@@ -1,2 +1,9 @@
-// @glance-apps/sync — public exports
-// Populated in subsequent extraction steps. See docs in glance-sync repo.
+export {
+  mergeArrayById,
+  mergeDailyNotes,
+  mergeHabits,
+  mergeHabitLogs,
+  mergeRoutineDefinitions,
+  mergeSyncData,
+  pruneTombstones,
+} from './merge.js';
