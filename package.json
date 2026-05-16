@@ -1,0 +1,14 @@
+{
+  "name": "@glance-apps/sync",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "types/index.d.ts",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/krelltunez/glance-sync.git"
+  }
+}
