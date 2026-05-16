@@ -1,6 +1,7 @@
 {
   "name": "@glance-apps/sync",
   "version": "0.1.0",
+  "license": "MIT",
   "type": "module",
   "main": "src/index.js",
   "types": "types/index.d.ts",
@@ -9,6 +10,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/krelltunez/glance-sync.git"
+    "url": "git+https://github.com/glance-apps/glance-sync.git"
   }
 }
