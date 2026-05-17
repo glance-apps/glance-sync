@@ -10,10 +10,12 @@
     "api",
     "types",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepublishOnly": "npm test"
   },
   "repository": {
     "type": "git",
