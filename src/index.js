@@ -30,3 +30,9 @@ export {
   AUTO_BACKUP_RETENTION,
   AUTO_BACKUP_INTERVALS,
 } from './autoBackup.js';
+
+export {
+  createSyncEngine,
+  SCHEMA_VERSION,
+  SUPPORTED_MAX_SCHEMA_VERSION,
+} from './engine.js';
