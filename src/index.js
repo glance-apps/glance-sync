@@ -19,3 +19,7 @@ export {
   isEncryptedEnvelope,
   initSessionKey,
 } from './crypto.js';
+
+// webdavFetch and createProviders are internal to the engine (Step 6) but
+// exported here so shims can wire them before the engine exists.
+export { webdavFetch, createProviders } from './providers.js';
