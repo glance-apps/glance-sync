@@ -7,3 +7,15 @@ export {
   mergeSyncData,
   pruneTombstones,
 } from './merge.js';
+
+export {
+  encryptData,
+  decryptData,
+  setupEncryptionKey,
+  setSyncPassphrase,
+  getSyncPassphrase,
+  clearEncryptionKey,
+  hasEncryptionReady,
+  isEncryptedEnvelope,
+  initSessionKey,
+} from './crypto.js';
