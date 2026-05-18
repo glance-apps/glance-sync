@@ -255,6 +255,7 @@ describe('createSyncEngine — first-sync conflict', () => {
 
 describe('createSyncEngine — 412 retry', () => {
   it('retries the full download→merge→upload cycle once on PRECONDITION_FAILED', async () => {
+    vi.useFakeTimers();
     const downloadEnvelope = {
       schemaVersion: 1, appId: 'test-app', version: 2,
       lastModified: '2026-01-02T00:00:00Z',
@@ -273,11 +274,47 @@ describe('createSyncEngine — 412 retry', () => {
       mergeResult: { data: { tasks: [] }, localChanged: false, remoteChanged: true },
     });
     localStorage.setItem('test-cloud-sync-last-synced', '2026-01-01T00:00:00Z');
-    await engine.download();
+    const p = engine.download();
+    // Advance past the 1–3 s jitter window so the retry can proceed.
+    await vi.advanceTimersByTimeAsync(4000);
+    await p;
     // First upload rejected with 412, then retried after re-download — so download
     // called twice and upload called twice.
     expect(provider.download.mock.calls.length).toBe(2);
     expect(provider.upload.mock.calls.length).toBe(2);
+    vi.useRealTimers();
+  });
+
+  it('applies exponential backoff and emits error when the 412 retry itself fails', async () => {
+    vi.useFakeTimers();
+    const downloadEnvelope = {
+      schemaVersion: 1, appId: 'test-app', version: 2,
+      lastModified: '2026-01-02T00:00:00Z',
+      data: { tasks: [] },
+    };
+    const provider = {
+      name: 'fake', configFields: [],
+      download: vi.fn(async () => ({ payload: downloadEnvelope, etag: 'e1' })),
+      upload:   vi.fn()
+        .mockRejectedValueOnce(new Error('PRECONDITION_FAILED'))
+        .mockRejectedValueOnce(new Error('PRECONDITION_FAILED')),
+      test:     vi.fn(),
+    };
+    const { engine, calls } = makeEngine({
+      provider,
+      mergeResult: { data: { tasks: [] }, localChanged: false, remoteChanged: true },
+    });
+    localStorage.setItem('test-cloud-sync-last-synced', '2026-01-01T00:00:00Z');
+    const p = engine.download();
+    await vi.advanceTimersByTimeAsync(4000);
+    await p;
+    // Both download calls happened (initial + retry).
+    expect(provider.download.mock.calls.length).toBe(2);
+    // Backoff must be set to a future timestamp.
+    expect(engine.getDownloadBackoffUntil()).toBeGreaterThan(Date.now());
+    // An error status must have been emitted.
+    expect(calls.statusChanges.some(c => c.s === 'error')).toBe(true);
+    vi.useRealTimers();
   });
 });
 

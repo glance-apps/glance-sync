@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-05-18
+
+### Fixed
+
+- **412 retry jitter**: add a random 1–3 s delay before the single re-try
+  `doCycle` call that follows a `PRECONDITION_FAILED` response. Two clients
+  polling on similar 60 s schedules previously collided on every cycle; the
+  jitter breaks the lock-step pattern.
+- **412 retry backoff**: when the one-shot retry itself fails, apply the same
+  exponential backoff (`downloadErrorCount` / `downloadBackoffUntil`) used for
+  all other transient errors, emit an `'error'` status, and call `onError`.
+  Previously the engine silently returned, which caused it to hammer the server
+  again on the very next 60 s poll.
+
 ## [1.0.0] - 2026-05-17
 
 Initial stable release. Extracted from dayGLANCE and made app-agnostic so the
