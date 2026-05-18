@@ -275,8 +275,10 @@ describe('createSyncEngine — 412 retry', () => {
     });
     localStorage.setItem('test-cloud-sync-last-synced', '2026-01-01T00:00:00Z');
     const p = engine.download();
-    // Advance past the 1–3 s jitter window so the retry can proceed.
-    await vi.advanceTimersByTimeAsync(4000);
+    // Jitter is 1–3 s. The successful retry upload then waits up to 2 s for
+    // MIN_SYNC_DURATION_MS. Advance 6 s to cover the worst-case combination
+    // (3 s jitter + 2 s upload hold + 1 s buffer) regardless of Math.random().
+    await vi.advanceTimersByTimeAsync(6000);
     await p;
     // First upload rejected with 412, then retried after re-download — so download
     // called twice and upload called twice.
