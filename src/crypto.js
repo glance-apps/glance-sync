@@ -17,6 +17,7 @@ let _sessionSalt = null;       // Uint8Array | null — the salt used to derive 
 export function setSyncPassphrase(p) { _sessionPassphrase = p; }
 export function getSyncPassphrase()  { return _sessionPassphrase; }
 export function hasEncryptionReady() { return _sessionKey !== null; }
+export function getSessionKey()      { return _sessionKey; }
 
 // ---------------------------------------------------------------------------
 // IndexedDB key store

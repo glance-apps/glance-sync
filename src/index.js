@@ -16,6 +16,7 @@ export {
   getSyncPassphrase,
   clearEncryptionKey,
   hasEncryptionReady,
+  getSessionKey,
   isEncryptedEnvelope,
   initSessionKey,
 } from './crypto.js';

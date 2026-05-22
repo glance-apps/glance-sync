@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-05-22
+
+### Added
+
+- `getSessionKey()` export — returns the cached non-extractable `CryptoKey` for reuse by sibling packages (e.g., `@glance-apps/intents` encryption helpers).
+
 ## [1.0.1] - 2026-05-18
 
 ### Fixed
