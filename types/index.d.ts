@@ -155,6 +155,7 @@ export function clearEncryptionKey(config: CryptoConfig): Promise<void>;
 export function setSyncPassphrase(passphrase: string | null): void;
 export function getSyncPassphrase(): string | null;
 export function hasEncryptionReady(): boolean;
+export function getSessionKey(): CryptoKey | null;
 export function encryptData<T>(data: T, config?: CryptoConfig): Promise<EncryptedEnvelope>;
 export function decryptData<T = unknown>(envelope: EncryptedEnvelope, config?: CryptoConfig): Promise<T>;
 export function isEncryptedEnvelope(value: unknown): value is EncryptedEnvelope;

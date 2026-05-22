@@ -147,6 +147,7 @@ Pass `encryptionEnabled: true` in the sync config object stored via `engine.setC
 | `isEncryptedEnvelope(value)` | Type guard — returns `true` if the value looks like an `EncryptedEnvelope`. |
 | `setSyncPassphrase(p)` / `getSyncPassphrase()` | Store/retrieve the passphrase in session memory (not persisted). |
 | `hasEncryptionReady()` | Returns `true` if the session key is loaded. |
+| `getSessionKey()` | Returns the cached non-extractable `CryptoKey`, or `null` if no key is loaded — intended for sibling packages (e.g., `@glance-apps/intents`) that need to reuse the same key. |
 
 ### Transport & providers
 

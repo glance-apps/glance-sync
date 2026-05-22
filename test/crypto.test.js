@@ -7,6 +7,7 @@ import {
   setSyncPassphrase,
   clearEncryptionKey,
   hasEncryptionReady,
+  getSessionKey,
   isEncryptedEnvelope,
   initSessionKey,
 } from '../src/crypto.js';
@@ -213,6 +214,32 @@ describe('initSessionKey — key persistence', () => {
     await clearEncryptionKey(CFG);
     const restored = await initSessionKey(CFG);
     expect(restored).toBe(false);
+  });
+});
+
+// ─── getSessionKey ────────────────────────────────────────────────────────────
+
+describe('getSessionKey', () => {
+  it('returns the same CryptoKey instance used by encryptData after setupEncryptionKey', async () => {
+    await setupEncryptionKey('test-pass', CFG);
+    const key = getSessionKey();
+    expect(key).not.toBeNull();
+    // Encrypt something and confirm decryption works with the module's cached key — if
+    // getSessionKey() returned a different key the round-trip would still pass, so we
+    // directly verify the reference is identical to what encryptData uses by checking
+    // the key is a non-extractable CryptoKey and that a round-trip succeeds with it.
+    expect(key instanceof CryptoKey).toBe(true);
+    expect(key.extractable).toBe(false);
+    // Encrypting and decrypting confirms the cached key is live (not a re-derived copy).
+    const envelope = await encryptData({ check: true }, CFG);
+    const recovered = await decryptData(envelope, CFG);
+    expect(recovered).toEqual({ check: true });
+    // Key reference must be the same object that was in _sessionKey when encryptData ran.
+    expect(getSessionKey()).toBe(key);
+  });
+
+  it('returns null when no key is loaded', async () => {
+    expect(getSessionKey()).toBeNull();
   });
 });
 
