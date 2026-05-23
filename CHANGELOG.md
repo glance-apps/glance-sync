@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-05-23
+
+### Fixed
+
+- **Generic WebDAV — `appFolderName` not used in URLs**: `getFileUrl` and
+  `getDirUrl` now insert `appFolderName` between the server root and the sync
+  filename, matching the behaviour of the Nextcloud and Koofr providers.
+  `webdavUrl` is now expected to be a server root (e.g. `https://dav.example.com`)
+  rather than a full folder path. Callers with an existing `webdavUrl` that
+  already includes the folder path should migrate it into `syncFolder`/`appFolderName`
+  and strip the path back to the origin.
+- **Generic WebDAV — Apache 403 on missing parent directories**: `upload` now
+  calls `mkcolWithParents` when PUT returns 403 in addition to 404/409. Apache
+  `mod_dav` returns 403 (not 409) when both the target directory and its parent
+  are absent. The `if (res.status === 403) throw FORBIDDEN` guard that follows
+  still catches genuine auth failures after the retry.
+
 ## [1.0.2] - 2026-05-22
 
 ### Added
@@ -58,5 +75,8 @@ entire sync infrastructure can be shared across the GLANCE app family.
 - TypeScript declarations in `types/index.d.ts`.
 - WebDAV CORS proxy handler in `api/webdav-proxy.js`.
 
-[Unreleased]: https://github.com/glance-apps/glance-sync/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/glance-apps/glance-sync/compare/v1.0.3...HEAD
+[1.0.3]: https://github.com/glance-apps/glance-sync/compare/v1.0.2...v1.0.3
+[1.0.2]: https://github.com/glance-apps/glance-sync/compare/v1.0.1...v1.0.2
+[1.0.1]: https://github.com/glance-apps/glance-sync/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/glance-apps/glance-sync/releases/tag/v1.0.0

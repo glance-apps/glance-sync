@@ -169,7 +169,7 @@ TypeScript declarations for all of the above are in `types/index.d.ts`.
 
 ## Versioning
 
-This package is at **v1.0.0** and follows [Semantic Versioning](https://semver.org/). Breaking changes to the public API or the sync envelope schema will result in a major version bump.
+This package follows [Semantic Versioning](https://semver.org/). Breaking changes to the public API or the sync envelope schema will result in a major version bump.
 
 ## License
 

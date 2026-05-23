@@ -261,9 +261,9 @@ export function createProviders(engineConfig) {
     webdav: {
       name: 'Generic WebDAV',
       getFileUrl: (config) =>
-        `${config.webdavUrl.replace(/\/+$/, '')}/${syncFilename}`,
+        `${config.webdavUrl.replace(/\/+$/, '')}/${appFolderName}/${syncFilename}`,
       getDirUrl: (config) =>
-        `${config.webdavUrl.replace(/\/+$/, '')}/`,
+        `${config.webdavUrl.replace(/\/+$/, '')}/${appFolderName}/`,
       getAuthHeaders: (config) => ({
         'X-WebDAV-Auth': 'Basic ' + toBase64(config.username + ':' + config.appPassword)
       }),
@@ -277,7 +277,7 @@ export function createProviders(engineConfig) {
         if (etag) extraHeaders['If-Match'] = etag;
         const doUpload = () => wf('PUT', fileUrl, authHeaders, body, extraHeaders);
         let res = await doUpload();
-        if (res.status === 404 || res.status === 409) {
+        if (res.status === 404 || res.status === 409 || res.status === 403) {
           await mkcol(dirUrl, authHeaders);
           res = await doUpload();
         }
@@ -307,11 +307,11 @@ export function createProviders(engineConfig) {
         return { success: false, error: `Unexpected response: ${res.status}${res.statusText ? ' ' + res.statusText : ''}` };
       },
       configFields: [
-        { key: 'webdavUrl', label: 'WebDAV URL', type: 'url', placeholder: 'https://dav.example.com/dayGLANCE/' },
+        { key: 'webdavUrl', label: 'WebDAV URL', type: 'url', placeholder: 'https://dav.example.com' },
         { key: 'username', label: 'Username', type: 'text', placeholder: 'your-username' },
         { key: 'appPassword', label: 'Password / App Password', type: 'password', placeholder: 'your-password' }
       ],
-      helpText: 'Enter the full URL of the WebDAV folder where dayGLANCE should store its sync file. pCloud, Seafile, and most self-hosted WebDAV providers are supported.'
+      helpText: 'Enter the server root URL (e.g. https://dav.example.com). The sync folder is configured separately via the Sync Folder setting. pCloud, Seafile, and most self-hosted WebDAV providers are supported.'
     }
   };
 }
