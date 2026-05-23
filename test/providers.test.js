@@ -196,16 +196,16 @@ describe('URL and path construction', () => {
     expect(p.koofr.getDirUrl()).toMatch(/\/$/);
   });
 
-  it('Generic WebDAV getFileUrl uses syncFilename', () => {
+  it('Generic WebDAV getFileUrl uses appFolderName and syncFilename', () => {
     const p = createProviders(BASE_ENGINE);
-    expect(p.webdav.getFileUrl({ ...USER_CFG, webdavUrl: 'https://dav.example.com/mydir' }))
-      .toBe('https://dav.example.com/mydir/myapp-sync.json');
+    expect(p.webdav.getFileUrl({ ...USER_CFG, webdavUrl: 'https://dav.example.com' }))
+      .toBe('https://dav.example.com/myapp/myapp-sync.json');
   });
 
   it('Generic WebDAV getFileUrl strips trailing slash from webdavUrl', () => {
     const p = createProviders(BASE_ENGINE);
-    expect(p.webdav.getFileUrl({ ...USER_CFG, webdavUrl: 'https://dav.example.com/mydir/' }))
-      .toBe('https://dav.example.com/mydir/myapp-sync.json');
+    expect(p.webdav.getFileUrl({ ...USER_CFG, webdavUrl: 'https://dav.example.com/' }))
+      .toBe('https://dav.example.com/myapp/myapp-sync.json');
   });
 });
 
