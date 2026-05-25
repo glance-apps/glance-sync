@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-05-25
+
+### Added
+
+- `deriveKeyForSalt(salt: Uint8Array): Promise<CryptoKey>` — derives a fresh
+  non-extractable AES-256-GCM key from the cached passphrase and a caller-supplied
+  salt (PBKDF2-SHA-256, 310 000 iterations). Intended as the `deriveKey` callback
+  for `@glance-apps/intents` per-envelope key derivation (Phase 2.6): the intents
+  emitter generates a random salt per envelope, embeds it in the envelope, and
+  calls this to obtain the encryption key; the poller extracts the salt from the
+  envelope and calls this again to obtain the decryption key — enabling cross-app
+  decryption without sharing a per-app session key.
+
+  Throws with `err.code === 'PASSPHRASE_REQUIRED'` when no passphrase is held in
+  the current session. Note that this guard is on `_sessionPassphrase`, **not** on
+  `hasEncryptionReady()`: after `initSessionKey()` restores a key from device
+  storage the session key is ready but the passphrase is not. Callers that want to
+  gate on passphrase availability should check `getSyncPassphrase() !== null`.
+
+  `getSessionKey()` (added in 1.0.2) is **not removed**; it remains exported for
+  any consumer that wants the cached per-app `CryptoKey` directly.
+
 ## [1.0.3] - 2026-05-23
 
 ### Fixed

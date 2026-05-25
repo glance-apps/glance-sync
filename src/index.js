@@ -17,6 +17,7 @@ export {
   clearEncryptionKey,
   hasEncryptionReady,
   getSessionKey,
+  deriveKeyForSalt,
   isEncryptedEnvelope,
   initSessionKey,
 } from './crypto.js';

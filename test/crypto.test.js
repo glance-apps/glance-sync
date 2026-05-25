@@ -8,6 +8,7 @@ import {
   clearEncryptionKey,
   hasEncryptionReady,
   getSessionKey,
+  deriveKeyForSalt,
   isEncryptedEnvelope,
   initSessionKey,
 } from '../src/crypto.js';
@@ -214,6 +215,77 @@ describe('initSessionKey — key persistence', () => {
     await clearEncryptionKey(CFG);
     const restored = await initSessionKey(CFG);
     expect(restored).toBe(false);
+  });
+});
+
+// ─── deriveKeyForSalt ─────────────────────────────────────────────────────────
+
+describe('deriveKeyForSalt', () => {
+  it('returns a non-extractable CryptoKey when passphrase is set', async () => {
+    setSyncPassphrase('test-passphrase');
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const key  = await deriveKeyForSalt(salt);
+    expect(key).toBeInstanceOf(CryptoKey);
+    expect(key.extractable).toBe(false);
+    expect(key.type).toBe('secret');
+  });
+
+  it('two calls with the same passphrase and salt produce functionally identical keys', async () => {
+    setSyncPassphrase('consistent-pass');
+    const salt = new Uint8Array(16).fill(42);
+    const key1 = await deriveKeyForSalt(salt);
+    const key2 = await deriveKeyForSalt(salt);
+
+    // Encrypt with key1, decrypt with key2 — if they are the same key the round-trip succeeds.
+    const plaintext  = new TextEncoder().encode('hello');
+    const iv         = new Uint8Array(12).fill(7);
+    const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key1, plaintext);
+    const recovered  = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key2, ciphertext);
+    expect(new TextDecoder().decode(recovered)).toBe('hello');
+  });
+
+  it('two calls with different salts produce different keys', async () => {
+    setSyncPassphrase('same-passphrase');
+    const salt1 = new Uint8Array(16).fill(1);
+    const salt2 = new Uint8Array(16).fill(2);
+    const key1  = await deriveKeyForSalt(salt1);
+    const key2  = await deriveKeyForSalt(salt2);
+
+    const plaintext  = new TextEncoder().encode('cross-salt test');
+    const iv         = new Uint8Array(12).fill(0);
+    const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key1, plaintext);
+
+    await expect(
+      crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key2, ciphertext)
+    ).rejects.toThrow();
+  });
+
+  it('throws PASSPHRASE_REQUIRED when passphrase is null', async () => {
+    // passphrase is already null from beforeEach
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    await expect(deriveKeyForSalt(salt)).rejects.toMatchObject({ code: 'PASSPHRASE_REQUIRED' });
+  });
+
+  it('throws PASSPHRASE_REQUIRED even when hasEncryptionReady() is true (key restored without passphrase)', async () => {
+    // Simulate initSessionKey() restoring from storage — key is ready but passphrase not set.
+    await setupEncryptionKey('secret', CFG);
+    // Restore key from IDB (simulates page reload): clears _sessionPassphrase but leaves _sessionKey set.
+    // We can't call clearEncryptionKey (it wipes IDB), so verify via initSessionKey which sets
+    // _sessionKey from IDB but does NOT set _sessionPassphrase.
+    setSyncPassphrase(null); // clear only passphrase, leaving IDB intact
+    await initSessionKey(CFG);
+
+    expect(hasEncryptionReady()).toBe(true);
+
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    await expect(deriveKeyForSalt(salt)).rejects.toMatchObject({ code: 'PASSPHRASE_REQUIRED' });
+  });
+
+  it('works with passphrase set via setSyncPassphrase (no setupEncryptionKey needed)', async () => {
+    setSyncPassphrase('direct-passphrase');
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const key  = await deriveKeyForSalt(salt);
+    expect(key).toBeInstanceOf(CryptoKey);
   });
 });
 
