@@ -147,7 +147,8 @@ Pass `encryptionEnabled: true` in the sync config object stored via `engine.setC
 | `isEncryptedEnvelope(value)` | Type guard — returns `true` if the value looks like an `EncryptedEnvelope`. |
 | `setSyncPassphrase(p)` / `getSyncPassphrase()` | Store/retrieve the passphrase in session memory (not persisted). |
 | `hasEncryptionReady()` | Returns `true` if the session key is loaded. |
-| `getSessionKey()` | Returns the cached non-extractable `CryptoKey`, or `null` if no key is loaded — intended for sibling packages (e.g., `@glance-apps/intents`) that need to reuse the same key. |
+| `getSessionKey()` | Returns the cached non-extractable `CryptoKey`, or `null` if no key is loaded. |
+| `deriveKeyForSalt(salt)` | Derives a fresh non-extractable AES-256-GCM key from the cached passphrase and a caller-supplied 16-byte salt (PBKDF2-SHA-256, 310 000 iterations). Intended as the `deriveKey` callback for `@glance-apps/intents` per-envelope encryption: pass `sync.deriveKeyForSalt` to `buildEncryptedEnvelope` / `parseEncryptedEnvelope` so each envelope is independently rekeyed. Throws with `err.code === 'PASSPHRASE_REQUIRED'` when no passphrase is in session — gate on `getSyncPassphrase() !== null` before using it. |
 
 ### Transport & providers
 
