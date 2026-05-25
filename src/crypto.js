@@ -19,6 +19,45 @@ export function getSyncPassphrase()  { return _sessionPassphrase; }
 export function hasEncryptionReady() { return _sessionKey !== null; }
 export function getSessionKey()      { return _sessionKey; }
 
+/**
+ * Derives a fresh AES-256-GCM key from the cached passphrase and the supplied
+ * salt. Intended for per-envelope key derivation in `@glance-apps/intents`:
+ * callers generate a new random salt per envelope, embed it in the envelope,
+ * and call this to get the encryption key — enabling cross-app decryption with
+ * the same passphrase but a fresh salt on every write.
+ *
+ * Uses identical PBKDF2 parameters as the rest of this module (SHA-256,
+ * 310 000 iterations, AES-256-GCM). The returned key is non-extractable because
+ * it is ephemeral and never stored.
+ *
+ * Throws with `err.code === 'PASSPHRASE_REQUIRED'` when no passphrase is
+ * held in the current session (e.g. after `initSessionKey()` restores from
+ * device storage without the user re-entering their passphrase). Note: this
+ * is a different condition from `hasEncryptionReady()` — callers that want to
+ * gate on passphrase availability should check `getSyncPassphrase() !== null`.
+ *
+ * @param {Uint8Array} salt - 16-byte salt to derive the key from
+ * @returns {Promise<CryptoKey>}
+ */
+export async function deriveKeyForSalt(salt) {
+  if (!_sessionPassphrase) {
+    const err = new Error('Encryption passphrase not available. Please enter your sync passphrase.');
+    err.code = 'PASSPHRASE_REQUIRED';
+    throw err;
+  }
+  const enc         = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw', enc.encode(_sessionPassphrase), 'PBKDF2', false, ['deriveKey']
+  );
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: 310_000, hash: 'SHA-256' },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
 // ---------------------------------------------------------------------------
 // IndexedDB key store
 // ---------------------------------------------------------------------------

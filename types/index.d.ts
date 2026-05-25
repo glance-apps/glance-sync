@@ -156,6 +156,17 @@ export function setSyncPassphrase(passphrase: string | null): void;
 export function getSyncPassphrase(): string | null;
 export function hasEncryptionReady(): boolean;
 export function getSessionKey(): CryptoKey | null;
+/**
+ * Derives a fresh non-extractable AES-256-GCM key from the cached passphrase
+ * and the supplied salt (PBKDF2-SHA-256, 310 000 iterations). Intended for
+ * per-envelope key derivation in `@glance-apps/intents`: pass this function as
+ * the `deriveKey` callback to `buildEncryptedEnvelope` / `parseEncryptedEnvelope`.
+ *
+ * Throws with `err.code === 'PASSPHRASE_REQUIRED'` when no passphrase is held
+ * in the current session. Gate on `getSyncPassphrase() !== null` (not
+ * `hasEncryptionReady()`) before passing this as a callback.
+ */
+export function deriveKeyForSalt(salt: Uint8Array): Promise<CryptoKey>;
 export function encryptData<T>(data: T, config?: CryptoConfig): Promise<EncryptedEnvelope>;
 export function decryptData<T = unknown>(envelope: EncryptedEnvelope, config?: CryptoConfig): Promise<T>;
 export function isEncryptedEnvelope(value: unknown): value is EncryptedEnvelope;
