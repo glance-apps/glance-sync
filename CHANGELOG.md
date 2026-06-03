@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-06-03
+
+### Fixed
+
+- **WebDAV — 405 on MKCOL treated as directory-already-exists**: `mkcolWithParents`
+  now handles HTTP 405 (Method Not Allowed) the same as 409/404, triggering the
+  parent-directory creation fallback. Some WebDAV servers (e.g. certain nginx
+  configurations) return 405 rather than 409 when MKCOL is called on a path that
+  already exists as a collection.
+
 ## [1.1.0] - 2026-05-25
 
 ### Added
@@ -97,7 +107,9 @@ entire sync infrastructure can be shared across the GLANCE app family.
 - TypeScript declarations in `types/index.d.ts`.
 - WebDAV CORS proxy handler in `api/webdav-proxy.js`.
 
-[Unreleased]: https://github.com/glance-apps/glance-sync/compare/v1.0.3...HEAD
+[Unreleased]: https://github.com/glance-apps/glance-sync/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/glance-apps/glance-sync/compare/v1.1.0...v1.1.1
+[1.1.0]: https://github.com/glance-apps/glance-sync/compare/v1.0.3...v1.1.0
 [1.0.3]: https://github.com/glance-apps/glance-sync/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/glance-apps/glance-sync/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/glance-apps/glance-sync/compare/v1.0.0...v1.0.1
