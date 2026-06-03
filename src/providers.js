@@ -102,7 +102,7 @@ async function parseDownloadResponse(res, engineConfig) {
 
 async function mkcolWithParents(dirUrl, authHeaders, wf) {
   const res = await wf('MKCOL', dirUrl, authHeaders);
-  if (res.status === 409 || res.status === 404) {
+  if (res.status === 409 || res.status === 404 || res.status === 405) {
     // Derive parent by stripping the last path segment via URL() to avoid
     // producing malformed strings on root-level inputs.
     let parent;
