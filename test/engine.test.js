@@ -318,6 +318,39 @@ describe('createSyncEngine — 412 retry', () => {
     expect(calls.statusChanges.some(c => c.s === 'error')).toBe(true);
     vi.useRealTimers();
   });
+
+  it('does not call applyPayload on the first attempt when upload returns 412', async () => {
+    vi.useFakeTimers();
+    const downloadEnvelope = {
+      schemaVersion: 1, appId: 'test-app', version: 2,
+      lastModified: '2026-01-02T00:00:00Z',
+      data: { tasks: [] },
+    };
+    const provider = {
+      name: 'fake', configFields: [],
+      download: vi.fn(async () => ({ payload: downloadEnvelope, etag: 'e1' })),
+      upload: vi.fn()
+        .mockRejectedValueOnce(new Error('PRECONDITION_FAILED'))
+        .mockResolvedValueOnce(true),
+      test: vi.fn(),
+    };
+    // localChanged: true so applyPayload would be called if ordering is wrong.
+    const { engine, calls } = makeEngine({
+      provider,
+      mergeResult: { data: { tasks: [] }, localChanged: true, remoteChanged: false },
+    });
+    localStorage.setItem('test-cloud-sync-last-synced', '2026-01-01T00:00:00Z');
+    const p = engine.download();
+    await vi.advanceTimersByTimeAsync(6000);
+    await p;
+    // Two full cycles ran (download called twice, upload called twice).
+    expect(provider.download.mock.calls.length).toBe(2);
+    expect(provider.upload.mock.calls.length).toBe(2);
+    // applyPayload must have been called exactly once — only after the
+    // successful (second) upload, not after the 412 failure.
+    expect(calls.applyPayload).toHaveLength(1);
+    vi.useRealTimers();
+  });
 });
 
 describe('createSyncEngine — status sequence', () => {
