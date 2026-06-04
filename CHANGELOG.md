@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-06-04
+
+### Fixed
+
+- **412 retry — local DB mutated before upload**: `applyPayload` was called before
+  `upload()` in `doCycle()`. If the upload returned a 412 Precondition Failed (concurrent
+  write from another device), the retry cycle re-merged already-dirtied local state with
+  the freshly downloaded remote, producing inconsistent data (e.g. completion events
+  referencing chore sync IDs that no longer exist after the second merge). `applyPayload`
+  is now deferred until after a successful upload (204), leaving the local DB untouched
+  if the upload fails so the retry starts from a clean state.
+
 ## [1.1.1] - 2026-06-03
 
 ### Fixed
@@ -107,7 +119,8 @@ entire sync infrastructure can be shared across the GLANCE app family.
 - TypeScript declarations in `types/index.d.ts`.
 - WebDAV CORS proxy handler in `api/webdav-proxy.js`.
 
-[Unreleased]: https://github.com/glance-apps/glance-sync/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/glance-apps/glance-sync/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/glance-apps/glance-sync/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/glance-apps/glance-sync/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/glance-apps/glance-sync/compare/v1.0.3...v1.1.0
 [1.0.3]: https://github.com/glance-apps/glance-sync/compare/v1.0.2...v1.0.3
