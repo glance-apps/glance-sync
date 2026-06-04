@@ -346,33 +346,35 @@ export const createSyncEngine = (config) => {
       const mergeResult = mergePayloads(localData, remote.data);
       const { data: mergedData, localChanged, remoteChanged } = mergeResult;
 
-      if (localChanged) {
-        let mayApply = true;
-        if (validateApplyPayload) {
-          const check = await validateApplyPayload({ ...remote, data: mergedData });
-          if (!check?.valid) {
-            // eslint-disable-next-line no-console
-            console.error(`[${appId}] applyRemoteData aborted:`, check?.reason || 'validation failed');
-            mayApply = false;
-          }
-        }
-        if (mayApply) {
-          await applyPayload(mergedData, { allowEmpty: !!remote.lastModified });
-          localStorage.setItem(KEY_LOCAL_MOD, new Date().toISOString());
-        }
-      }
-
       if (remoteChanged || localChanged) {
         const mergedPayload = {
           version: ENVELOPE_DATA_VERSION,
           lastModified: new Date().toISOString(),
           data: mergedData,
         };
+        // Upload first — if this throws (e.g. 412 PRECONDITION_FAILED), the
+        // local DB must remain untouched so the retry starts from clean state.
         await upload({
           prebuiltPayload: mergedPayload,
           skipLockCheck: true,
           etag: etag || overrideEtag || null,
         });
+
+        if (localChanged) {
+          let mayApply = true;
+          if (validateApplyPayload) {
+            const check = await validateApplyPayload({ ...remote, data: mergedData });
+            if (!check?.valid) {
+              // eslint-disable-next-line no-console
+              console.error(`[${appId}] applyRemoteData aborted:`, check?.reason || 'validation failed');
+              mayApply = false;
+            }
+          }
+          if (mayApply) {
+            await applyPayload(mergedData, { allowEmpty: !!remote.lastModified });
+            localStorage.setItem(KEY_LOCAL_MOD, new Date().toISOString());
+          }
+        }
 
         if (hasNeverSynced && localChanged) {
           onFirstSyncReload?.();
