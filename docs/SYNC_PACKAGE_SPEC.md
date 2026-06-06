@@ -88,8 +88,8 @@ All fields are required unless marked optional.
 |---|---|---|
 | `buildPayload()` | `async () => object` | Returns the full sync payload `data` object. Called immediately before every upload. **Must read live state** (React refs, localStorage tombstones, etc.) — not a snapshot. |
 | `buildBackupPayload()` | `async () => object` | Returns the backup payload. Semantically distinct from `buildPayload`: sync payloads contain the cross-device state; backup payloads may include additional device-local data (settings, preferences) that aren't part of the sync protocol. Called on backup timer. **Must be safe to call without React context** (timer callbacks). Read from localStorage/IndexedDB only, not React state. |
-| `applyPayload(data)` | `async (object) => void` | Applies a merged remote payload to local state. Called after every successful download+merge. For React apps: update both React state and localStorage. For IndexedDB apps (lastGLANCE): write to Dexie inside a transaction. |
-| `mergePayloads(local, remote)` | `(object, object) => object` | Merges a local payload snapshot with a remote payload. Called by the engine between download and apply. The engine does not know the data model — this is always app-provided. Use `mergeArrayById` from the package for each syncable array. Must be synchronous. |
+| `applyPayload(data, opts)` | `async (object, { allowEmpty: boolean }) => void` | Applies a merged remote payload to local state. Called after every successful download+merge. `opts.allowEmpty` is `true` on a device's first sync (when `remote.lastModified` is set), signalling that an empty payload is valid and should not be rejected. For React apps: update both React state and localStorage. For IndexedDB apps (lastGLANCE): write to Dexie inside a transaction. |
+| `mergePayloads(local, remote)` | `(object, object) => { data, localChanged, remoteChanged }` | Merges a local payload snapshot with a remote payload. Returns `{ data: mergedPayload, localChanged: boolean, remoteChanged: boolean }`. The engine uses `localChanged` to decide whether to call `applyPayload`, and `remoteChanged` (or `localChanged`) to decide whether to re-upload. Must be synchronous. |
 | `validateUploadPayload(payload)` _(optional)_ | `async (object) => { valid: boolean, reason?: string }` | Safety guard before upload. Returning `{ valid: false }` aborts the upload without error. Use to block empty payloads, schema problems, etc. |
 | `validateApplyPayload(payload)` _(optional)_ | `async (object) => { valid: boolean, reason?: string }` | Safety guard before applying remote data locally. Returning `{ valid: false }` aborts the apply without error. |
 
@@ -199,38 +199,52 @@ Encryption is end-to-end: plaintext never leaves the device.
 
 ```json
 {
-  "encrypted": true,
-  "salt": "<base64>",
-  "iv": "<base64>",
-  "ciphertext": "<base64>"
+  "v": 1,
+  "enc": "AES-GCM-256",
+  "data": "<base64>"
 }
 ```
 
-`isEncryptedEnvelope(obj)` returns `true` if `obj.encrypted === true`.
+`data` is a single base64 string containing the salt (16 bytes), IV (12 bytes), and ciphertext packed together. `isEncryptedEnvelope(obj)` returns `true` if `obj.v === 1`, `obj.enc === 'AES-GCM-256'`, and `obj.data` is a string.
 
 ### Crypto API (also exported standalone)
 
+All crypto functions that read/write the key store accept a `CryptoConfig` object:
+
 ```ts
-setupEncryptionKey(passphrase: string): Promise<void>
-// Derives key from passphrase, generates salt, stores in IndexedDB.
+interface CryptoConfig {
+  cryptoDBName: string;                                          // IndexedDB database name
+  nativeGetSyncKey?: (() => string | null | Promise<string | null>) | null;
+  nativeStoreSyncKey?: ((value: string | null) => void) | null;
+}
+```
 
-setSyncPassphrase(passphrase: string): void
-// Stores passphrase for re-authentication on existing encrypted setup.
+```ts
+initSessionKey(config: CryptoConfig): Promise<boolean>
+// Loads the session key from IndexedDB (or native keystore). Returns true if a key was found.
+// Call on app start before any sync; if it returns false, call onPassphraseRequired.
 
-clearEncryptionKey(): Promise<void>
+setupEncryptionKey(passphrase: string, config: CryptoConfig): Promise<void>
+// Derives key from passphrase (PBKDF2), generates a new random salt, stores in IndexedDB.
+
+setSyncPassphrase(passphrase: string | null): void
+// Caches passphrase in memory for the current session (used by encryptData / decryptData
+// to re-derive the key when needed).
+
+clearEncryptionKey(config: CryptoConfig): Promise<void>
 // Removes key from IndexedDB and memory.
 
 hasEncryptionReady(): boolean
 // Returns true if a session key is loaded and ready.
 
-encryptData(plaintext: object): Promise<EncryptedEnvelope>
+encryptData<T>(data: T, config?: CryptoConfig): Promise<EncryptedEnvelope>
 // Encrypts plaintext object. Throws if no key is loaded.
 
-decryptData(envelope: EncryptedEnvelope): Promise<object>
+decryptData<T>(envelope: EncryptedEnvelope, config?: CryptoConfig): Promise<T>
 // Decrypts envelope. Throws if no key is loaded or ciphertext tampered.
 
 isEncryptedEnvelope(obj: unknown): boolean
-// Type guard.
+// Type guard. Returns true for { v: 1, enc: 'AES-GCM-256', data: string }.
 ```
 
 ### Android Keystore Bridge
@@ -249,7 +263,8 @@ The core merge primitive. Merges two arrays of objects using tombstone-based CRD
 mergeArrayById(
   local: object[],
   remote: object[],
-  tombstones: Record<string, string>,  // id → ISO deletedAt
+  deletedIds: Record<string, string>,  // id → ISO deletedAt
+  syncHorizon?: Date | null,           // suppress resurrection of items older than this date
   options?: {
     idField?: string,       // default: 'id'
     timestampField?: string // default: 'updatedAt'
@@ -274,7 +289,9 @@ mergeHabits(local, remote, tombstones): object[]
 mergeHabitLogs(local, remote, tombstones): object[]
 mergeRoutineDefinitions(local, remote, tombstones): object[]
 mergeSyncData(local, remote): object   // dayGLANCE full orchestrator
-pruneTombstones(tombstones, retentionDays): Record<string, string>
+pruneTombstones(tombstones, cutoff): Record<string, string>
+// cutoff must be a Date object (or null to skip pruning).
+// Example: pruneTombstones(tombstones, new Date(Date.now() - 90 * 86400_000))
 ```
 
 ---

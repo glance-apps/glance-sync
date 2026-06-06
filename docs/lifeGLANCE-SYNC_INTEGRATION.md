@@ -175,7 +175,8 @@ const buildBackupPayload = () => {
 ## `applyPayload`
 
 ```js
-const applyPayload = async (data) => {
+const applyPayload = async (data, opts) => {
+  // opts.allowEmpty is true on first sync — treat an empty payload as valid
   // Preserve local photo blobs — remote payload has metadata only
   const localEntries = entriesRef.current;
   const localBlobMap = Object.fromEntries(
@@ -200,20 +201,39 @@ This ensures local photo blobs are not lost when remote data is applied on the o
 
 ## Merge Orchestrator
 
+`mergePayloads` must return `{ data, localChanged, remoteChanged }`. The engine uses `localChanged` to decide whether to call `applyPayload`, and either flag to decide whether to re-upload.
+
+`pruneTombstones` expects a `Date` object as its second argument, not a plain number.
+
 ```js
 import { mergeArrayById, pruneTombstones } from '@glance-apps/sync';
 
 const mergePayloads = (local, remote) => {
+  const cutoff = new Date(Date.now() - 90 * 86_400_000);
   const tombstones = pruneTombstones(
     { ...local.tombstones, ...remote.tombstones },
-    90
+    cutoff
   );
-  return {
-    entries: mergeArrayById(local.entries, remote.entries, tombstones, {
-      idField: 'id',
-      timestampField: 'updatedAt',
-    }),
+
+  const mergedEntries = mergeArrayById(
+    local.entries,
+    remote.entries,
     tombstones,
+    null,  // syncHorizon — pass null unless you have a tombstonePrunedBefore date
+    { idField: 'id', timestampField: 'updatedAt' }
+  );
+
+  const localChanged =
+    JSON.stringify(mergedEntries) !== JSON.stringify(local.entries) ||
+    JSON.stringify(tombstones) !== JSON.stringify(local.tombstones);
+  const remoteChanged =
+    JSON.stringify(mergedEntries) !== JSON.stringify(remote.entries) ||
+    JSON.stringify(tombstones) !== JSON.stringify(remote.tombstones);
+
+  return {
+    data: { entries: mergedEntries, tombstones },
+    localChanged,
+    remoteChanged,
   };
 };
 ```
