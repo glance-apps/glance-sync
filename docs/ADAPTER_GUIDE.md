@@ -11,7 +11,7 @@ An adapter is the set of callbacks you pass to `createSyncEngine` that wire the 
 
 - `buildPayload()` — reads live state and returns the cross-device sync payload
 - `buildBackupPayload()` — reads storage-only state and returns the richer backup payload
-- `applyPayload(data)` — writes a merged remote payload back into your app's state
+- `applyPayload(data, opts)` — writes a merged remote payload back into your app's state (`opts.allowEmpty` is `true` on first sync)
 - `mergePayloads(local, remote)` — merges a local snapshot with a remote payload; uses `mergeArrayById` internally
 - `validateUploadPayload(payload)` / `validateApplyPayload(payload)` _(optional safety guards)_
 
@@ -120,7 +120,8 @@ Called after every successful download+merge with the merged data. Write it to y
 **For React apps:**
 
 ```js
-const applyPayload = async (data) => {
+const applyPayload = async (data, opts) => {
+  // opts.allowEmpty is true on first sync — treat an empty payload as valid
   // Update localStorage first (source of truth for next buildPayload)
   localStorage.setItem('myapp-items', JSON.stringify(data.items));
   localStorage.setItem('myapp-tombstones', JSON.stringify(data.tombstones));
@@ -132,7 +133,7 @@ const applyPayload = async (data) => {
 **For Dexie apps:**
 
 ```js
-const applyPayload = async (data) => {
+const applyPayload = async (data, opts) => {
   await db.transaction('rw', db.items, db.categories, db.tombstones, async () => {
     await db.items.bulkPut(data.items);
     await db.categories.bulkPut(data.categories);
@@ -161,24 +162,38 @@ engine calls mergePayloads(local, remote) → merged
 engine calls applyPayload(merged)
 ```
 
-Use `mergeArrayById` from the package for each syncable array:
+Use `mergeArrayById` from the package for each syncable array. `mergePayloads` must return `{ data, localChanged, remoteChanged }` — the engine uses these flags to decide whether to call `applyPayload` and whether to re-upload:
 
 ```js
 import { mergeArrayById, pruneTombstones } from '@glance-apps/sync';
 
 const mergePayloads = (local, remote) => {
+  // pruneTombstones expects a Date object, not a plain number
+  const cutoff = new Date(Date.now() - 90 * 86_400_000);
   const tombstones = pruneTombstones(
     { ...local.tombstones, ...remote.tombstones },
-    90
+    cutoff
   );
-  return {
-    items: mergeArrayById(
-      local.items,
-      remote.items,
-      tombstones,
-      { idField: 'id', timestampField: 'updatedAt' }
-    ),
+
+  const mergedItems = mergeArrayById(
+    local.items,
+    remote.items,
     tombstones,
+    null,  // syncHorizon — pass null unless you have a tombstonePrunedBefore date
+    { idField: 'id', timestampField: 'updatedAt' }
+  );
+
+  const localChanged =
+    JSON.stringify(mergedItems) !== JSON.stringify(local.items) ||
+    JSON.stringify(tombstones) !== JSON.stringify(local.tombstones);
+  const remoteChanged =
+    JSON.stringify(mergedItems) !== JSON.stringify(remote.items) ||
+    JSON.stringify(tombstones) !== JSON.stringify(remote.tombstones);
+
+  return {
+    data: { items: mergedItems, tombstones },
+    localChanged,
+    remoteChanged,
   };
 };
 ```
