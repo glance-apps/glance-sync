@@ -246,7 +246,12 @@ export function createProviders(engineConfig) {
           // nativeHttpRequest != null means the Android HTTP bridge is available,
           // which bypasses Koofr's server-side block on Vercel proxy IPs.
           const onAndroid = engineConfig.nativeHttpRequest != null;
-          if (!onAndroid) return { success: false, error: "Koofr is blocking requests from the web app's server. Use the Android app — it connects to Koofr directly." };
+          if (!onAndroid) {
+            if (engineConfig.isHostedApp) {
+              return { success: false, error: "Koofr blocks requests from dayglance.app's servers. Use a self-hosted instance or the Android app to connect directly." };
+            }
+            return { success: false, error: "Access forbidden. If requests are going through a proxy, Koofr may be blocking that server's IP." };
+          }
           return { success: false, error: 'Access forbidden. Check that your app password is correct and has not been revoked.' };
         }
         return { success: false, error: `Unexpected response: ${res.status}${res.statusText ? ' ' + res.statusText : ''}` };
