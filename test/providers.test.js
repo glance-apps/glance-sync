@@ -309,13 +309,22 @@ describe('upload', () => {
 describe('Koofr test — native-required 403 handling', () => {
   afterEach(() => { vi.restoreAllMocks(); });
 
-  it('on web (nativeHttpRequest=null): 403 returns "use Android app" message', async () => {
+  it('on web hosted (nativeHttpRequest=null, isHostedApp=true): 403 returns "use Android app" message', async () => {
     const mockFetch = vi.fn().mockResolvedValue(mockResp(403));
     vi.stubGlobal('fetch', mockFetch);
-    const p = createProviders(BASE_ENGINE); // nativeHttpRequest: null
+    const p = createProviders({ ...BASE_ENGINE, isHostedApp: true });
     const result = await p.koofr.test({ username: 'u', appPassword: 'p' });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/Android app/);
+  });
+
+  it('on web self-hosted (nativeHttpRequest=null, isHostedApp=false): 403 returns proxy-block message', async () => {
+    const mockFetch = vi.fn().mockResolvedValue(mockResp(403));
+    vi.stubGlobal('fetch', mockFetch);
+    const p = createProviders(BASE_ENGINE); // nativeHttpRequest: null, isHostedApp: undefined
+    const result = await p.koofr.test({ username: 'u', appPassword: 'p' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/proxy/);
   });
 
   it('on Android (nativeHttpRequest present): 403 returns credential error message', async () => {
