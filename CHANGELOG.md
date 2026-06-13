@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-06-13
+
+### Added
+
+- **Phase 3: database (GLANCEvault) sync transport**, selected via
+  `transportMode: 'database'` in the engine config. The file-tier transport is
+  completely unchanged; file-tier users run the identical code path as before.
+  - `src/dbCrypto.js`: per-entity encryption. One PBKDF2 root key per account
+    (salt from the GLANCEvault salt endpoint), per-entity AES-256-GCM keys
+    HKDF-derived from it using the entityId as context, fresh IV per entity.
+  - `src/vaultClient.js`: Bearer-authenticated HTTP client for the vault batch,
+    list, get, delete, device, and salt endpoints, with an injectable fetch.
+  - `src/dbEngine.js`: row-grained engine with per-entity dirty tracking
+    (`markDirty`), seq-based incremental pull, entity-grain last-writer-wins,
+    insert-only union, partial-write safety, and a best-effort device cursor.
+  - New exports: `createDbSyncEngine`, `createVaultClient`, `setupDbRootKey`,
+    `initDbRootKey`, `clearDbRootKey`, `hasDbRootKey`, `encryptEntity`,
+    `decryptEntity`.
+  - See `docs/PHASE3_DB_TRANSPORT.md` for design decisions, the coordinated
+    GLANCEvault `POST /sync/:app/device` endpoint, and the Phase 4 cutover steps.
+
 ## [1.1.2] - 2026-06-04
 
 ### Fixed

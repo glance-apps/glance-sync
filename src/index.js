@@ -38,3 +38,15 @@ export {
   SCHEMA_VERSION,
   SUPPORTED_MAX_SCHEMA_VERSION,
 } from './engine.js';
+
+// Phase 3: database transport (selected via transportMode: 'database').
+export { createDbSyncEngine } from './dbEngine.js';
+export { createVaultClient } from './vaultClient.js';
+export {
+  setupDbRootKey,
+  initDbRootKey,
+  clearDbRootKey,
+  hasDbRootKey,
+  encryptEntity,
+  decryptEntity,
+} from './dbCrypto.js';

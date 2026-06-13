@@ -22,6 +22,7 @@
 //     written before Step 6 don't include either field).
 
 import { createProviders, webdavFetch } from './providers.js';
+import { createDbSyncEngine } from './dbEngine.js';
 import {
   hasEncryptionReady,
 } from './crypto.js';
@@ -56,6 +57,13 @@ const MIN_SYNC_DURATION_MS = 2000;
  * config schema and behavioral contract.
  */
 export const createSyncEngine = (config) => {
+  // Transport selection (Phase 3). When transportMode is 'database', delegate to
+  // the row-grained DB engine. The default ('file', or unset) falls through to
+  // the original file-tier engine below, whose code path is unchanged.
+  if (config.transportMode === 'database') {
+    return createDbSyncEngine(config);
+  }
+
   const {
     storageKeyPrefix,
     appId,
