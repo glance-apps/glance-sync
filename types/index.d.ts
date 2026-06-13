@@ -265,6 +265,9 @@ export interface ValidationResult {
 }
 
 export interface SyncEngineConfig {
+  // Transport selection (Phase 3). Defaults to 'file' when unset.
+  transportMode?: 'file' | 'database';
+
   // Identity
   storageKeyPrefix: string;
   cryptoDBName: string;
@@ -336,7 +339,119 @@ export interface SyncEngine {
   webdavFetch: WebdavFetch;
 }
 
+// createSyncEngine returns the file-tier engine by default, or the DB engine
+// when config.transportMode is 'database'.
 export function createSyncEngine(config: SyncEngineConfig): SyncEngine;
+export function createSyncEngine(config: DbSyncEngineConfig & { transportMode: 'database' }): DbSyncEngine;
 
 export const SCHEMA_VERSION: number;
 export const SUPPORTED_MAX_SCHEMA_VERSION: number;
+
+// ---------------------------------------------------------------------------
+// Database transport (Phase 3)
+// ---------------------------------------------------------------------------
+
+// Per-entity crypto. The root key is PBKDF2-derived from the passphrase and a
+// per-account salt; per-entity AES-GCM keys are HKDF-derived from it.
+export interface DbCryptoConfig {
+  cryptoDBName: string;
+  nativeGetSyncKey?: (() => string | null | Promise<string | null>) | null;
+  nativeStoreSyncKey?: ((value: string | null) => void) | null;
+}
+
+export function setupDbRootKey(passphrase: string, salt: Uint8Array, config: DbCryptoConfig): Promise<void>;
+export function initDbRootKey(config: DbCryptoConfig): Promise<boolean>;
+export function clearDbRootKey(config: DbCryptoConfig): Promise<void>;
+export function hasDbRootKey(): boolean;
+export function encryptEntity(entity: unknown, entityId: string, rootKey?: CryptoKey): Promise<string>;
+export function decryptEntity<T = unknown>(ciphertext: string, entityId: string, rootKey?: CryptoKey): Promise<T>;
+
+// Row exchanged with GLANCEvault. ciphertext is base64(IV || AES-GCM output).
+export interface VaultRow {
+  entityId: string;
+  ciphertext: string;
+  createdAt: number;
+}
+
+export interface VaultPulledRow extends Partial<VaultRow> {
+  entityId: string;
+  seq: number;
+  deleted?: boolean;
+  ciphertext?: string;
+}
+
+export interface VaultClient {
+  batch(app: string, args: { accountId: string; rows: VaultRow[] }): Promise<{ written: number; maxSeq: number }>;
+  list(app: string, args: { accountId: string; since: number }): Promise<{ rows: VaultPulledRow[]; hasMore: boolean }>;
+  getRow(app: string, entityId: string, accountId: string): Promise<VaultPulledRow | null>;
+  deleteRow(app: string, entityId: string, accountId: string): Promise<{ seq?: number } | null>;
+  device(app: string, args: { accountId: string; deviceId: string; lastSeenSeq: number }): Promise<{ updated: boolean }>;
+  getSalt(accountId: string): Promise<Uint8Array | null>;
+  putSalt(accountId: string, salt: Uint8Array): Promise<Uint8Array>;
+}
+
+export function createVaultClient(config: {
+  vaultUrl: string;
+  vaultToken: string;
+  fetchImpl?: typeof fetch;
+}): VaultClient;
+
+export interface DbSyncEngineConfig {
+  // Identity / local state
+  storageKeyPrefix: string;
+  appId: string;
+  vaultApp?: string;
+  cryptoDBName: string;
+  nativeGetSyncKey?: (() => string | null | Promise<string | null>) | null;
+  nativeStoreSyncKey?: ((value: string | null) => void) | null;
+
+  // Transport selection
+  transportMode?: 'database';
+
+  // Vault connection
+  vaultUrl?: string;
+  vaultToken?: string;
+  accountId: string;
+  deviceId?: string;
+  fetchImpl?: typeof fetch;
+  vaultClient?: VaultClient;
+
+  // Data callbacks
+  getLocalEntity: (entityId: string) => unknown | Promise<unknown>;
+  applyRemoteEntity: (entityId: string, entity: unknown) => void | Promise<void>;
+  applyRemoteDelete: (entityId: string) => void | Promise<void>;
+  isInsertOnly?: (entity: unknown, entityId: string) => boolean;
+  getEntityLastModified?: (entity: unknown) => string | number | undefined;
+
+  // Event callbacks
+  onStatusChange?: (status: SyncStatus, hints?: { from?: SyncStatus }) => void;
+  onError?: (message: string | null, code: SyncErrorCode | null, isHardStop: boolean) => void;
+}
+
+export interface DbSyncEngine {
+  transportMode: 'database';
+  sync(): Promise<void>;
+  dbSyncCycle(): Promise<void>;
+  pushDirtyRows(): Promise<{ written: number; deleted: number; maxSeq: number }>;
+  pullRemoteChanges(): Promise<{ maxSeq: number; appliedRemote: boolean }>;
+  updateDeviceCursor(): Promise<{ updated: boolean }>;
+  ensureRootKey(): Promise<void>;
+
+  markDirty(entityId: string): void;
+  getDirtySet(): string[];
+  clearDirty(): void;
+
+  getHighWaterMark(): number;
+  setHighWaterMark(seq: number): void;
+
+  getConfig(): Record<string, unknown> | null;
+  setConfig(config: Record<string, unknown> | null): void;
+  getLastSynced(): string | null;
+
+  isSyncing(): boolean;
+  hasEncryptionReady(): boolean;
+
+  vault: VaultClient;
+}
+
+export function createDbSyncEngine(config: DbSyncEngineConfig): DbSyncEngine;
