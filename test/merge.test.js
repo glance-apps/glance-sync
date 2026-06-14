@@ -260,6 +260,25 @@ describe('mergeRoutineDefinitions', () => {
     const { merged } = mergeRoutineDefinitions(local, remote, deleted);
     expect(merged.wed).toHaveLength(1);
   });
+
+  it('on id collision, the newer remote chip wins (field-level last-write-wins)', () => {
+    // Remote stamped an edit (e.g. ownerSyncId) onto an existing chip more recently.
+    const local  = { thu: [{ id: 'c5', name: 'Run', lastModified: ts(10) }] };
+    const remote = { thu: [{ id: 'c5', name: 'Run', ownerSyncId: 'jason', lastModified: ts(1) }] };
+    const { merged, localChanged } = mergeRoutineDefinitions(local, remote);
+    expect(merged.thu).toHaveLength(1);
+    expect(merged.thu[0].ownerSyncId).toBe('jason');
+    expect(localChanged).toBe(true);
+  });
+
+  it('on id collision, the newer local chip wins and remote is flagged', () => {
+    const local  = { fri: [{ id: 'c6', name: 'Read (renamed)', lastModified: ts(1) }] };
+    const remote = { fri: [{ id: 'c6', name: 'Read', lastModified: ts(10) }] };
+    const { merged, remoteChanged } = mergeRoutineDefinitions(local, remote);
+    expect(merged.fri).toHaveLength(1);
+    expect(merged.fri[0].name).toBe('Read (renamed)');
+    expect(remoteChanged).toBe(true);
+  });
 });
 
 // ─── mergeSyncData (integration) ──────────────────────────────────────────────
