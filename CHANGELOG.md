@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-06-14
+
+### Fixed
+
+- **`mergeRoutineDefinitions` now applies last-write-wins on chip id collisions.**
+  Previously, when the same chip id existed on both sides, the local chip was
+  kept verbatim and the remote one skipped — `lastModified` was only consulted
+  for tombstone resurrection. As a result, any edit to an existing routine chip
+  (rename, reorder, time change, or stamping `ownerSyncId`) failed to propagate
+  across devices. Colliding chips are now resolved by the newer `lastModified`,
+  matching the behavior of `mergeArrayById` / `mergeHabits`. Ordering and
+  tombstone behavior are preserved.
+
 ## [1.3.0] - 2026-06-14
 
 ### Added

@@ -115,8 +115,11 @@ export const mergeArrayById = (localItems, remoteItems, deletedIds, syncHorizon 
  *
  * Each side's bucket is an array of { id, name } chips.  The merge preserves
  * local ordering and appends any remote-only chips at the end — mirroring the
- * mergeArrayById strategy.  Chips present in the deletedChipIds tombstone map
- * are excluded from the merged result.
+ * mergeArrayById strategy.  When the same chip id exists on both sides, the
+ * version with the newer `lastModified` wins (field-level last-write-wins), so
+ * edits like renames, time changes, or ownership stamps propagate across
+ * devices.  Chips present in the deletedChipIds tombstone map are excluded from
+ * the merged result.
  *
  * @param {Object} localDefs  - Local routine definitions (bucket → chip[])
  * @param {Object} remoteDefs - Remote routine definitions (bucket → chip[])
@@ -141,40 +144,33 @@ export const mergeRoutineDefinitions = (localDefs, remoteDefs, deletedChipIds = 
   for (const bucket of allBuckets) {
     const localChips = localDefs[bucket] || [];
     const remoteChips = remoteDefs[bucket] || [];
-    const localIds = new Set(localChips.map(c => String(c.id)));
     const remoteMap = new Map(remoteChips.map(c => [String(c.id), c]));
+    const localMap = new Map(localChips.map(c => [String(c.id), c]));
+    const lm = (c) => c?.lastModified ? new Date(c.lastModified).getTime() : 0;
 
-    // Start with local chips in order, filtering out tombstoned chips
     const bucketMerged = [];
+    // Local chips in order; when a chip also exists remotely, take the newer one.
     for (const chip of localChips) {
-      if (isTombstoned(chip)) {
-        localChanged = true; // chip removed locally
-        continue;
+      if (isTombstoned(chip)) { localChanged = true; continue; }
+      const r = remoteMap.get(String(chip.id));
+      if (r && !isTombstoned(r) && lm(r) > lm(chip)) {
+        bucketMerged.push(r); localChanged = true;          // remote edit wins
+      } else {
+        bucketMerged.push(chip);
+        if (r && lm(chip) > lm(r)) remoteChanged = true;    // local edit is newer
       }
-      bucketMerged.push(chip);
     }
-
     // Append remote-only chips (skip tombstoned)
-    for (const remoteChip of remoteChips) {
-      const id = String(remoteChip.id);
-      if (localIds.has(id)) continue;
-      if (isTombstoned(remoteChip)) {
-        remoteChanged = true; // tell remote this was deleted
-        continue;
-      }
-      bucketMerged.push(remoteChip);
-      localChanged = true;
+    for (const r of remoteChips) {
+      if (localMap.has(String(r.id))) continue;
+      if (isTombstoned(r)) { remoteChanged = true; continue; }
+      bucketMerged.push(r); localChanged = true;
     }
-
-    // Check for local-only chips (remote needs them)
-    for (const localChip of localChips) {
-      const id = String(localChip.id);
-      if (isTombstoned(localChip)) continue; // don't flag deleted chips as needing push
-      if (!remoteMap.has(id)) {
-        remoteChanged = true;
-      }
+    // Local-only chips → remote needs them
+    for (const c of localChips) {
+      if (isTombstoned(c)) continue;
+      if (!remoteMap.has(String(c.id))) remoteChanged = true;
     }
-
     merged[bucket] = bucketMerged;
   }
 
