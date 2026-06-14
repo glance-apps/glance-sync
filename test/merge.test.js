@@ -261,23 +261,51 @@ describe('mergeRoutineDefinitions', () => {
     expect(merged.wed).toHaveLength(1);
   });
 
-  it('on id collision, the newer remote chip wins (field-level last-write-wins)', () => {
-    // Remote stamped an edit (e.g. ownerSyncId) onto an existing chip more recently.
+  it('on id collision with same ownership status, the newer remote chip wins (LWW)', () => {
     const local  = { thu: [{ id: 'c5', name: 'Run', lastModified: ts(10) }] };
-    const remote = { thu: [{ id: 'c5', name: 'Run', ownerSyncId: 'jason', lastModified: ts(1) }] };
+    const remote = { thu: [{ id: 'c5', name: 'Run (faster)', lastModified: ts(1) }] };
     const { merged, localChanged } = mergeRoutineDefinitions(local, remote);
     expect(merged.thu).toHaveLength(1);
-    expect(merged.thu[0].ownerSyncId).toBe('jason');
+    expect(merged.thu[0].name).toBe('Run (faster)');
     expect(localChanged).toBe(true);
   });
 
-  it('on id collision, the newer local chip wins and remote is flagged', () => {
+  it('on id collision with same ownership status, the newer local chip wins and remote is flagged', () => {
     const local  = { fri: [{ id: 'c6', name: 'Read (renamed)', lastModified: ts(1) }] };
     const remote = { fri: [{ id: 'c6', name: 'Read', lastModified: ts(10) }] };
     const { merged, remoteChanged } = mergeRoutineDefinitions(local, remote);
     expect(merged.fri).toHaveLength(1);
     expect(merged.fri[0].name).toBe('Read (renamed)');
     expect(remoteChanged).toBe(true);
+  });
+
+  it('a claimed remote chip beats an unclaimed local copy even when local is newer', () => {
+    // Jason claimed the chip on another device (older stamp); Maggie's local copy
+    // is unclaimed but was restamped more recently. The claim must still win.
+    const local  = { sat: [{ id: 'c7', name: 'Walk', lastModified: ts(1) }] };
+    const remote = { sat: [{ id: 'c7', name: 'Walk', ownerSyncId: 'jason', lastModified: ts(10) }] };
+    const { merged, localChanged } = mergeRoutineDefinitions(local, remote);
+    expect(merged.sat).toHaveLength(1);
+    expect(merged.sat[0].ownerSyncId).toBe('jason');
+    expect(localChanged).toBe(true);
+  });
+
+  it('a claimed local chip beats an unclaimed remote copy even when remote is newer', () => {
+    const local  = { sun: [{ id: 'c8', name: 'Walk', ownerSyncId: 'jason', lastModified: ts(10) }] };
+    const remote = { sun: [{ id: 'c8', name: 'Walk', lastModified: ts(1) }] };
+    const { merged, remoteChanged } = mergeRoutineDefinitions(local, remote);
+    expect(merged.sun).toHaveLength(1);
+    expect(merged.sun[0].ownerSyncId).toBe('jason');
+    expect(remoteChanged).toBe(true);
+  });
+
+  it('when both sides are claimed by different users, the newer lastModified wins', () => {
+    const local  = { mon: [{ id: 'c9', name: 'Cook', ownerSyncId: 'maggie', lastModified: ts(10) }] };
+    const remote = { mon: [{ id: 'c9', name: 'Cook', ownerSyncId: 'jason', lastModified: ts(1) }] };
+    const { merged, localChanged } = mergeRoutineDefinitions(local, remote);
+    expect(merged.mon).toHaveLength(1);
+    expect(merged.mon[0].ownerSyncId).toBe('jason'); // remote is newer
+    expect(localChanged).toBe(true);
   });
 });
 

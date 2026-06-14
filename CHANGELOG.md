@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-06-14
+
+### Fixed
+
+- **`mergeRoutineDefinitions` chip collisions are now ownership-aware.** Routine
+  chips can be claimed by a user (stamping `ownerSyncId`), and claiming is a
+  one-way transition. Previously collisions were resolved purely by newer
+  `lastModified`, so an unclaimed copy of a chip could beat a claimed copy when
+  it carried an equal-or-newer timestamp — a claim made on one device would
+  never reach a device still holding the unclaimed copy. Resolution now prefers
+  the claimed side when exactly one side is claimed, regardless of
+  `lastModified`; when both sides share the same ownership status (both claimed
+  or both unclaimed), the newer `lastModified` still wins. Ordering and
+  tombstone behavior are unchanged.
+
 ## [1.3.1] - 2026-06-14
 
 ### Fixed

@@ -115,11 +115,14 @@ export const mergeArrayById = (localItems, remoteItems, deletedIds, syncHorizon 
  *
  * Each side's bucket is an array of { id, name } chips.  The merge preserves
  * local ordering and appends any remote-only chips at the end — mirroring the
- * mergeArrayById strategy.  When the same chip id exists on both sides, the
+ * mergeArrayById strategy.  When the same chip id exists on both sides, a
+ * claimed chip (one carrying an `ownerSyncId`) always beats an unclaimed copy —
+ * claiming is a one-way transition, so the unclaimed side is stale regardless of
+ * its `lastModified`.  When both sides share the same ownership status, the
  * version with the newer `lastModified` wins (field-level last-write-wins), so
- * edits like renames, time changes, or ownership stamps propagate across
- * devices.  Chips present in the deletedChipIds tombstone map are excluded from
- * the merged result.
+ * edits like renames and time changes still propagate across devices.  Chips
+ * present in the deletedChipIds tombstone map are excluded from the merged
+ * result.
  *
  * @param {Object} localDefs  - Local routine definitions (bucket → chip[])
  * @param {Object} remoteDefs - Remote routine definitions (bucket → chip[])
@@ -147,17 +150,22 @@ export const mergeRoutineDefinitions = (localDefs, remoteDefs, deletedChipIds = 
     const remoteMap = new Map(remoteChips.map(c => [String(c.id), c]));
     const localMap = new Map(localChips.map(c => [String(c.id), c]));
     const lm = (c) => c?.lastModified ? new Date(c.lastModified).getTime() : 0;
+    const owned = (c) => !!c?.ownerSyncId;
+    // A claimed chip (has ownerSyncId) always overrides an unclaimed copy of the
+    // same id — claiming is one-way, so the unclaimed side is stale regardless of
+    // its lastModified. Same ownership status on both sides → newer wins.
+    const overrides = (x, y) => owned(x) !== owned(y) ? owned(x) : lm(x) > lm(y);
 
     const bucketMerged = [];
-    // Local chips in order; when a chip also exists remotely, take the newer one.
+    // Local chips in order; when a chip also exists remotely, take the winner.
     for (const chip of localChips) {
       if (isTombstoned(chip)) { localChanged = true; continue; }
       const r = remoteMap.get(String(chip.id));
-      if (r && !isTombstoned(r) && lm(r) > lm(chip)) {
-        bucketMerged.push(r); localChanged = true;          // remote edit wins
+      if (r && !isTombstoned(r) && overrides(r, chip)) {
+        bucketMerged.push(r); localChanged = true;          // remote version wins
       } else {
         bucketMerged.push(chip);
-        if (r && lm(chip) > lm(r)) remoteChanged = true;    // local edit is newer
+        if (r && overrides(chip, r)) remoteChanged = true;  // local version wins → push
       }
     }
     // Append remote-only chips (skip tombstoned)
