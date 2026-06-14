@@ -366,10 +366,10 @@ export function hasDbRootKey(): boolean;
 export function encryptEntity(entity: unknown, entityId: string, rootKey?: CryptoKey): Promise<string>;
 export function decryptEntity<T = unknown>(ciphertext: string, entityId: string, rootKey?: CryptoKey): Promise<T>;
 
-// Row exchanged with GLANCEvault. ciphertext is base64(IV || AES-GCM output).
+// Row exchanged with GLANCEvault. envelope is base64(IV || AES-GCM output).
 export interface VaultRow {
   entityId: string;
-  ciphertext: string;
+  envelope: string;
   createdAt: number;
 }
 
@@ -377,7 +377,7 @@ export interface VaultPulledRow extends Partial<VaultRow> {
   entityId: string;
   seq: number;
   deleted?: boolean;
-  ciphertext?: string;
+  envelope?: string;
 }
 
 export interface VaultClient {

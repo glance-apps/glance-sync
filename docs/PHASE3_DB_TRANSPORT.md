@@ -33,7 +33,8 @@ Public exports added to `src/index.js`: `createDbSyncEngine`, `createVaultClient
 `dbSyncCycle()` runs on the same schedule the file tier uses for `download()`:
 
 1. PUSH dirty rows. Each dirty entityId is encrypted into
-   `{ entityId, ciphertext, createdAt }` and upserted via
+   `{ entityId, envelope, createdAt }` (the `envelope` is the base64 ciphertext)
+   and upserted via
    `POST /sync/:app/batch`. The dirty set is cleared and the high water mark is
    advanced to `maxSeq` only on full server acknowledgment. On any failure the
    dirty set is kept and re-sent idempotently next cycle (rows are keyed by

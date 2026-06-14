@@ -202,8 +202,8 @@ export const createDbSyncEngine = (config) => {
       if (entity == null) {
         deletes.push(entityId);
       } else {
-        const ciphertext = await encryptEntity(entity, entityId);
-        upserts.push({ entityId, ciphertext, createdAt: Date.now() });
+        const envelope = await encryptEntity(entity, entityId);
+        upserts.push({ entityId, envelope, createdAt: Date.now() });
       }
     }
 
@@ -256,7 +256,7 @@ export const createDbSyncEngine = (config) => {
         }
 
         await ensureRootKey();
-        const remoteEntity = await decryptEntity(R.ciphertext, R.entityId);
+        const remoteEntity = await decryptEntity(R.envelope, R.entityId);
         const local = await getLocalEntity(R.entityId);
 
         if (local == null) {
