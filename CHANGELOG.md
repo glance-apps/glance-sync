@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-06-14
+
+### Added
+
+- **Multi-user roster sync in `mergeSyncData`.** A `users` array is now merged
+  across devices using last-write-wins per user, keyed by `syncId` (falling back
+  to `id`) and resolved by `updatedAt`. A roster signature (id, `updatedAt`,
+  `deleted` flag, and `name`) drives the `localChanged` / `remoteChanged` dirty
+  flags so roster edits propagate. The per-device `multiUserEnabled` toggle is
+  intentionally not merged.
+
 ## [1.2.1] - 2026-06-14
 
 ### Fixed
