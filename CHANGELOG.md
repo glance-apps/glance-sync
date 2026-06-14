@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-06-14
+
+### Fixed
+
+- **DB sync transport: row field renamed `ciphertext` to `envelope`** to match the
+  GLANCEvault batch and list endpoints. The encrypted rows exchanged with the
+  vault are now `{ entityId, envelope, createdAt }`; the field rename is applied
+  across the push row, the pull read, the vault client and engine types, the
+  tests, and the docs. The base64 encoding is unchanged: the value is still
+  `base64(IV || AES-GCM output)` produced by `encryptEntity`.
+
 ## [1.2.0] - 2026-06-13
 
 ### Added

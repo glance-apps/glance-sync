@@ -39,7 +39,7 @@ const FIXED_SALT = new Uint8Array(16).fill(5);
 // ---------- Mock vault ----------
 
 const makeStatefulVault = () => {
-  const rows = new Map(); // entityId -> { entityId, ciphertext, createdAt, seq, deleted }
+  const rows = new Map(); // entityId -> { entityId, envelope, createdAt, seq, deleted }
   let seq = 0;
   const calls = { batch: [], list: [], deleteRow: [], device: [] };
   return {
@@ -141,7 +141,7 @@ describe('pull cycle', () => {
     // Build five encrypted remote rows with explicit seqs.
     const mk = async (entityId, entity, seq) => ({
       entityId,
-      ciphertext: await encryptEntity(entity, entityId),
+      envelope: await encryptEntity(entity, entityId),
       createdAt: Date.now(),
       seq,
       deleted: false,

@@ -257,7 +257,7 @@ export async function clearDbRootKey({ cryptoDBName, nativeGetSyncKey = null, na
 
 /**
  * Encrypts one entity into a base64 ciphertext string for the row's
- * `ciphertext` field. The output encodes [ 12-byte IV ][ AES-GCM ciphertext ].
+ * `envelope` field. The output encodes [ 12-byte IV ][ AES-GCM ciphertext ].
  *
  * @param {*} entity        - plain JS value to encrypt (serialised with JSON)
  * @param {string} entityId - stable entity UUID, used as HKDF context
@@ -280,7 +280,7 @@ export async function encryptEntity(entity, entityId, rootKey = _rootKey) {
 /**
  * Decrypts a base64 ciphertext produced by encryptEntity back into the entity.
  *
- * @param {string} ciphertextB64 - the row's `ciphertext` field
+ * @param {string} ciphertextB64 - the row's `envelope` field
  * @param {string} entityId      - stable entity UUID, used as HKDF context
  * @param {CryptoKey} [rootKey]  - explicit root key (defaults to the session key)
  * @returns {Promise<*>} the decrypted entity

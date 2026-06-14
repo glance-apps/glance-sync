@@ -75,7 +75,7 @@ export function createVaultClient({ vaultUrl, vaultToken, fetchImpl } = {}) {
 
   return {
     /**
-     * Upserts a batch of rows. Each row is { entityId, ciphertext, createdAt }.
+     * Upserts a batch of rows. Each row is { entityId, envelope, createdAt }.
      * @returns {Promise<{ written: number, maxSeq: number }>}
      */
     async batch(app, { accountId, rows }) {
