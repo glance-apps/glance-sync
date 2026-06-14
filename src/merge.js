@@ -832,6 +832,25 @@ export const mergeSyncData = (localData, remoteData, retentionDays = 90) => {
   const prunedDeletedGoalIds = pruneTombstones(allDeletedGoalIds, tombstoneCutoff);
   const prunedDeletedProjectIds = pruneTombstones(allDeletedProjectIds, tombstoneCutoff);
 
+  // ── Multi-user roster: last-write-wins per user by updatedAt (keyed by syncId).
+  // NOTE: multiUserEnabled is intentionally NOT merged — it's a per-device toggle.
+  const localUsers  = Array.isArray(localData.users)  ? localData.users  : [];
+  const remoteUsers = Array.isArray(remoteData.users) ? remoteData.users : [];
+  const usersById = new Map(localUsers.map(u => [u.syncId ?? u.id, u]));
+  for (const u of remoteUsers) {
+    const k = u.syncId ?? u.id;
+    const prev = usersById.get(k);
+    if (!prev || (u.updatedAt || '') > (prev.updatedAt || '')) usersById.set(k, u);
+  }
+  const mergedUsers = [...usersById.values()];
+
+  const rosterSig = (arr) => arr
+    .map(u => `${u.syncId ?? u.id}:${u.updatedAt || ''}:${u.deleted ? 1 : 0}:${u.name || ''}`)
+    .sort().join('|');
+  const mergedSig = rosterSig(mergedUsers);
+  if (mergedSig !== rosterSig(localUsers))  localChanged  = true;
+  if (mergedSig !== rosterSig(remoteUsers)) remoteChanged = true;
+
   return {
     data: {
       tasks: finalTasks,
@@ -877,6 +896,7 @@ export const mergeSyncData = (localData, remoteData, retentionDays = 90) => {
       minimizedSections: localData.minimizedSections, // UI pref — keep local
       use24HourClock: localData.use24HourClock, // device pref — keep local
       tombstonePrunedBefore: mergedTombstonePrunedBefore,
+      users: mergedUsers,
     },
     localChanged,
     remoteChanged
