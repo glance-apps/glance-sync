@@ -105,7 +105,16 @@ export const createDbSyncEngine = (config) => {
 
   // localStorage keys owned by this engine.
   const KEY_CONFIG = `${storageKeyPrefix}-db-sync-config`;
+  // KEY_HWM is the PULL cursor: the highest seq this device has actually
+  // consumed (listed + applied). It is the `since` we resume pulling from, so
+  // only the pull step may advance it. A push consumes nothing and must never
+  // touch it — see KEY_PUSH_ACK below.
   const KEY_HWM    = `${storageKeyPrefix}-db-sync-hwm`;
+  // KEY_PUSH_ACK is the PUSH high-water mark: the highest seq the server has
+  // assigned to rows this device has pushed and fully acknowledged. It exists
+  // purely for push idempotency/observability and is never read by the pull
+  // cursor, so it cannot cause unread remote rows to be skipped.
+  const KEY_PUSH_ACK = `${storageKeyPrefix}-db-sync-push-ack`;
   const KEY_DIRTY  = `${storageKeyPrefix}-db-sync-dirty`;
   const KEY_LAST_SYNCED = `${storageKeyPrefix}-db-sync-last-synced`;
 
@@ -123,6 +132,10 @@ export const createDbSyncEngine = (config) => {
   };
   const getLastSynced = () => localStorage.getItem(KEY_LAST_SYNCED) || null;
 
+  // PULL cursor. Advanced only by pullRemoteChanges from rows actually applied.
+  // An existing stored value from before the pull/push split is read as
+  // pull-progress, which is the conservative interpretation (it never lets us
+  // resume ahead of what we have consumed).
   const getHighWaterMark = () => {
     const raw = localStorage.getItem(KEY_HWM);
     const n = raw == null ? 0 : Number(raw);
@@ -130,6 +143,17 @@ export const createDbSyncEngine = (config) => {
   };
   const setHighWaterMark = (seq) => {
     localStorage.setItem(KEY_HWM, String(seq));
+  };
+
+  // PUSH high-water mark. Tracked separately so a push can never advance the
+  // pull cursor (KEY_HWM) and skip lower-seq remote rows.
+  const getPushAck = () => {
+    const raw = localStorage.getItem(KEY_PUSH_ACK);
+    const n = raw == null ? 0 : Number(raw);
+    return Number.isFinite(n) ? n : 0;
+  };
+  const setPushAck = (seq) => {
+    localStorage.setItem(KEY_PUSH_ACK, String(seq));
   };
 
   // Dirty set persisted as a JSON array; deduped via Set on read/write.
@@ -187,11 +211,14 @@ export const createDbSyncEngine = (config) => {
   // ── Step 1: push dirty rows ───────────────────────────────────────────────
   // Encrypts every dirty entity and upserts it as a batch. Entities that no
   // longer exist locally are pushed as soft-deletes. The dirty set is cleared
-  // and the high water mark advanced only after the server fully acknowledges,
-  // so a network failure leaves un-acked rows dirty for an idempotent re-send.
+  // and the push-ack high water mark advanced only after the server fully
+  // acknowledges, so a network failure leaves un-acked rows dirty for an
+  // idempotent re-send. Push deliberately does NOT touch the pull cursor
+  // (getHighWaterMark): the server assigns pushed rows the highest seqs, so
+  // advancing `since` here would skip any remote row whose seq sits below them.
   const pushDirtyRows = async () => {
     const dirty = getDirtySet();
-    if (dirty.length === 0) return { written: 0, deleted: 0, maxSeq: getHighWaterMark() };
+    if (dirty.length === 0) return { written: 0, deleted: 0, maxSeq: getPushAck() };
 
     await ensureRootKey();
 
@@ -208,8 +235,8 @@ export const createDbSyncEngine = (config) => {
     }
 
     // Soft-delete first, then batch the upserts. If any call throws, we fall out
-    // before clearing the dirty set or advancing the cursor.
-    let maxSeq = getHighWaterMark();
+    // before clearing the dirty set or advancing the push-ack marker.
+    let maxSeq = getPushAck();
     for (const entityId of deletes) {
       const r = await vault.deleteRow(app, entityId, accountId);
       if (r && typeof r.seq === 'number') maxSeq = Math.max(maxSeq, r.seq);
@@ -220,9 +247,11 @@ export const createDbSyncEngine = (config) => {
       if (result && typeof result.maxSeq === 'number') maxSeq = Math.max(maxSeq, result.maxSeq);
     }
 
-    // Full acknowledgment: safe to mark clean.
+    // Full acknowledgment: safe to mark clean. Advance the push-ack marker only;
+    // the pull cursor stays put so the next pull still lists from the highest
+    // seq we have actually consumed.
     clearDirty();
-    setHighWaterMark(maxSeq);
+    setPushAck(maxSeq);
     return { written: upserts.length, deleted: deletes.length, maxSeq };
   };
 
@@ -285,13 +314,18 @@ export const createDbSyncEngine = (config) => {
       hasMore = !!more;
     }
 
+    // Pull is the sole writer of the pull cursor. Advance it (monotonically)
+    // from the highest seq we actually listed this run.
     setHighWaterMark(Math.max(getHighWaterMark(), maxSeq));
     return { maxSeq, appliedRemote };
   };
 
   // ── Step 3: update device cursor ──────────────────────────────────────────
   // Best-effort: a failure here only affects tombstone GC timing, never sync
-  // correctness, so it is swallowed.
+  // correctness, so it is swallowed. lastSeenSeq reports the pull cursor (what
+  // we have truly consumed), not the push-ack marker: reporting consumed
+  // progress is the conservative value for server-side tombstone GC, since it
+  // never lets the server reclaim a tombstone this device has not yet seen.
   const updateDeviceCursor = async () => {
     if (!deviceId) return { updated: false };
     try {
@@ -352,9 +386,11 @@ export const createDbSyncEngine = (config) => {
     getDirtySet,
     clearDirty,
 
-    // Cursor
+    // Cursor (pull-progress) and push-ack marker
     getHighWaterMark,
     setHighWaterMark,
+    getPushAck,
+    setPushAck,
 
     // Config
     getConfig,

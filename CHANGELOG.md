@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-06-18
+
+### Fixed
+
+- **DB sync push no longer skips unread remote rows.** The DB engine split the
+  single high-water mark into two cursors: a pull cursor (`getHighWaterMark`,
+  the highest seq actually listed and applied) that only the pull step
+  advances, and a separate push-ack marker (`getPushAck`) for push
+  idempotency. Previously `pushDirtyRows` advanced the shared high-water mark to
+  the max seq the server assigned its pushed rows; because pushed rows get the
+  highest seqs, the next pull resumed from `since` above any remote row whose
+  seq sat below them and silently skipped it — unrecoverable for insert-only
+  rows. A push consumes nothing and now never moves the pull cursor, so
+  push-then-pull and pull-then-push are both safe. An existing stored cursor is
+  read as pull-progress (the conservative interpretation), so upgrades are safe.
+
+### Added
+
+- `getPushAck()` / `setPushAck()` on the DB sync engine expose the push-ack
+  high-water mark.
+
 ## [1.3.2] - 2026-06-14
 
 ### Fixed
