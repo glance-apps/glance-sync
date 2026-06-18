@@ -103,7 +103,7 @@ beforeEach(async () => {
 // ---------- #3 push cycle ----------
 
 describe('push cycle', () => {
-  it('posts a batch of dirty rows, then clears the dirty set and advances the high water mark', async () => {
+  it('posts a batch of dirty rows, then clears the dirty set and advances the push-ack marker (not the pull cursor)', async () => {
     const local = new Map([
       ['a', { id: 'a', lastModified: '2026-01-01T00:00:00Z' }],
       ['b', { id: 'b', lastModified: '2026-01-01T00:00:00Z' }],
@@ -116,6 +116,7 @@ describe('push cycle', () => {
     engine.markDirty('c');
     expect(engine.getDirtySet().sort()).toEqual(['a', 'b', 'c']);
     expect(engine.getHighWaterMark()).toBe(0);
+    expect(engine.getPushAck()).toBe(0);
 
     const result = await engine.pushDirtyRows();
 
@@ -123,7 +124,10 @@ describe('push cycle', () => {
     expect(vault.calls.batch[0]).toHaveLength(3);
     expect(result.maxSeq).toBe(3);
     expect(engine.getDirtySet()).toEqual([]);
-    expect(engine.getHighWaterMark()).toBe(3);
+    // Push records its ack...
+    expect(engine.getPushAck()).toBe(3);
+    // ...but must NOT advance the pull cursor: a push consumes nothing.
+    expect(engine.getHighWaterMark()).toBe(0);
   });
 
   it('is a no-op when nothing is dirty', async () => {
@@ -254,8 +258,89 @@ describe('idempotency', () => {
     // Server keyed rows by entityId: still exactly 3 rows, no duplicates.
     expect(vault.rows.size).toBe(3);
     expect(second.maxSeq).toBe(6);
-    expect(engine.getHighWaterMark()).toBe(6);
+    expect(engine.getPushAck()).toBe(6);
+    // Pull cursor untouched by either push.
+    expect(engine.getHighWaterMark()).toBe(0);
     expect(engine.getDirtySet()).toEqual([]);
+  });
+});
+
+// ---------- multi-device: push must not skip unread remote rows ----------
+
+describe('multi-device cursor isolation', () => {
+  it('neither device skips the other\'s unread rows when it pushes in the same cycle, including insert-only', async () => {
+    // One shared server (shared rows + seq counter) so both devices see each
+    // other's writes through the seq cursor exactly as the real vault would.
+    const vault = makeStatefulVault();
+
+    const makeDev = (prefix, local) => createDbSyncEngine({
+      storageKeyPrefix: prefix,
+      appId: 'test-app',
+      accountId: 'acct-multi',
+      deviceId: prefix,
+      cryptoDBName: CRYPTO_CFG.cryptoDBName,
+      vaultClient: vault,
+      getLocalEntity: (id) => (local.has(id) ? local.get(id) : null),
+      applyRemoteEntity: (id, e) => { local.set(id, e); },
+      applyRemoteDelete: (id) => { local.delete(id); },
+      isInsertOnly: (e) => !!(e && e.insertOnly),
+    });
+
+    const localA = new Map();
+    const localB = new Map();
+    const A = makeDev('devA', localA);
+    const B = makeDev('devB', localB);
+
+    const LM = '2026-01-01T00:00:00Z';
+
+    // ── Phase 1: device B pushes first, so its rows take the LOW seqs (1, 2).
+    // 'B-ins' is insert-only: if a peer ever skips it, it can never self-heal
+    // via later LWW because insert-only rows are a pure union with no conflict.
+    localB.set('B-ins',  { id: 'B-ins',  insertOnly: true, v: 'fromB', lastModified: LM });
+    localB.set('B-norm', { id: 'B-norm', v: 'fromB', lastModified: LM });
+    B.markDirty('B-ins');
+    B.markDirty('B-norm');
+    await B.pushDirtyRows();           // server seqs 1, 2
+    expect(B.getHighWaterMark()).toBe(0); // push must not move B's pull cursor
+
+    // ── Phase 2: device A's cycle. A has its own dirty rows AND two unread
+    // remote rows from B (seqs 1, 2) sitting BELOW the seqs A is about to push.
+    localA.set('A-ins',  { id: 'A-ins',  insertOnly: true, v: 'fromA', lastModified: LM });
+    localA.set('A-norm', { id: 'A-norm', v: 'fromA', lastModified: LM });
+    A.markDirty('A-ins');
+    A.markDirty('A-norm');
+
+    await A.pushDirtyRows();           // server seqs 3, 4
+    // The crux: pushing must not advance A's pull cursor past B's unread rows.
+    expect(A.getHighWaterMark()).toBe(0);
+    await A.pullRemoteChanges();
+
+    // A must have consumed B's rows — including the insert-only one.
+    expect(localA.has('B-ins')).toBe(true);
+    expect(localA.get('B-ins')).toMatchObject({ v: 'fromB', insertOnly: true });
+    expect(localA.has('B-norm')).toBe(true);
+
+    // ── Phase 3: device B's cycle. B now has a fresh dirty row plus two unread
+    // remote rows from A (seqs 3, 4) sitting BELOW the seq B is about to push.
+    localB.set('B-norm2', { id: 'B-norm2', v: 'fromB', lastModified: LM });
+    B.markDirty('B-norm2');
+
+    await B.pushDirtyRows();           // server seq 5
+    expect(B.getHighWaterMark()).toBe(0); // still unmoved by push
+    await B.pullRemoteChanges();
+
+    // B must have consumed A's rows — including the insert-only one.
+    expect(localB.has('A-ins')).toBe(true);
+    expect(localB.get('A-ins')).toMatchObject({ v: 'fromA', insertOnly: true });
+    expect(localB.has('A-norm')).toBe(true);
+
+    // Each pull cursor sits at the highest seq that device has truly consumed:
+    // A last pulled through seq 4; B last pulled through seq 5. The push-ack
+    // markers reflect each device's own writes (A: 3,4 -> 4; B: 1,2,5 -> 5).
+    expect(A.getHighWaterMark()).toBe(4);
+    expect(B.getHighWaterMark()).toBe(5);
+    expect(A.getPushAck()).toBe(4);
+    expect(B.getPushAck()).toBe(5);
   });
 });
 

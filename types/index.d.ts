@@ -441,8 +441,12 @@ export interface DbSyncEngine {
   getDirtySet(): string[];
   clearDirty(): void;
 
+  /** Pull cursor: highest seq actually listed + applied. Only pull advances it. */
   getHighWaterMark(): number;
   setHighWaterMark(seq: number): void;
+  /** Push-ack marker: highest seq the server assigned to pushed rows. Never feeds the pull cursor. */
+  getPushAck(): number;
+  setPushAck(seq: number): void;
 
   getConfig(): Record<string, unknown> | null;
   setConfig(config: Record<string, unknown> | null): void;
