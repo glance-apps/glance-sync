@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-06-19
+
+### Fixed
+
+- **Key verifier no longer fails with a cryptic `get row failed: 400`.** The
+  verifier's single-row GET (`GET /sync/{app}/__glance_keycheck`) is scoped by
+  `accountId`, which GLANCEvault requires as a query param on every row-scoped
+  endpoint. When the verifier ran with an `accountId` that was empty or
+  whitespace — e.g. fired during reconstruction before the account id was
+  populated — the request went out as `?accountId=` (or `?accountId=+++`), which
+  the server correctly rejects with `400 {"error":"accountId is required"}`,
+  aborting enable. The default `createVaultClient` now validates `accountId` on
+  every row-scoped call (`batch`, `list`, single-row GET, `DELETE`, `device`) and
+  throws a clear, typed, retryable `ACCOUNT_ID_REQUIRED` instead of putting a
+  malformed `accountId` on the wire — so the next cycle (once the id is loaded)
+  succeeds. `createDbSyncEngine` also rejects an empty/whitespace `accountId` at
+  construction (a whitespace-only id previously passed the plain falsy check).
+  The verifier path surfaces `ACCOUNT_ID_REQUIRED` (and `PASSPHRASE_REQUIRED`)
+  with their own code rather than mislabeling them `VERIFIER_UNSUPPORTED`. The
+  verifier GET correctly carries `?accountId=...` (like the working `list` call)
+  and, on a fresh account, 404 → writes the verifier via `batch` with
+  `accountId` + `insertOnly: true`.
+
+### Added
+
+- `ACCOUNT_ID_REQUIRED` standardized on the `SyncErrorCode` type.
+
 ## [1.5.1] - 2026-06-19
 
 ### Fixed

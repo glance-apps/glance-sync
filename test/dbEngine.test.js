@@ -530,6 +530,94 @@ describe('key verifier (Part A)', () => {
   });
 });
 
+// ---------- keycheck GET carries accountId (real HTTP client) ----------
+//
+// Regression for "get row failed: 400": the verifier's single-row GET must
+// carry ?accountId=..., exactly like the working `list` call, and the verifier
+// write must include accountId + insertOnly:true. Driven through the REAL
+// createVaultClient (built from vaultUrl/fetchImpl) so the URL the client puts
+// on the wire is what's asserted.
+describe('keycheck request shape (real vault client)', () => {
+  const makeRecordingFetch = (urls) => async (url, init) => {
+    urls.push({ method: init.method, url, body: init.body ? JSON.parse(init.body) : undefined });
+    if (url.includes('/__glance_keycheck')) {
+      // Mimic the server: 400 if accountId missing/empty, else 404 (new account).
+      const acct = new URL(url).searchParams.get('accountId');
+      if (!acct || acct.trim() === '') return { ok: false, status: 400, json: async () => ({ error: 'accountId is required' }) };
+      return { ok: false, status: 404, json: async () => ({ error: 'not found' }) };
+    }
+    if (url.includes('/batch')) return { ok: true, status: 200, json: async () => ({ written: 1, maxSeq: 1 }) };
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+
+  const makeRealEngine = (urls, accountId = 'house-1') => createDbSyncEngine({
+    storageKeyPrefix: `real-${accountId}`,
+    appId: 'dayglance',
+    accountId,
+    vaultUrl: 'https://vault.example',
+    vaultToken: 'tok',
+    cryptoDBName: CRYPTO_CFG.cryptoDBName, // root key already set up in beforeEach
+    fetchImpl: makeRecordingFetch(urls),
+    getLocalEntity: () => null,
+    applyRemoteEntity: () => {},
+    applyRemoteDelete: () => {},
+  });
+
+  it('the verifier GET carries ?accountId=... and returns 404 -> writes the verifier (insertOnly) without a 400', async () => {
+    const urls = [];
+    const engine = makeRealEngine(urls);
+
+    await engine.ensureRootKey();
+    expect(engine.isKeyVerified()).toBe(true);
+
+    const getCall = urls.find(u => u.method === 'GET' && u.url.includes('/__glance_keycheck'));
+    expect(getCall).toBeTruthy();
+    // The crux: the query string carries the accountId, like the working list call.
+    expect(new URL(getCall.url).searchParams.get('accountId')).toBe('house-1');
+
+    // On 404 the verifier is written via batch with accountId + insertOnly:true.
+    const batchCall = urls.find(u => u.method === 'POST' && u.url.includes('/batch'));
+    expect(batchCall).toBeTruthy();
+    expect(batchCall.body.accountId).toBe('house-1');
+    expect(batchCall.body.rows[0]).toMatchObject({ entityId: KEYCHECK_ENTITY_ID, insertOnly: true });
+  });
+});
+
+// ---------- accountId readiness (no cryptic 400) ----------
+
+describe('accountId readiness', () => {
+  it('rejects a whitespace-only accountId at construction (would serialize to ?accountId=+++ -> 400)', () => {
+    expect(() => createDbSyncEngine({
+      storageKeyPrefix: 'ws', appId: 'a', accountId: '   ',
+      vaultUrl: 'https://v', vaultToken: 't', cryptoDBName: CRYPTO_CFG.cryptoDBName,
+      getLocalEntity: () => null, applyRemoteEntity: () => {}, applyRemoteDelete: () => {},
+    })).toThrow(/accountId is required/);
+  });
+
+  it('the real vault client throws a clear ACCOUNT_ID_REQUIRED instead of firing ?accountId= (no cryptic 400)', async () => {
+    const { createVaultClient } = await import('../src/vaultClient.js');
+    let fetched = false;
+    const client = createVaultClient({
+      vaultUrl: 'https://v', vaultToken: 't',
+      fetchImpl: async () => { fetched = true; return { ok: true, status: 200, json: async () => ({}) }; },
+    });
+    await expect(client.getRow('app', KEYCHECK_ENTITY_ID, '')).rejects.toMatchObject({ code: 'ACCOUNT_ID_REQUIRED' });
+    await expect(client.getRow('app', KEYCHECK_ENTITY_ID, '   ')).rejects.toMatchObject({ code: 'ACCOUNT_ID_REQUIRED' });
+    expect(fetched).toBe(false); // never hit the wire with a malformed accountId
+  });
+
+  it('a verifier getRow that fails for ACCOUNT_ID_REQUIRED surfaces that code, NOT VERIFIER_UNSUPPORTED', async () => {
+    const vault = {
+      async getRow() { const e = new Error('get row: accountId is required'); e.code = 'ACCOUNT_ID_REQUIRED'; throw e; },
+      async batch() { return { written: 1, maxSeq: 1 }; },
+      async list() { return { rows: [], hasMore: false }; },
+      async device() { return { updated: true }; },
+    };
+    const { engine } = makeEngine({ vault });
+    await expect(engine.ensureRootKey()).rejects.toMatchObject({ code: 'ACCOUNT_ID_REQUIRED' });
+  });
+});
+
 // ---------- Part B: per-row quarantine ----------
 
 describe('per-row quarantine (Part B)', () => {
