@@ -16,7 +16,12 @@ export type SyncErrorCode =
   | 'FORBIDDEN'
   | 'AUTH_FAILURE'
   | 'LOCKED'
-  | 'NETWORK_ERROR';
+  | 'NETWORK_ERROR'
+  // DB transport: derived root key does not match the account's existing data.
+  | 'KEY_MISMATCH'
+  // DB transport: a single row failed to decrypt (surfaced as a count via
+  // onRowsSkipped, never thrown).
+  | 'ROW_DECRYPT_FAILED';
 
 export type SyncStatus = 'idle' | 'uploading' | 'downloading' | 'success' | 'error';
 
@@ -366,6 +371,14 @@ export function hasDbRootKey(): boolean;
 export function encryptEntity(entity: unknown, entityId: string, rootKey?: CryptoKey): Promise<string>;
 export function decryptEntity<T = unknown>(ciphertext: string, entityId: string, rootKey?: CryptoKey): Promise<T>;
 
+// Engine-reserved entities. Rows whose entityId starts with RESERVED_ENTITY_PREFIX
+// are owned by the sync engine (e.g. the key verifier) and are never routed to
+// getLocalEntity / applyRemoteEntity.
+export const RESERVED_ENTITY_PREFIX: string;
+export const KEYCHECK_ENTITY_ID: string;
+export const KEYCHECK_PAYLOAD: { v: number; magic: string };
+export function isReservedEntityId(entityId: string): boolean;
+
 // Row exchanged with GLANCEvault. envelope is base64(IV || AES-GCM output).
 export interface VaultRow {
   entityId: string;
@@ -425,21 +438,39 @@ export interface DbSyncEngineConfig {
 
   // Event callbacks
   onStatusChange?: (status: SyncStatus, hints?: { from?: SyncStatus }) => void;
+  // Called with code === 'KEY_MISMATCH' when the derived key doesn't match the account.
   onError?: (message: string | null, code: SyncErrorCode | null, isHardStop: boolean) => void;
+  // Called once per cycle that skipped > 0 undecryptable rows (per-row quarantine).
+  onRowsSkipped?: (count: number, entityIds: string[]) => void;
+}
+
+/** Result of a DB sync cycle / pull: how many rows applied vs. quarantined. */
+export interface DbSyncResult {
+  applied: number;
+  skipped: number;
+  skippedEntityIds: string[];
+}
+
+/** A row quarantined after failing to decrypt under the (verified) account key. */
+export interface QuarantinedRow {
+  entityId: string;
+  seq: number;
 }
 
 export interface DbSyncEngine {
   transportMode: 'database';
-  sync(): Promise<void>;
-  dbSyncCycle(): Promise<void>;
+  sync(): Promise<DbSyncResult>;
+  dbSyncCycle(): Promise<DbSyncResult>;
   pushDirtyRows(): Promise<{ written: number; deleted: number; maxSeq: number }>;
-  pullRemoteChanges(): Promise<{ maxSeq: number; appliedRemote: boolean }>;
+  pullRemoteChanges(): Promise<DbSyncResult & { maxSeq: number; appliedRemote: boolean }>;
   updateDeviceCursor(): Promise<{ updated: boolean }>;
   ensureRootKey(): Promise<void>;
 
   markDirty(entityId: string): void;
   getDirtySet(): string[];
   clearDirty(): void;
+  /** Rows quarantined after a per-row decrypt failure, awaiting self-heal. */
+  getQuarantine(): QuarantinedRow[];
 
   /** Pull cursor: highest seq actually listed + applied. Only pull advances it. */
   getHighWaterMark(): number;
@@ -453,6 +484,8 @@ export interface DbSyncEngine {
   getLastSynced(): string | null;
 
   isSyncing(): boolean;
+  /** True once the derived root key has been proven against the account (Part A). */
+  isKeyVerified(): boolean;
   hasEncryptionReady(): boolean;
 
   vault: VaultClient;

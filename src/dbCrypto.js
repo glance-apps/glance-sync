@@ -28,6 +28,27 @@ const IV_BYTES          = 12;
 const HKDF_INFO_PREFIX = 'glance-sync:entity:';
 
 // ---------------------------------------------------------------------------
+// Engine-reserved entities
+// ---------------------------------------------------------------------------
+// Rows whose entityId starts with this prefix are owned by the sync engine
+// itself (e.g. the key verifier) and are NOT app entities: they must never be
+// routed to getLocalEntity / applyRemoteEntity.
+export const RESERVED_ENTITY_PREFIX = '__glance_';
+
+// The key-verifier row. Its decryptability under the derived root key is the
+// signal the engine uses to prove a passphrase matches an account's data.
+export const KEYCHECK_ENTITY_ID = '__glance_keycheck';
+
+// Any fixed known plaintext works: AES-GCM tag validation means a wrong key
+// fails to decrypt regardless of contents, so decryption SUCCESS is the signal.
+export const KEYCHECK_PAYLOAD = { v: 1, magic: 'glance-keycheck' };
+
+/** True for engine-reserved rows (e.g. the key verifier), which apps never see. */
+export function isReservedEntityId(entityId) {
+  return typeof entityId === 'string' && entityId.startsWith(RESERVED_ENTITY_PREFIX);
+}
+
+// ---------------------------------------------------------------------------
 // Session state (in-memory only, never persisted in plaintext)
 // ---------------------------------------------------------------------------
 let _rootKey = null; // CryptoKey | null  (an HKDF base key, non-extractable)
@@ -300,7 +321,9 @@ export async function decryptEntity(ciphertextB64, entityId, rootKey = _rootKey)
     return JSON.parse(new TextDecoder().decode(plaintext));
   } catch (err) {
     if (err.name === 'OperationError') {
-      throw new Error('Decryption failed: wrong passphrase or corrupted data.');
+      const failure = new Error('Decryption failed: wrong passphrase or corrupted data.');
+      failure.code = 'ROW_DECRYPT_FAILED';
+      throw failure;
     }
     throw err;
   }

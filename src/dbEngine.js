@@ -25,6 +25,9 @@ import {
   hasDbRootKey,
   encryptEntity,
   decryptEntity,
+  isReservedEntityId,
+  KEYCHECK_ENTITY_ID,
+  KEYCHECK_PAYLOAD,
 } from './dbCrypto.js';
 
 const ts = (v) => {
@@ -58,7 +61,8 @@ const ts = (v) => {
  *
  * Event callbacks (optional):
  * @param {Function} [config.onStatusChange]
- * @param {Function} [config.onError]
+ * @param {Function} [config.onError]      - (message, code, isHardStop) called with code 'KEY_MISMATCH' on a wrong key
+ * @param {Function} [config.onRowsSkipped] - (count, entityIds) called when a cycle skipped undecryptable rows
  */
 export const createDbSyncEngine = (config) => {
   const {
@@ -80,6 +84,7 @@ export const createDbSyncEngine = (config) => {
     getEntityLastModified,
     onStatusChange,
     onError,
+    onRowsSkipped,
   } = config;
 
   if (!storageKeyPrefix) throw new Error('createDbSyncEngine: storageKeyPrefix is required');
@@ -117,9 +122,17 @@ export const createDbSyncEngine = (config) => {
   const KEY_PUSH_ACK = `${storageKeyPrefix}-db-sync-push-ack`;
   const KEY_DIRTY  = `${storageKeyPrefix}-db-sync-dirty`;
   const KEY_LAST_SYNCED = `${storageKeyPrefix}-db-sync-last-synced`;
+  // KEY_QUARANTINE persists the set of rows that failed to decrypt under the
+  // (otherwise verified) account key, as [{ entityId, seq }]. They are skipped
+  // on pull so one bad row cannot wedge the cycle, and re-attempted each cycle
+  // so a row recovers if the correct key later becomes available.
+  const KEY_QUARANTINE = `${storageKeyPrefix}-db-sync-quarantine`;
 
-  // ── In-memory guard ───────────────────────────────────────────────────────
+  // ── In-memory guards ──────────────────────────────────────────────────────
   let syncing = false;
+  // Per-session cache: once the derived root key is proven against the account's
+  // existing data (Part A), we never re-verify for the life of this engine.
+  let verified = false;
 
   // ── Local state accessors ─────────────────────────────────────────────────
   const getConfig = () => {
@@ -172,6 +185,32 @@ export const createDbSyncEngine = (config) => {
   };
   const clearDirty = () => localStorage.removeItem(KEY_DIRTY);
 
+  // Quarantine set persisted as a JSON array of { entityId, seq }.
+  const getQuarantine = () => {
+    const raw = localStorage.getItem(KEY_QUARANTINE);
+    if (!raw) return [];
+    try {
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? arr : [];
+    } catch {
+      return [];
+    }
+  };
+  const writeQuarantine = (list) => {
+    if (list.length === 0) localStorage.removeItem(KEY_QUARANTINE);
+    else localStorage.setItem(KEY_QUARANTINE, JSON.stringify(list));
+  };
+  const addToQuarantine = (entityId, seq) => {
+    const list = getQuarantine();
+    const i = list.findIndex((q) => q.entityId === entityId);
+    if (i >= 0) list[i] = { entityId, seq };
+    else list.push({ entityId, seq });
+    writeQuarantine(list);
+  };
+  const removeFromQuarantine = (entityId) => {
+    writeQuarantine(getQuarantine().filter((q) => q.entityId !== entityId));
+  };
+
   // markDirty: called by the app on every local write (and at creation time for
   // insert-only types). Idempotent and synchronous so it can run inside the
   // app's own write path.
@@ -184,28 +223,72 @@ export const createDbSyncEngine = (config) => {
     writeDirtySet(current);
   };
 
+  // ── Key verifier (Part A) ─────────────────────────────────────────────────
+  // Proves the derived root key matches the account's existing data BEFORE we
+  // are allowed to push. A wrong passphrase — or a per-account salt that drifted
+  // across server redeploys — derives a non-matching key; without this check it
+  // would only surface as a cryptic per-row failure mid-sync, after a device may
+  // already have uploaded rows under the bad key and poisoned the account.
+  //
+  // The signal is decryptability: AES-GCM tag validation means a wrong key
+  // simply fails, so the verifier payload's contents need not match. Runs once
+  // per session (cached via `verified`).
+  const verifyAccountKey = async () => {
+    if (verified) return;
+    // Verification needs a single-row fetch. Clients that don't implement getRow
+    // (e.g. minimal test stubs) cannot be verified; don't block sync on them.
+    if (typeof vault.getRow !== 'function') { verified = true; return; }
+
+    const row = await vault.getRow(app, KEYCHECK_ENTITY_ID, accountId);
+    if (row && !row.deleted && row.envelope) {
+      // Existing account: the verifier must decrypt under our derived key.
+      try {
+        await decryptEntity(row.envelope, KEYCHECK_ENTITY_ID);
+        verified = true;
+      } catch {
+        const err = new Error("This sync passphrase doesn't match this account's existing data.");
+        err.code = 'KEY_MISMATCH';
+        throw err;
+      }
+    } else {
+      // New account: establish the verifier. Insert-only / first-write-wins so
+      // concurrent establishers don't clobber — and since the salt is already
+      // first-write-wins, concurrent establishers derive the same key and their
+      // verifiers are mutually decryptable anyway.
+      const envelope = await encryptEntity(KEYCHECK_PAYLOAD, KEYCHECK_ENTITY_ID);
+      await vault.batch(app, {
+        accountId,
+        rows: [{ entityId: KEYCHECK_ENTITY_ID, envelope, createdAt: Date.now(), insertOnly: true }],
+      });
+      verified = true;
+    }
+  };
+
   // ── Root key / salt bootstrap ─────────────────────────────────────────────
   // Ensures the per-account root key is available, fetching or registering the
-  // salt with the vault on first use.
+  // salt with the vault on first use, then verifies it once per session.
   const ensureRootKey = async () => {
-    if (hasDbRootKey()) return;
-    if (await initDbRootKey(cryptoCfg)) return;
+    if (!hasDbRootKey() && !(await initDbRootKey(cryptoCfg))) {
+      const passphrase = getSyncPassphrase();
+      if (!passphrase) {
+        const err = new Error('Encryption passphrase not available. Please enter your sync passphrase.');
+        err.code = 'PASSPHRASE_REQUIRED';
+        throw err;
+      }
 
-    const passphrase = getSyncPassphrase();
-    if (!passphrase) {
-      const err = new Error('Encryption passphrase not available. Please enter your sync passphrase.');
-      err.code = 'PASSPHRASE_REQUIRED';
-      throw err;
+      let salt = await vault.getSalt(accountId);
+      if (!salt) {
+        const fresh = crypto.getRandomValues(new Uint8Array(16));
+        // First-write-wins: use whatever the server returns (another device may
+        // have registered a salt between our GET and PUT).
+        salt = await vault.putSalt(accountId, fresh);
+      }
+      await setupDbRootKey(passphrase, salt, cryptoCfg);
     }
 
-    let salt = await vault.getSalt(accountId);
-    if (!salt) {
-      const fresh = crypto.getRandomValues(new Uint8Array(16));
-      // First-write-wins: use whatever the server returns (another device may
-      // have registered a salt between our GET and PUT).
-      salt = await vault.putSalt(accountId, fresh);
-    }
-    await setupDbRootKey(passphrase, salt, cryptoCfg);
+    // Key is now available (restored or freshly derived). Prove it matches the
+    // account before anything else relies on it; this gates the push.
+    await verifyAccountKey();
   };
 
   // ── Step 1: push dirty rows ───────────────────────────────────────────────
@@ -216,6 +299,11 @@ export const createDbSyncEngine = (config) => {
   // idempotent re-send. Push deliberately does NOT touch the pull cursor
   // (getHighWaterMark): the server assigns pushed rows the highest seqs, so
   // advancing `since` here would skip any remote row whose seq sits below them.
+  //
+  // The push is GATED on key verification: ensureRootKey runs Part A's
+  // verifyAccountKey, which throws KEY_MISMATCH (before any upsert) if the
+  // derived key doesn't match the account — so a device can never upload rows
+  // under a non-matching key.
   const pushDirtyRows = async () => {
     const dirty = getDirtySet();
     if (dirty.length === 0) return { written: 0, deleted: 0, maxSeq: getPushAck() };
@@ -255,57 +343,116 @@ export const createDbSyncEngine = (config) => {
     return { written: upserts.length, deleted: deletes.length, maxSeq };
   };
 
+  // Decrypts and applies one row with entity-grain LWW. Mutates the supplied
+  // `dirty` Set in place (and persists it) when a remote write supersedes a
+  // dirty local copy, so we do not re-push a superseded version. Returns true if
+  // a remote write/delete was applied. Throws (ROW_DECRYPT_FAILED) on a decrypt
+  // failure — the caller decides whether to quarantine.
+  const applyRemoteRow = async (R, dirty) => {
+    if (R.deleted) {
+      await applyRemoteDelete(R.entityId);
+      if (dirty.delete(R.entityId)) writeDirtySet([...dirty]);
+      return true;
+    }
+
+    const remoteEntity = await decryptEntity(R.envelope, R.entityId);
+    const local = await getLocalEntity(R.entityId);
+
+    if (local == null) {
+      await applyRemoteEntity(R.entityId, remoteEntity);
+      return true;
+    }
+    if (insertOnly(remoteEntity, R.entityId)) {
+      // Insert-only types never conflict: applying is an idempotent union.
+      await applyRemoteEntity(R.entityId, remoteEntity);
+      return true;
+    }
+    // Entity-grain last-writer-wins. The same comparison covers both the clean
+    // case and the contended (locally dirty) case.
+    const remoteWins = ts(lastModifiedOf(remoteEntity)) > ts(lastModifiedOf(local));
+    if (remoteWins) {
+      await applyRemoteEntity(R.entityId, remoteEntity);
+      if (dirty.delete(R.entityId)) writeDirtySet([...dirty]);
+      return true;
+    }
+    // local is newer or equal: keep local and discard remote. If the entity is
+    // dirty it stays dirty and will be re-pushed next cycle.
+    return false;
+  };
+
+  // ── Quarantine self-heal (Part B) ─────────────────────────────────────────
+  // Quarantined rows sit BELOW the pull cursor (we advanced past them), so they
+  // never reappear in list() — re-fetching by id is the only recovery path. A
+  // row drops out of quarantine on successful decrypt+apply (e.g. once the
+  // correct key is in use) or once it is gone from the server.
+  const healQuarantine = async (dirty) => {
+    const list = getQuarantine();
+    if (list.length === 0 || typeof vault.getRow !== 'function') return 0;
+
+    let healed = 0;
+    for (const { entityId } of list) {
+      let R;
+      try {
+        R = await vault.getRow(app, entityId, accountId);
+      } catch {
+        continue; // transient network error: leave quarantined, retry next cycle
+      }
+      if (R == null) {
+        removeFromQuarantine(entityId); // gone from server: nothing to recover
+        continue;
+      }
+      try {
+        const didApply = await applyRemoteRow(R, dirty);
+        removeFromQuarantine(entityId);
+        if (didApply) healed += 1;
+      } catch {
+        // Still undecryptable under the current key: leave quarantined.
+      }
+    }
+    return healed;
+  };
+
   // ── Step 2: pull remote changes ───────────────────────────────────────────
   // Paginates from the high water mark, applying each row with entity-grain LWW.
-  // Rows that are also locally dirty are resolved against the dirty local copy
-  // (contended path): remote wins only if its lastModified is newer, and when it
-  // does win the entity is dropped from the dirty set so we do not re-push a
-  // superseded version.
+  // Part A's key verification has already run (via ensureRootKey), so a globally
+  // wrong key has aborted with KEY_MISMATCH before we get here; any decrypt
+  // failure now is an INDIVIDUAL bad row. Such a row is counted, quarantined,
+  // and its cursor advanced past — it must never throw and wedge the cycle.
   const pullRemoteChanges = async () => {
+    await ensureRootKey();
+
     let since = getHighWaterMark();
     let maxSeq = since;
     let appliedRemote = false;
+    let applied = 0;
+    let skipped = 0;
+    const skippedEntityIds = [];
+
+    // Re-attempt previously quarantined rows first; a snapshot dirty set keeps
+    // contended-path resolution consistent across heal + page application.
+    const dirty = new Set(getDirtySet());
+    applied += await healQuarantine(dirty);
 
     let hasMore = true;
     while (hasMore) {
       const { rows, hasMore: more } = await vault.list(app, { accountId, since });
       if (!Array.isArray(rows) || rows.length === 0) break;
 
-      // Snapshot the dirty set once per page for contended-path resolution.
-      const dirty = new Set(getDirtySet());
-
       for (const R of rows) {
         if (typeof R.seq === 'number' && R.seq > maxSeq) maxSeq = R.seq;
 
-        if (R.deleted) {
-          await applyRemoteDelete(R.entityId);
-          if (dirty.delete(R.entityId)) writeDirtySet([...dirty]);
-          appliedRemote = true;
-          continue;
-        }
-
-        await ensureRootKey();
-        const remoteEntity = await decryptEntity(R.envelope, R.entityId);
-        const local = await getLocalEntity(R.entityId);
-
-        if (local == null) {
-          await applyRemoteEntity(R.entityId, remoteEntity);
-          appliedRemote = true;
-        } else if (insertOnly(remoteEntity, R.entityId)) {
-          // Insert-only types never conflict: applying is an idempotent union.
-          await applyRemoteEntity(R.entityId, remoteEntity);
-          appliedRemote = true;
-        } else {
-          // Entity-grain last-writer-wins. The same comparison covers both the
-          // clean case and the contended (locally dirty) case.
-          const remoteWins = ts(lastModifiedOf(remoteEntity)) > ts(lastModifiedOf(local));
-          if (remoteWins) {
-            await applyRemoteEntity(R.entityId, remoteEntity);
-            appliedRemote = true;
-            if (dirty.delete(R.entityId)) writeDirtySet([...dirty]);
+        // Engine-reserved rows (e.g. the key verifier) are not app entities and
+        // must never be routed to applyRemoteEntity. Advance past them.
+        if (!isReservedEntityId(R.entityId)) {
+          try {
+            const didApply = await applyRemoteRow(R, dirty);
+            if (didApply) { appliedRemote = true; applied += 1; }
+          } catch {
+            // Per-row decrypt failure: quarantine, count, advance, continue.
+            skipped += 1;
+            skippedEntityIds.push(R.entityId);
+            addToQuarantine(R.entityId, R.seq);
           }
-          // else: local is newer or equal, so keep local and discard remote. If the
-          // entity is dirty it stays dirty and will be re-pushed next cycle.
         }
 
         if (typeof R.seq === 'number') since = Math.max(since, R.seq);
@@ -317,7 +464,7 @@ export const createDbSyncEngine = (config) => {
     // Pull is the sole writer of the pull cursor. Advance it (monotonically)
     // from the highest seq we actually listed this run.
     setHighWaterMark(Math.max(getHighWaterMark(), maxSeq));
-    return { maxSeq, appliedRemote };
+    return { maxSeq, appliedRemote, applied, skipped, skippedEntityIds };
   };
 
   // ── Step 3: update device cursor ──────────────────────────────────────────
@@ -350,20 +497,29 @@ export const createDbSyncEngine = (config) => {
     onStatusChange?.('uploading');
     onError?.(null, null, false);
     try {
+      // Part A first: prove the key before we push anything. A globally wrong
+      // key aborts here with KEY_MISMATCH (push gated, nothing uploaded) rather
+      // than quarantining thousands of rows one by one on the pull.
+      await ensureRootKey();
+
       await pushDirtyRows();
       onStatusChange?.('downloading');
-      await pullRemoteChanges();
+      const pull = await pullRemoteChanges();
       await updateDeviceCursor();
 
       const now = new Date().toISOString();
       localStorage.setItem(KEY_LAST_SYNCED, now);
       onStatusChange?.('success');
+
+      if (pull.skipped > 0) onRowsSkipped?.(pull.skipped, pull.skippedEntityIds);
+      return { applied: pull.applied, skipped: pull.skipped, skippedEntityIds: pull.skippedEntityIds };
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error(`[${appId}] db sync cycle error:`, err);
       const code = err && err.code ? err.code : 'NETWORK_ERROR';
       onError?.(err?.message || String(err), code, false);
       onStatusChange?.('error');
+      return { applied: 0, skipped: 0, skippedEntityIds: [] };
     } finally {
       syncing = false;
     }
@@ -386,6 +542,9 @@ export const createDbSyncEngine = (config) => {
     getDirtySet,
     clearDirty,
 
+    // Quarantine (per-row decrypt failures awaiting self-heal)
+    getQuarantine,
+
     // Cursor (pull-progress) and push-ack marker
     getHighWaterMark,
     setHighWaterMark,
@@ -399,6 +558,7 @@ export const createDbSyncEngine = (config) => {
 
     // State queries
     isSyncing:        () => syncing,
+    isKeyVerified:    () => verified,
     hasEncryptionReady: hasDbRootKey,
 
     // Sub-modules

@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **DB sync key verifier (fail fast; never upload under an unverified key).**
+  Before pushing, the DB engine now proves the derived root key matches the
+  account's existing data. It reserves an engine-owned entity
+  (`__glance_keycheck`, never routed to `getLocalEntity` / `applyRemoteEntity`)
+  holding a fixed known plaintext; decryptability under the derived key is the
+  signal. `ensureRootKey` runs `verifyAccountKey()` once per session: an existing
+  verifier that fails to decrypt throws a typed `KEY_MISMATCH` and gates the push
+  (nothing is uploaded), so a wrong passphrase — or a per-account salt that
+  drifted across server redeploys — can no longer poison an account. A new
+  account writes the verifier insert-only (first-write-wins), matching the salt's
+  concurrency model. Exposed via `engine.isKeyVerified()` and
+  `config.onError(message, 'KEY_MISMATCH')`.
+- **DB sync per-row decrypt quarantine (one bad row must not wedge the cycle).**
+  `pullRemoteChanges` now wraps each row's decrypt + apply in try/catch: an
+  individual undecryptable row is counted, recorded in a persisted quarantine set
+  (localStorage, keyed by `storageKeyPrefix`), and the cursor is advanced past it
+  — the cycle no longer throws and wedges all future sync. Reserved `__glance_*`
+  rows are skipped from normal routing. Key verification (Part A) runs first, so
+  a globally wrong key aborts once with `KEY_MISMATCH` instead of quarantining
+  rows one by one. Each cycle re-attempts quarantined rows by id and drops them
+  on a successful decrypt + apply, so a row self-heals once the correct key is in
+  use. Surfaced via `config.onRowsSkipped(count, entityIds)`; `dbSyncCycle()` now
+  resolves to `{ applied, skipped, skippedEntityIds }` and `engine.getQuarantine()`
+  exposes the set.
+- Error codes `KEY_MISMATCH` and `ROW_DECRYPT_FAILED` standardized on the
+  `SyncErrorCode` type.
+
 ## [1.4.0] - 2026-06-18
 
 ### Fixed
