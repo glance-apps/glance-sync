@@ -35,8 +35,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   use. Surfaced via `config.onRowsSkipped(count, entityIds)`; `dbSyncCycle()` now
   resolves to `{ applied, skipped, skippedEntityIds }` and `engine.getQuarantine()`
   exposes the set.
-- Error codes `KEY_MISMATCH` and `ROW_DECRYPT_FAILED` standardized on the
-  `SyncErrorCode` type.
+- **Clear failure when the server can't host the verifier.** `verifyAccountKey`
+  now distinguishes three outcomes: a present-but-undecryptable verifier still
+  throws `KEY_MISMATCH`; an absent verifier (404) is still written; but any
+  *other* error from the single-row GET or the verifier write (HTTP 400/405/500,
+  or a 404 on the route itself — an old GLANCEvault that doesn't support the
+  reserved `__glance_keycheck` id or the single-row endpoint) now throws a typed
+  `VERIFIER_UNSUPPORTED` with an actionable "update your server" message instead
+  of a raw "get row failed: 400". The engine never silently proceeds unverified
+  (the verifier gates push and quarantine does not), so sync pauses with a clear
+  reason. An opt-in `config.allowUnverified` (default `false`) downgrades this to
+  a logged warning and proceeds, for operators who knowingly accept the risk.
+- Error codes `KEY_MISMATCH`, `ROW_DECRYPT_FAILED`, and `VERIFIER_UNSUPPORTED`
+  standardized on the `SyncErrorCode` type.
 
 ## [1.4.0] - 2026-06-18
 

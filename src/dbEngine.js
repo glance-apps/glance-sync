@@ -61,8 +61,9 @@ const ts = (v) => {
  *
  * Event callbacks (optional):
  * @param {Function} [config.onStatusChange]
- * @param {Function} [config.onError]      - (message, code, isHardStop) called with code 'KEY_MISMATCH' on a wrong key
+ * @param {Function} [config.onError]      - (message, code, isHardStop) called with code 'KEY_MISMATCH' on a wrong key, or 'VERIFIER_UNSUPPORTED' when the server can't host the verifier
  * @param {Function} [config.onRowsSkipped] - (count, entityIds) called when a cycle skipped undecryptable rows
+ * @param {boolean}  [config.allowUnverified=false] - operator escape hatch: downgrade VERIFIER_UNSUPPORTED to a logged warning and proceed (unsafe; off by default)
  */
 export const createDbSyncEngine = (config) => {
   const {
@@ -85,6 +86,7 @@ export const createDbSyncEngine = (config) => {
     onStatusChange,
     onError,
     onRowsSkipped,
+    allowUnverified = false,
   } = config;
 
   if (!storageKeyPrefix) throw new Error('createDbSyncEngine: storageKeyPrefix is required');
@@ -233,15 +235,44 @@ export const createDbSyncEngine = (config) => {
   // The signal is decryptability: AES-GCM tag validation means a wrong key
   // simply fails, so the verifier payload's contents need not match. Runs once
   // per session (cached via `verified`).
+  // A server that can't host the verifier (doesn't support the reserved id or
+  // the single-row GET endpoint) must fail with a CLEAR reason, not a raw
+  // "get row failed: 400". We never silently proceed unverified: the verifier
+  // gates push and quarantine does NOT, so a wrong-key device with verification
+  // skipped would still push poison rows. Pausing sync with a clear reason is
+  // the correct degradation. (config.allowUnverified is an explicit operator
+  // escape hatch, off by default, that downgrades this to a logged warning.)
+  const verifierUnsupported = (cause) => {
+    if (allowUnverified) {
+      // eslint-disable-next-line no-console
+      console.warn(`[${appId}] db sync proceeding UNVERIFIED: the server cannot host the key verifier (${KEYCHECK_ENTITY_ID}).`, cause);
+      verified = true;
+      return; // caller returns from verifyAccountKey and sync proceeds
+    }
+    const err = new Error('Your GLANCEvault server needs to be updated to support key verification (the __glance_keycheck row).');
+    err.code = 'VERIFIER_UNSUPPORTED';
+    if (cause) err.cause = cause;
+    throw err;
+  };
+
   const verifyAccountKey = async () => {
     if (verified) return;
     // Verification needs a single-row fetch. Clients that don't implement getRow
     // (e.g. minimal test stubs) cannot be verified; don't block sync on them.
     if (typeof vault.getRow !== 'function') { verified = true; return; }
 
-    const row = await vault.getRow(app, KEYCHECK_ENTITY_ID, accountId);
+    // Outcome 3: any error from the GET (HTTP 400/405/500, or a 404 on the route
+    // itself) means the server can't host the verifier — fail clearly.
+    let row;
+    try {
+      row = await vault.getRow(app, KEYCHECK_ENTITY_ID, accountId);
+    } catch (cause) {
+      verifierUnsupported(cause);
+      return; // only reached when downgraded via allowUnverified
+    }
+
     if (row && !row.deleted && row.envelope) {
-      // Existing account: the verifier must decrypt under our derived key.
+      // Outcome 1: existing account — the verifier must decrypt under our key.
       try {
         await decryptEntity(row.envelope, KEYCHECK_ENTITY_ID);
         verified = true;
@@ -251,15 +282,22 @@ export const createDbSyncEngine = (config) => {
         throw err;
       }
     } else {
-      // New account: establish the verifier. Insert-only / first-write-wins so
-      // concurrent establishers don't clobber — and since the salt is already
-      // first-write-wins, concurrent establishers derive the same key and their
-      // verifiers are mutually decryptable anyway.
+      // Outcome 2: row absent (404 -> getRow returned null) — new account.
+      // Establish the verifier insert-only / first-write-wins so concurrent
+      // establishers don't clobber; since the salt is already first-write-wins,
+      // they derive the same key and their verifiers are mutually decryptable.
       const envelope = await encryptEntity(KEYCHECK_PAYLOAD, KEYCHECK_ENTITY_ID);
-      await vault.batch(app, {
-        accountId,
-        rows: [{ entityId: KEYCHECK_ENTITY_ID, envelope, createdAt: Date.now(), insertOnly: true }],
-      });
+      try {
+        await vault.batch(app, {
+          accountId,
+          rows: [{ entityId: KEYCHECK_ENTITY_ID, envelope, createdAt: Date.now(), insertOnly: true }],
+        });
+      } catch (cause) {
+        // The write itself rejecting the reserved id (400/405/…) is the same
+        // "server can't host the verifier" condition.
+        verifierUnsupported(cause);
+        return;
+      }
       verified = true;
     }
   };

@@ -21,7 +21,10 @@ export type SyncErrorCode =
   | 'KEY_MISMATCH'
   // DB transport: a single row failed to decrypt (surfaced as a count via
   // onRowsSkipped, never thrown).
-  | 'ROW_DECRYPT_FAILED';
+  | 'ROW_DECRYPT_FAILED'
+  // DB transport: the server can't host the key verifier (doesn't support the
+  // reserved __glance_keycheck id or the single-row endpoint).
+  | 'VERIFIER_UNSUPPORTED';
 
 export type SyncStatus = 'idle' | 'uploading' | 'downloading' | 'success' | 'error';
 
@@ -438,10 +441,16 @@ export interface DbSyncEngineConfig {
 
   // Event callbacks
   onStatusChange?: (status: SyncStatus, hints?: { from?: SyncStatus }) => void;
-  // Called with code === 'KEY_MISMATCH' when the derived key doesn't match the account.
+  // Called with code === 'KEY_MISMATCH' when the derived key doesn't match the
+  // account, or 'VERIFIER_UNSUPPORTED' when the server can't host the verifier.
   onError?: (message: string | null, code: SyncErrorCode | null, isHardStop: boolean) => void;
   // Called once per cycle that skipped > 0 undecryptable rows (per-row quarantine).
   onRowsSkipped?: (count: number, entityIds: string[]) => void;
+
+  // Operator escape hatch: downgrade VERIFIER_UNSUPPORTED to a logged warning
+  // and proceed without verification (unsafe — a wrong-key device could push
+  // poison rows). Off by default so the safe behavior is the default.
+  allowUnverified?: boolean;
 }
 
 /** Result of a DB sync cycle / pull: how many rows applied vs. quarantined. */
