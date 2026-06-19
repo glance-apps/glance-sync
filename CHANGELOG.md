@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-06-19
+
+### Fixed
+
+- **Key verification fails clearly when the server can't host the verifier.**
+  1.5.0's `verifyAccountKey` did `GET /sync/{app}/__glance_keycheck`; against a
+  server that doesn't yet support the reserved id or the single-row GET, that
+  threw a raw `get row failed: 400` and aborted the whole sync with a meaningless
+  message. `verifyAccountKey` now distinguishes three outcomes: a
+  present-but-undecryptable verifier still throws `KEY_MISMATCH`; an absent
+  verifier (404) is still written; but any *other* error from the single-row GET
+  or the verifier write (HTTP 400/405/500, or a 404 on the route itself) now
+  throws a typed `VERIFIER_UNSUPPORTED` with an actionable "update your server"
+  message. The engine never silently proceeds unverified (the verifier gates push
+  and quarantine does not, so a wrong-key device with verification skipped would
+  still push poison rows), so sync pauses with a clear reason. Surfaced via
+  `config.onError(message, code)` like `KEY_MISMATCH`.
+
+### Added
+
+- `config.allowUnverified` (default `false`): an opt-in operator escape hatch
+  that downgrades `VERIFIER_UNSUPPORTED` to a logged warning and proceeds, for
+  operators who knowingly accept the risk of syncing against a server that can't
+  host the verifier.
+- `VERIFIER_UNSUPPORTED` standardized on the `SyncErrorCode` type.
+
 ## [1.5.0] - 2026-06-19
 
 ### Added

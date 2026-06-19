@@ -457,6 +457,77 @@ describe('key verifier (Part A)', () => {
     expect(vault.calls.batch).toHaveLength(0);   // nothing uploaded under the bad key
     expect(engine.getDirtySet()).toEqual(['a']); // dirty row preserved for a correct key later
   });
+
+  it('a server that cannot host the verifier (getRow 400) fails with VERIFIER_UNSUPPORTED and pushes nothing', async () => {
+    // getRow rejects with a non-404 error, as an old GLANCEvault would for the
+    // reserved id / single-row endpoint.
+    const calls = { batch: [] };
+    const vault = {
+      calls,
+      async getRow() {
+        const err = new Error('get row failed: 400');
+        err.code = 'VAULT_ERROR';
+        err.status = 400;
+        throw err;
+      },
+      async batch(_app, args) { calls.batch.push(args.rows); return { written: args.rows.length, maxSeq: 1 }; },
+      async list() { return { rows: [], hasMore: false }; },
+      async device() { return { updated: true }; },
+    };
+
+    const local = new Map([['a', { id: 'a', lastModified: '2026-01-01T00:00:00Z' }]]);
+    const errors = [];
+    const { engine } = makeEngine({
+      vault,
+      local,
+      config: { onError: (message, code) => { if (code) errors.push({ message, code }); } },
+    });
+    engine.markDirty('a');
+
+    // Typed, not a raw 400 — and NOT KEY_MISMATCH.
+    await expect(engine.ensureRootKey()).rejects.toMatchObject({ code: 'VERIFIER_UNSUPPORTED' });
+
+    // A full cycle surfaces it via onError and pushes NOTHING.
+    await engine.dbSyncCycle();
+    expect(errors.some(e => e.code === 'VERIFIER_UNSUPPORTED')).toBe(true);
+    expect(errors.some(e => e.code === 'KEY_MISMATCH')).toBe(false);
+    expect(engine.isKeyVerified()).toBe(false);
+    expect(calls.batch).toHaveLength(0);          // never reached push
+    expect(engine.getDirtySet()).toEqual(['a']);  // dirty row preserved
+  });
+
+  it('a verifier write rejected by the server also surfaces VERIFIER_UNSUPPORTED', async () => {
+    // Row absent (getRow -> null) but the establishing write is rejected.
+    const vault = {
+      async getRow() { return null; },
+      async batch() { const err = new Error('batch upsert failed: 405'); err.status = 405; throw err; },
+      async list() { return { rows: [], hasMore: false }; },
+      async device() { return { updated: true }; },
+    };
+    const { engine } = makeEngine({ vault });
+    await expect(engine.ensureRootKey()).rejects.toMatchObject({ code: 'VERIFIER_UNSUPPORTED' });
+    expect(engine.isKeyVerified()).toBe(false);
+  });
+
+  it('allowUnverified downgrades VERIFIER_UNSUPPORTED to a warning and proceeds', async () => {
+    const calls = { batch: [] };
+    const vault = {
+      calls,
+      async getRow() { const err = new Error('get row failed: 400'); err.status = 400; throw err; },
+      async batch(_app, args) { calls.batch.push(args.rows); return { written: args.rows.length, maxSeq: 1 }; },
+      async list() { return { rows: [], hasMore: false }; },
+      async device() { return { updated: true }; },
+    };
+    const local = new Map([['a', { id: 'a', lastModified: '2026-01-01T00:00:00Z' }]]);
+    const { engine } = makeEngine({ vault, local, config: { allowUnverified: true } });
+    engine.markDirty('a');
+
+    await engine.ensureRootKey();
+    // Proceeds: marked verified despite the unsupported server, and push runs.
+    expect(engine.isKeyVerified()).toBe(true);
+    await engine.pushDirtyRows();
+    expect(calls.batch).toHaveLength(1);
+  });
 });
 
 // ---------- Part B: per-row quarantine ----------
