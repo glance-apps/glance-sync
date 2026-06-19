@@ -73,12 +73,27 @@ export function createVaultClient({ vaultUrl, vaultToken, fetchImpl } = {}) {
     return res.json();
   };
 
+  // accountId scopes every row-scoped endpoint (batch, list, single-row GET,
+  // DELETE, device). The server has no default and rejects a missing/empty value
+  // with a cryptic 400 {"error":"accountId is required"}. Validate it here so a
+  // caller that fires before the account id is populated (e.g. the key verifier
+  // running during reconstruction) fails with a clear, typed, retryable error
+  // and we never put a malformed `?accountId=` on the wire.
+  const requireAccountId = (accountId, context) => {
+    if (typeof accountId !== 'string' || accountId.trim() === '') {
+      const err = new Error(`${context}: accountId is required but was missing or empty.`);
+      err.code = 'ACCOUNT_ID_REQUIRED';
+      throw err;
+    }
+  };
+
   return {
     /**
      * Upserts a batch of rows. Each row is { entityId, envelope, createdAt }.
      * @returns {Promise<{ written: number, maxSeq: number }>}
      */
     async batch(app, { accountId, rows }) {
+      requireAccountId(accountId, 'batch upsert');
       const res = await request('POST', `/sync/${encodeURIComponent(app)}/batch`, {
         body: { accountId, rows },
       });
@@ -90,6 +105,7 @@ export function createVaultClient({ vaultUrl, vaultToken, fetchImpl } = {}) {
      * @returns {Promise<{ rows: Array, hasMore: boolean }>}
      */
     async list(app, { accountId, since }) {
+      requireAccountId(accountId, 'list');
       const res = await request('GET', `/sync/${encodeURIComponent(app)}/list`, {
         query: { accountId, since: String(since) },
       });
@@ -100,6 +116,7 @@ export function createVaultClient({ vaultUrl, vaultToken, fetchImpl } = {}) {
      * Fetches a single row by entityId. Returns null on 404.
      */
     async getRow(app, entityId, accountId) {
+      requireAccountId(accountId, 'get row');
       const res = await request('GET', `/sync/${encodeURIComponent(app)}/${encodeURIComponent(entityId)}`, {
         query: { accountId },
       });
@@ -112,6 +129,7 @@ export function createVaultClient({ vaultUrl, vaultToken, fetchImpl } = {}) {
      * the new seq for the tombstone).
      */
     async deleteRow(app, entityId, accountId) {
+      requireAccountId(accountId, 'delete row');
       const res = await request('DELETE', `/sync/${encodeURIComponent(app)}/${encodeURIComponent(entityId)}`, {
         query: { accountId },
       });
@@ -125,6 +143,7 @@ export function createVaultClient({ vaultUrl, vaultToken, fetchImpl } = {}) {
      * @returns {Promise<{ updated: boolean }>}
      */
     async device(app, { accountId, deviceId, lastSeenSeq }) {
+      requireAccountId(accountId, 'device cursor');
       const res = await request('POST', `/sync/${encodeURIComponent(app)}/device`, {
         body: { accountId, deviceId, lastSeenSeq },
       });

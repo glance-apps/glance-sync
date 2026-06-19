@@ -24,7 +24,10 @@ export type SyncErrorCode =
   | 'ROW_DECRYPT_FAILED'
   // DB transport: the server can't host the key verifier (doesn't support the
   // reserved __glance_keycheck id or the single-row endpoint).
-  | 'VERIFIER_UNSUPPORTED';
+  | 'VERIFIER_UNSUPPORTED'
+  // DB transport: a row-scoped call (incl. the key verifier) was made before the
+  // accountId was populated — retryable once the account id is available.
+  | 'ACCOUNT_ID_REQUIRED';
 
 export type SyncStatus = 'idle' | 'uploading' | 'downloading' | 'success' | 'error';
 

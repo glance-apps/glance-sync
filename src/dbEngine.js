@@ -92,7 +92,13 @@ export const createDbSyncEngine = (config) => {
   if (!storageKeyPrefix) throw new Error('createDbSyncEngine: storageKeyPrefix is required');
   if (!config.vaultClient && !vaultUrl)   throw new Error('createDbSyncEngine: vaultUrl is required');
   if (!config.vaultClient && !vaultToken) throw new Error('createDbSyncEngine: vaultToken is required');
-  if (!accountId)        throw new Error('createDbSyncEngine: accountId is required');
+  if (typeof accountId !== 'string' || accountId.trim() === '') {
+    // Reject empty/whitespace too: a whitespace-only id passes a plain falsy
+    // check but serialises to `?accountId=+++`, which the server trims to empty
+    // and rejects with a cryptic 400 on every row-scoped call (incl. the key
+    // verifier's single-row GET).
+    throw new Error('createDbSyncEngine: accountId is required');
+  }
   if (typeof getLocalEntity    !== 'function') throw new Error('createDbSyncEngine: getLocalEntity is required');
   if (typeof applyRemoteEntity !== 'function') throw new Error('createDbSyncEngine: applyRemoteEntity is required');
   if (typeof applyRemoteDelete !== 'function') throw new Error('createDbSyncEngine: applyRemoteDelete is required');
@@ -242,7 +248,14 @@ export const createDbSyncEngine = (config) => {
   // skipped would still push poison rows. Pausing sync with a clear reason is
   // the correct degradation. (config.allowUnverified is an explicit operator
   // escape hatch, off by default, that downgrades this to a logged warning.)
+  // Client-readiness failures (no passphrase yet, or accountId not populated)
+  // are NOT a server problem: re-throw them as-is so they surface with their own
+  // typed, retryable code instead of being mislabeled "update your server".
+  const isClientNotReady = (err) =>
+    err && (err.code === 'ACCOUNT_ID_REQUIRED' || err.code === 'PASSPHRASE_REQUIRED');
+
   const verifierUnsupported = (cause) => {
+    if (isClientNotReady(cause)) throw cause;
     if (allowUnverified) {
       // eslint-disable-next-line no-console
       console.warn(`[${appId}] db sync proceeding UNVERIFIED: the server cannot host the key verifier (${KEYCHECK_ENTITY_ID}).`, cause);
