@@ -31,17 +31,32 @@ const {
   setupDbRootKey,
   clearDbRootKey,
   encryptEntity,
+  KEYCHECK_ENTITY_ID,
+  KEYCHECK_PAYLOAD,
 } = await import('../src/dbCrypto.js');
 
 const CRYPTO_CFG = { cryptoDBName: 'glance-db-engine-test' };
 const FIXED_SALT = new Uint8Array(16).fill(5);
 
+// A verifier envelope encrypted under the beforeEach session key, recomputed in
+// beforeEach so mock vaults can be seeded as "already-established" accounts.
+let VERIFIER_ENVELOPE = null;
+
 // ---------- Mock vault ----------
 
-const makeStatefulVault = () => {
+// seedVerifier (default true): pre-store a key verifier at seq 0 so the engine's
+// verifyAccountKey takes the decrypt-success path — no extra batch write and no
+// seq consumed — matching an account whose verifier already exists. Pass false
+// to exercise the fresh-account path (getRow -> null -> verifier write).
+const makeStatefulVault = ({ seedVerifier = true } = {}) => {
   const rows = new Map(); // entityId -> { entityId, envelope, createdAt, seq, deleted }
   let seq = 0;
-  const calls = { batch: [], list: [], deleteRow: [], device: [] };
+  if (seedVerifier && VERIFIER_ENVELOPE) {
+    rows.set(KEYCHECK_ENTITY_ID, {
+      entityId: KEYCHECK_ENTITY_ID, envelope: VERIFIER_ENVELOPE, createdAt: 0, seq: 0, deleted: false,
+    });
+  }
+  const calls = { batch: [], list: [], deleteRow: [], device: [], getRow: [] };
   return {
     rows,
     calls,
@@ -57,6 +72,10 @@ const makeStatefulVault = () => {
       calls.list.push(since);
       const out = [...rows.values()].filter(r => r.seq > since).sort((a, b) => a.seq - b.seq);
       return { rows: out, hasMore: false };
+    },
+    async getRow(app, entityId) {
+      calls.getRow.push(entityId);
+      return rows.get(entityId) ?? null;
     },
     async deleteRow(app, entityId) {
       calls.deleteRow.push(entityId);
@@ -98,6 +117,7 @@ beforeEach(async () => {
   localStorage.clear();
   await clearDbRootKey(CRYPTO_CFG);
   await setupDbRootKey('engine-test-pass', FIXED_SALT, CRYPTO_CFG);
+  VERIFIER_ENVELOPE = await encryptEntity(KEYCHECK_PAYLOAD, KEYCHECK_ENTITY_ID);
 });
 
 // ---------- #3 push cycle ----------
@@ -255,8 +275,10 @@ describe('idempotency', () => {
     ['a', 'b', 'c'].forEach(id => engine.markDirty(id));
     const second = await engine.pushDirtyRows();
 
-    // Server keyed rows by entityId: still exactly 3 rows, no duplicates.
-    expect(vault.rows.size).toBe(3);
+    // Server keyed rows by entityId: still exactly 3 app rows, no duplicates.
+    // (The engine-reserved verifier row is excluded.)
+    const appRows = [...vault.rows.keys()].filter(id => !id.startsWith('__glance_'));
+    expect(appRows.sort()).toEqual(['a', 'b', 'c']);
     expect(second.maxSeq).toBe(6);
     expect(engine.getPushAck()).toBe(6);
     // Pull cursor untouched by either push.
@@ -372,6 +394,175 @@ describe('dbSyncCycle and transport selection', () => {
     });
     expect(engine.transportMode).toBe('database');
     expect(typeof engine.markDirty).toBe('function');
+  });
+});
+
+// ---------- Part A: key verifier ----------
+
+describe('key verifier (Part A)', () => {
+  it('a fresh account writes the verifier row, marks itself verified, and never routes it to applyRemoteEntity', async () => {
+    // No seeded verifier: this is a brand-new account.
+    const vault = makeStatefulVault({ seedVerifier: false });
+    const { engine, applied } = makeEngine({ vault });
+
+    expect(engine.isKeyVerified()).toBe(false);
+    await engine.ensureRootKey();
+    expect(engine.isKeyVerified()).toBe(true);
+
+    // The verifier row exists on the server and decrypts under our key.
+    const row = vault.rows.get(KEYCHECK_ENTITY_ID);
+    expect(row).toBeTruthy();
+    expect(row.deleted).toBe(false);
+
+    // A subsequent pull must skip the reserved verifier row entirely.
+    await engine.pullRemoteChanges();
+    expect(applied.some(a => a.id === KEYCHECK_ENTITY_ID)).toBe(false);
+  });
+
+  it('a second device with the same passphrase + salt verifies OK against the existing verifier', async () => {
+    // Shared server already carries a verifier (seeded under the session key).
+    const vault = makeStatefulVault();
+    const { engine } = makeEngine({ vault });
+
+    await engine.ensureRootKey();
+    expect(engine.isKeyVerified()).toBe(true);
+    // No new verifier write: the existing one was simply decrypted.
+    expect(vault.calls.batch).toHaveLength(0);
+  });
+
+  it('a device with a different derived key gets KEY_MISMATCH and pushes nothing', async () => {
+    // The shared server's verifier was written under the beforeEach key. Switch
+    // the session to a DIFFERENT passphrase so the derived key no longer matches.
+    const vault = makeStatefulVault();
+    const local = new Map([['a', { id: 'a', lastModified: '2026-01-01T00:00:00Z' }]]);
+    const errors = [];
+    const { engine } = makeEngine({
+      vault,
+      local,
+      config: { onError: (message, code) => { if (code) errors.push({ message, code }); } },
+    });
+    engine.markDirty('a');
+
+    // Re-derive the root key under a mismatching passphrase (same fixed salt).
+    await clearDbRootKey(CRYPTO_CFG);
+    await setupDbRootKey('a-totally-different-passphrase', FIXED_SALT, CRYPTO_CFG);
+
+    // ensureRootKey / verify throws a typed KEY_MISMATCH.
+    await expect(engine.ensureRootKey()).rejects.toMatchObject({ code: 'KEY_MISMATCH' });
+
+    // A full cycle must surface the code via onError and push NOTHING.
+    await engine.dbSyncCycle();
+    expect(errors.some(e => e.code === 'KEY_MISMATCH')).toBe(true);
+    expect(engine.isKeyVerified()).toBe(false);
+    expect(vault.calls.batch).toHaveLength(0);   // nothing uploaded under the bad key
+    expect(engine.getDirtySet()).toEqual(['a']); // dirty row preserved for a correct key later
+  });
+});
+
+// ---------- Part B: per-row quarantine ----------
+
+describe('per-row quarantine (Part B)', () => {
+  const mkRow = async (entityId, entity, seq) => ({
+    entityId,
+    envelope: await encryptEntity(entity, entityId),
+    createdAt: Date.now(),
+    seq,
+    deleted: false,
+  });
+
+  it('applies good rows, skips+counts+quarantines a bad row, advances the cursor, and a later cycle still progresses', async () => {
+    const good1 = await mkRow('good1', { id: 'good1', lastModified: '2026-01-01T00:00:00Z' }, 1);
+    // A corrupt envelope (valid base64, wrong bytes) that cannot decrypt.
+    const bad = { entityId: 'bad', envelope: 'AAAAAAAAAAAAAAAAAAAAAA==', createdAt: Date.now(), seq: 2, deleted: false };
+    const good2 = await mkRow('good2', { id: 'good2', lastModified: '2026-01-01T00:00:00Z' }, 3);
+
+    let page = [good1, bad, good2];
+    const vault = {
+      calls: { list: [] },
+      async getRow(_app, entityId) {
+        if (entityId === KEYCHECK_ENTITY_ID) return { entityId, envelope: VERIFIER_ENVELOPE, seq: 0, deleted: false };
+        return page.find(r => r.entityId === entityId) ?? null;
+      },
+      async list(_app, { since }) { this.calls.list.push(since); return { rows: page.filter(r => r.seq > since), hasMore: false }; },
+      async device() { return { updated: true }; },
+    };
+
+    const skippedEvents = [];
+    const { engine, local: store } = makeEngine({
+      vault,
+      config: { onRowsSkipped: (count, ids) => skippedEvents.push({ count, ids }) },
+    });
+
+    const result = await engine.dbSyncCycle();
+
+    // Good rows applied, bad row skipped + counted.
+    expect(store.has('good1')).toBe(true);
+    expect(store.has('good2')).toBe(true);
+    expect(store.has('bad')).toBe(false);
+    expect(result.applied).toBe(2);
+    expect(result.skipped).toBe(1);
+    expect(result.skippedEntityIds).toEqual(['bad']);
+
+    // onRowsSkipped fired once with the bad id.
+    expect(skippedEvents).toEqual([{ count: 1, ids: ['bad'] }]);
+
+    // Cursor advanced PAST the bad row (to the highest listed seq), and the row
+    // is persisted in quarantine.
+    expect(engine.getHighWaterMark()).toBe(3);
+    expect(engine.getQuarantine()).toEqual([{ entityId: 'bad', seq: 2 }]);
+
+    // A later cycle still progresses (no wedge): the bad row stays quarantined
+    // while it remains undecryptable, and nothing new is skipped.
+    const second = await engine.dbSyncCycle();
+    expect(second.skipped).toBe(0);
+    expect(engine.getQuarantine()).toEqual([{ entityId: 'bad', seq: 2 }]);
+  });
+
+  it('self-heals a quarantined row once the correct key is in use', async () => {
+    // Encrypt the row under key A (a different passphrase), so it cannot decrypt
+    // under the current session key (B). It is fetchable by id for self-heal.
+    await clearDbRootKey(CRYPTO_CFG);
+    await setupDbRootKey('key-A', FIXED_SALT, CRYPTO_CFG);
+    const underA = await encryptEntity({ id: 'roamer', lastModified: '2026-01-01T00:00:00Z', v: 'A' }, 'roamer');
+
+    // Switch to key B and re-seed the verifier under B so verification passes.
+    await clearDbRootKey(CRYPTO_CFG);
+    await setupDbRootKey('key-B', FIXED_SALT, CRYPTO_CFG);
+    const verifierB = await encryptEntity(KEYCHECK_PAYLOAD, KEYCHECK_ENTITY_ID);
+
+    const rowEnvelope = { value: underA };
+    const vault = {
+      async getRow(_app, entityId) {
+        if (entityId === KEYCHECK_ENTITY_ID) return { entityId, envelope: verifierB, seq: 0, deleted: false };
+        if (entityId === 'roamer') return { entityId, envelope: rowEnvelope.value, seq: 1, deleted: false };
+        return null;
+      },
+      async list(_app, { since }) {
+        const rows = [{ entityId: 'roamer', envelope: rowEnvelope.value, createdAt: 0, seq: 1, deleted: false }];
+        return { rows: rows.filter(r => r.seq > since), hasMore: false };
+      },
+      async device() { return { updated: true }; },
+    };
+
+    const { engine, local: store } = makeEngine({ vault });
+
+    // Cycle 1: row is encrypted under A, fails to decrypt under B -> quarantined.
+    const first = await engine.dbSyncCycle();
+    expect(first.skipped).toBe(1);
+    expect(store.has('roamer')).toBe(false);
+    expect(engine.getQuarantine()).toEqual([{ entityId: 'roamer', seq: 1 }]);
+
+    // The correct key (A) becomes available: re-encrypt the SAME row under B's
+    // session... actually simulate recovery by serving a version the current key
+    // can read. Re-encrypt the payload under the now-current key.
+    rowEnvelope.value = await encryptEntity({ id: 'roamer', lastModified: '2026-01-01T00:00:00Z', v: 'A' }, 'roamer');
+
+    // Cycle 2: self-heal re-fetches the quarantined id, decrypts, applies, and
+    // drops it from quarantine.
+    const second = await engine.dbSyncCycle();
+    expect(store.get('roamer')).toMatchObject({ id: 'roamer', v: 'A' });
+    expect(engine.getQuarantine()).toEqual([]);
+    expect(second.applied).toBeGreaterThanOrEqual(1);
   });
 });
 

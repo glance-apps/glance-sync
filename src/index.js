@@ -49,4 +49,8 @@ export {
   hasDbRootKey,
   encryptEntity,
   decryptEntity,
+  isReservedEntityId,
+  RESERVED_ENTITY_PREFIX,
+  KEYCHECK_ENTITY_ID,
+  KEYCHECK_PAYLOAD,
 } from './dbCrypto.js';
