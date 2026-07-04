@@ -287,3 +287,131 @@ describe('createAutoBackupProviders — Nextcloud path', () => {
     expect(mkcolCalls[1].url).toContain('/dayglance/backups/');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Generic WebDAV auto-backup path construction
+//
+// Regression coverage for lifeGLANCE issue #206: backups were written to the
+// bare WebDAV root (`<webdavUrl>/<prefix><ts>.json`), which NAS targets
+// (Synology/fnOS) reject with 405 because PUT is only allowed inside a shared
+// folder. Backups must now nest under `<webdavUrl>/<appFolderName>/backups/`.
+// ---------------------------------------------------------------------------
+describe('createAutoBackupProviders — generic WebDAV path', () => {
+  function makeWebdavProviders(appFolder = 'lifeglance', prefix = 'lifeglance-backup-') {
+    const calls = [];
+    const mockFetch = vi.fn(async (method, url) => {
+      calls.push({ method, url });
+      return { ok: true, status: 200, statusText: 'OK' };
+    });
+    const providers = createAutoBackupProviders({
+      backupFilenamePrefix: prefix,
+      appFolderName: appFolder,
+      webdavFetch: mockFetch,
+    });
+    return { providers, calls };
+  }
+
+  it('nests the backup dir under appFolderName/backups/ (not the root)', () => {
+    const { providers } = makeWebdavProviders('lifeglance');
+    const dirUrl = providers.webdav._getBackupDirUrl({ webdavUrl: 'http://nas:5005' });
+    expect(dirUrl).toBe('http://nas:5005/lifeglance/backups/');
+  });
+
+  it('PUTs the backup inside <webdavUrl>/<appFolderName>/backups/', async () => {
+    const { providers, calls } = makeWebdavProviders('lifeglance', 'lifeglance-backup-');
+    await providers.webdav.uploadBackup(
+      { webdavUrl: 'http://nas:5005', username: 'u', appPassword: 'p' },
+      { tasks: [] }
+    );
+    const putCall = calls.find(c => c.method === 'PUT');
+    expect(putCall.url).toMatch(
+      /^http:\/\/nas:5005\/lifeglance\/backups\/lifeglance-backup-.*\.json$/
+    );
+  });
+
+  it('normalizes a trailing slash on webdavUrl without doubling', () => {
+    const { providers } = makeWebdavProviders('lifeglance');
+    const dirUrl = providers.webdav._getBackupDirUrl({ webdavUrl: 'http://nas:5005/' });
+    expect(dirUrl).toBe('http://nas:5005/lifeglance/backups/');
+    expect(dirUrl).not.toContain('//lifeglance');
+  });
+
+  it('creates the app folder before the backups/ subdir on 404', async () => {
+    const calls = [];
+    let putCount = 0;
+    const mockFetch = vi.fn(async (method, url) => {
+      calls.push({ method, url });
+      if (method === 'PUT' && putCount++ === 0) {
+        return { ok: false, status: 404, statusText: 'Not Found' };
+      }
+      return { ok: true, status: 200, statusText: 'OK' };
+    });
+    const providers = createAutoBackupProviders({
+      backupFilenamePrefix: 'lifeglance-backup-',
+      appFolderName: 'lifeglance',
+      webdavFetch: mockFetch,
+    });
+    await providers.webdav.uploadBackup(
+      { webdavUrl: 'http://nas:5005', username: 'u', appPassword: 'p' },
+      {}
+    );
+    const mkcolCalls = calls.filter(c => c.method === 'MKCOL');
+    expect(mkcolCalls).toHaveLength(2);
+    expect(mkcolCalls[0].url).toBe('http://nas:5005/lifeglance/');
+    expect(mkcolCalls[1].url).toBe('http://nas:5005/lifeglance/backups/');
+  });
+
+  it('retries the PUT after creating the directory (405-style fresh target)', async () => {
+    const calls = [];
+    let putCount = 0;
+    const mockFetch = vi.fn(async (method, url) => {
+      calls.push({ method, url });
+      // First PUT to a missing collection returns 409 Conflict (parent absent).
+      if (method === 'PUT' && putCount++ === 0) {
+        return { ok: false, status: 409, statusText: 'Conflict' };
+      }
+      return { ok: true, status: 201, statusText: 'Created' };
+    });
+    const providers = createAutoBackupProviders({
+      backupFilenamePrefix: 'lifeglance-backup-',
+      appFolderName: 'lifeglance',
+      webdavFetch: mockFetch,
+    });
+    const filename = await providers.webdav.uploadBackup(
+      { webdavUrl: 'http://nas:5005', username: 'u', appPassword: 'p' },
+      {}
+    );
+    const putCalls = calls.filter(c => c.method === 'PUT');
+    expect(putCalls).toHaveLength(2);
+    expect(putCalls.every(c => c.url.startsWith('http://nas:5005/lifeglance/backups/'))).toBe(true);
+    expect(filename).toMatch(/^lifeglance-backup-.*\.json$/);
+  });
+
+  it('lists and deletes within the nested backups dir (retention targeting)', async () => {
+    // DOMParser is not available under vitest's default node environment, so
+    // exercise listBackups via its 404 short-circuit (returns [] before parsing)
+    // and assert the PROPFIND/DELETE URLs both target the nested backups dir.
+    const calls = [];
+    const mockFetch = vi.fn(async (method, url) => {
+      calls.push({ method, url });
+      if (method === 'PROPFIND') return { ok: false, status: 404 };
+      return { ok: true, status: 204, statusText: 'No Content' };
+    });
+    const providers = createAutoBackupProviders({
+      backupFilenamePrefix: 'lifeglance-backup-',
+      appFolderName: 'lifeglance',
+      webdavFetch: mockFetch,
+    });
+    const cfg = { webdavUrl: 'http://nas:5005', username: 'u', appPassword: 'p' };
+
+    const list = await providers.webdav.listBackups(cfg);
+    expect(list).toEqual([]);
+    expect(calls.find(c => c.method === 'PROPFIND').url).toBe('http://nas:5005/lifeglance/backups/');
+
+    await providers.webdav.deleteBackup(cfg, 'lifeglance-backup-2026-07-04T10-00-00.json');
+    const deleteCall = calls.find(c => c.method === 'DELETE');
+    expect(deleteCall.url).toBe(
+      'http://nas:5005/lifeglance/backups/lifeglance-backup-2026-07-04T10-00-00.json'
+    );
+  });
+});
