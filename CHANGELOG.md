@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.3] - 2026-07-04
+
 ### Fixed
 
 - **Generic WebDAV auto-backups now nest under the app folder instead of the
@@ -313,7 +315,9 @@ entire sync infrastructure can be shared across the GLANCE app family.
 - TypeScript declarations in `types/index.d.ts`.
 - WebDAV CORS proxy handler in `api/webdav-proxy.js`.
 
-[Unreleased]: https://github.com/glance-apps/glance-sync/compare/v1.1.2...HEAD
+[Unreleased]: https://github.com/glance-apps/glance-sync/compare/v1.5.3...HEAD
+[1.5.3]: https://github.com/glance-apps/glance-sync/compare/v1.5.2...v1.5.3
+[1.5.2]: https://github.com/glance-apps/glance-sync/compare/v1.5.1...v1.5.2
 [1.1.2]: https://github.com/glance-apps/glance-sync/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/glance-apps/glance-sync/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/glance-apps/glance-sync/compare/v1.0.3...v1.1.0
