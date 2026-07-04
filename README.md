@@ -114,7 +114,7 @@ Pass `encryptionEnabled: true` in the sync config object stored via `engine.setC
 |--------|-------------|
 | `sync()` / `download()` | Full cycle: download → validate → merge → apply → upload if changed. |
 | `upload(opts?)` | Upload local state to the remote provider. |
-| `runBackup(frequency)` | Save a snapshot to IDB and upload it to the remote backup folder. |
+| `runBackup(frequency)` | Save a snapshot to IDB and upload it to the remote backup folder (`<appFolderName>/backups/`, a sibling of the sync file inside the app folder). |
 | `test(config)` | Test the connection to the configured provider. |
 | `getConfig()` / `setConfig(cfg)` | Read/write the persisted sync config (credentials, provider, flags). |
 | `getLastSynced()` | ISO 8601 timestamp of the last successful sync. |

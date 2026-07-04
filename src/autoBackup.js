@@ -195,7 +195,12 @@ export function createAutoBackupProviders(config) {
         { key: 'appPassword', label: 'Password / App Password', type: 'password', placeholder: 'your-password' }
       ],
       _getBackupDirUrl(providerConfig) {
-        return `${providerConfig.webdavUrl.replace(/\/+$/, '')}/`;
+        // Nest backups under the app folder (mirroring the sync file path
+        // `${webdavUrl}/${appFolderName}/${syncFilename}` and the nextcloud
+        // provider's `${appFolder}/backups/`). Writing to the bare WebDAV root
+        // fails with 405 on NAS targets (Synology/fnOS) that only permit PUT
+        // inside a shared folder.
+        return `${providerConfig.webdavUrl.replace(/\/+$/, '')}/${appFolder}/backups/`;
       },
       _getAuthHeaders(providerConfig) {
         return { 'X-WebDAV-Auth': 'Basic ' + toBase64(providerConfig.username + ':' + providerConfig.appPassword) };
@@ -213,6 +218,11 @@ export function createAutoBackupProviders(config) {
           wdFetch('PUT', fileUrl, authHeaders, body, { 'Content-Type': 'application/json' });
         let res = await doUpload();
         if (res.status === 404 || res.status === 409) {
+          // Create the app folder before the backups/ subdir so the first
+          // backup to a fresh target doesn't 404/409 (mirrors the nextcloud
+          // provider). MKCOL on an existing collection is a harmless no-op.
+          const parentDir = `${providerConfig.webdavUrl.replace(/\/+$/, '')}/${appFolder}/`;
+          await wdFetch('MKCOL', parentDir, authHeaders);
           await wdFetch('MKCOL', dirUrl, authHeaders);
           res = await doUpload();
         }

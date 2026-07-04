@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.3] - 2026-07-04
+
+### Fixed
+
+- **Generic WebDAV auto-backups now nest under the app folder instead of the
+  server root.** The `webdav` backup provider built its upload directory as the
+  bare WebDAV root (`<webdavUrl>/`), so backups landed at
+  `<webdavUrl>/<prefix><ts>.json`. On NAS targets whose base URL is the server
+  root (Synology/fnOS), a `PUT` to `/` is rejected with `405 Method Not Allowed`
+  because writes are only permitted inside a shared folder, so auto-backups
+  silently failed (lifeGLANCE issue #206). The provider now writes to
+  `<webdavUrl>/<appFolderName>/backups/` — matching how the sync file path
+  (`<webdavUrl>/<appFolderName>/<syncFilename>`) and the `nextcloud` backup
+  provider (`<appFolder>/backups/`) are constructed — and issues an `MKCOL` for
+  the app folder and the `backups/` subdir on a `404`/`409` before retrying the
+  `PUT`, so the first backup to a fresh target succeeds. `listBackups`,
+  `downloadBackup`, `deleteBackup`, and retention all target the same nested
+  directory. The folder segment comes from `appFolderName` (the sync folder),
+  not the dead `config.folder` field.
+
 ## [1.5.2] - 2026-06-19
 
 ### Fixed
@@ -295,7 +315,9 @@ entire sync infrastructure can be shared across the GLANCE app family.
 - TypeScript declarations in `types/index.d.ts`.
 - WebDAV CORS proxy handler in `api/webdav-proxy.js`.
 
-[Unreleased]: https://github.com/glance-apps/glance-sync/compare/v1.1.2...HEAD
+[Unreleased]: https://github.com/glance-apps/glance-sync/compare/v1.5.3...HEAD
+[1.5.3]: https://github.com/glance-apps/glance-sync/compare/v1.5.2...v1.5.3
+[1.5.2]: https://github.com/glance-apps/glance-sync/compare/v1.5.1...v1.5.2
 [1.1.2]: https://github.com/glance-apps/glance-sync/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/glance-apps/glance-sync/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/glance-apps/glance-sync/compare/v1.0.3...v1.1.0
