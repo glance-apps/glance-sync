@@ -396,6 +396,8 @@ export interface VaultPulledRow extends Partial<VaultRow> {
   entityId: string;
   seq: number;
   deleted?: boolean;
+  /** Tombstone LWW stamp (epoch ms or date string). Absent on rows from servers that predate it: the engine then treats the delete as unconditionally winning. */
+  deletedAt?: number | string;
   envelope?: string;
 }
 
@@ -403,7 +405,7 @@ export interface VaultClient {
   batch(app: string, args: { accountId: string; rows: VaultRow[] }): Promise<{ written: number; maxSeq: number }>;
   list(app: string, args: { accountId: string; since: number }): Promise<{ rows: VaultPulledRow[]; hasMore: boolean }>;
   getRow(app: string, entityId: string, accountId: string): Promise<VaultPulledRow | null>;
-  deleteRow(app: string, entityId: string, accountId: string): Promise<{ seq?: number } | null>;
+  deleteRow(app: string, entityId: string, accountId: string, opts?: { deletedAt?: number }): Promise<{ seq?: number } | null>;
   device(app: string, args: { accountId: string; deviceId: string; lastSeenSeq: number }): Promise<{ updated: boolean }>;
   getSalt(accountId: string): Promise<Uint8Array | null>;
   putSalt(accountId: string, salt: Uint8Array): Promise<Uint8Array>;

@@ -10,7 +10,7 @@
 //   POST   /sync/:app/batch                     upsert rows, returns { written, maxSeq }
 //   GET    /sync/:app/list?accountId=&since=     incremental fetch, { rows, hasMore }
 //   GET    /sync/:app/:entityId?accountId=       fetch one row
-//   DELETE /sync/:app/:entityId?accountId=       soft-delete a row
+//   DELETE /sync/:app/:entityId?accountId=&deletedAt=  soft-delete a row (deletedAt optional)
 //   POST   /sync/:app/device                     update device cursor, { updated }
 //   GET    /salt/:accountId                      fetch the account root-key salt
 //   PUT    /salt/:accountId                      register a salt (first-write-wins)
@@ -127,11 +127,18 @@ export function createVaultClient({ vaultUrl, vaultToken, fetchImpl } = {}) {
     /**
      * Soft-deletes a row by entityId. Returns the server response (may include
      * the new seq for the tombstone).
+     *
+     * opts.deletedAt (epoch ms) stamps the tombstone so pulling devices can
+     * resolve delete-vs-edit conflicts with LWW. It rides as a query param, so
+     * servers that predate the stamp simply ignore it (their tombstones come
+     * back without deletedAt and the engine falls back to delete-wins).
      */
-    async deleteRow(app, entityId, accountId) {
+    async deleteRow(app, entityId, accountId, opts = {}) {
       requireAccountId(accountId, 'delete row');
+      const query = { accountId };
+      if (opts && opts.deletedAt != null) query.deletedAt = String(opts.deletedAt);
       const res = await request('DELETE', `/sync/${encodeURIComponent(app)}/${encodeURIComponent(entityId)}`, {
-        query: { accountId },
+        query,
       });
       if (res.status === 404) return null;
       return jsonOrThrow(res, 'delete row');

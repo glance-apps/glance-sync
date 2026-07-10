@@ -373,17 +373,33 @@ export const createDbSyncEngine = (config) => {
       }
     }
 
-    // Soft-delete first, then batch the upserts. If any call throws, we fall out
-    // before clearing the dirty set or advancing the push-ack marker.
+    // Batch the upserts FIRST, then soft-delete. If any call throws, we fall
+    // out before clearing the dirty set or advancing the push-ack marker.
+    //
+    // The order matters for partial-failure safety: a cross-list move puts a
+    // delete ("old-list:X") and its replacement upsert ("new-list:X") in the
+    // same dirty set. Deleting first opened a window where the delete landed,
+    // the batch failed, and every peer pulled a delete with no replacement —
+    // the entity vanished fleet-wide until this device successfully retried.
+    // Upserting first inverts the partial state into a benign one (both rows
+    // briefly exist) that the retried delete cleans up. Nothing depends on
+    // deletes landing first: upserts and deletes in one push never share an
+    // entityId (an entity is either present locally or not), and maxSeq is
+    // order-independent.
+    //
+    // Each delete carries a deletedAt stamp so pulling devices can run LWW
+    // against it (see applyRemoteRow). Servers that predate the stamp ignore
+    // the extra field, in which case pulled tombstones simply lack deletedAt
+    // and fall back to the old delete-wins behavior.
     let maxSeq = getPushAck();
-    for (const entityId of deletes) {
-      const r = await vault.deleteRow(app, entityId, accountId);
-      if (r && typeof r.seq === 'number') maxSeq = Math.max(maxSeq, r.seq);
-      if (r && typeof r.maxSeq === 'number') maxSeq = Math.max(maxSeq, r.maxSeq);
-    }
     if (upserts.length > 0) {
       const result = await vault.batch(app, { accountId, rows: upserts });
       if (result && typeof result.maxSeq === 'number') maxSeq = Math.max(maxSeq, result.maxSeq);
+    }
+    for (const entityId of deletes) {
+      const r = await vault.deleteRow(app, entityId, accountId, { deletedAt: Date.now() });
+      if (r && typeof r.seq === 'number') maxSeq = Math.max(maxSeq, r.seq);
+      if (r && typeof r.maxSeq === 'number') maxSeq = Math.max(maxSeq, r.maxSeq);
     }
 
     // Full acknowledgment: safe to mark clean. Advance the push-ack marker only;
@@ -401,6 +417,29 @@ export const createDbSyncEngine = (config) => {
   // failure — the caller decides whether to quarantine.
   const applyRemoteRow = async (R, dirty) => {
     if (R.deleted) {
+      // A tombstone participates in the same entity-grain LWW as an upsert,
+      // using the deletedAt stamp the pushing device attached (see
+      // pushDirtyRows). A local copy KEEPS only when its lastModified strictly
+      // exceeds deletedAt: the delete wins ties, because deletedAt is stamped
+      // at push time and therefore already post-dates the edit that produced
+      // it on the deleting device. Tombstones from servers/devices that
+      // predate the stamp carry no deletedAt (ts -> 0); those keep the old
+      // unconditional delete-wins behavior.
+      const deletedAt = ts(R.deletedAt);
+      if (deletedAt > 0) {
+        const local = await getLocalEntity(R.entityId);
+        if (local != null && ts(lastModifiedOf(local)) > deletedAt) {
+          // The local edit is newer than the delete: keep it, and make sure it
+          // is dirty so the next push re-upserts it over the tombstone and
+          // restores the row fleet-wide (matching the file tier's
+          // newest-write-wins over tombstones).
+          if (!dirty.has(R.entityId)) {
+            dirty.add(R.entityId);
+            writeDirtySet([...dirty]);
+          }
+          return false;
+        }
+      }
       await applyRemoteDelete(R.entityId);
       if (dirty.delete(R.entityId)) writeDirtySet([...dirty]);
       return true;
