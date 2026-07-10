@@ -77,10 +77,10 @@ const makeStatefulVault = ({ seedVerifier = true } = {}) => {
       calls.getRow.push(entityId);
       return rows.get(entityId) ?? null;
     },
-    async deleteRow(app, entityId) {
+    async deleteRow(app, entityId, _accountId, opts = {}) {
       calls.deleteRow.push(entityId);
       seq += 1;
-      rows.set(entityId, { entityId, seq, deleted: true });
+      rows.set(entityId, { entityId, seq, deleted: true, deletedAt: opts?.deletedAt });
       return { seq };
     },
     async device(app, args) {
@@ -228,6 +228,193 @@ describe('pull cycle', () => {
     expect(deleted).toEqual(['gone']);
     expect(store.has('gone')).toBe(false);
     expect(engine.getHighWaterMark()).toBe(7);
+  });
+});
+
+// ---------- tombstone LWW: pulled delete vs local edit ----------
+//
+// Regression for the "pulled delete unconditionally beats a newer local edit"
+// defect: device A deletes X, device B edits X offline with a NEWER
+// lastModified, B pulls before pushing. The delete must lose LWW against the
+// newer edit, and the edit must stay dirty so the next push restores the row
+// fleet-wide — matching both the engine's own upsert LWW and the file tier's
+// newest-write-wins over tombstones.
+
+describe('tombstone LWW (pulled delete vs local edit)', () => {
+  const tombstoneVault = (tombstone) => ({
+    calls: { batch: [] },
+    async batch(_app, { rows }) { this.calls.batch.push(rows); return { written: rows.length, maxSeq: tombstone.seq + 1 }; },
+    async list(_app, { since }) { return { rows: [tombstone].filter(r => r.seq > since), hasMore: false }; },
+    async device() { return { updated: true }; },
+  });
+
+  it('keeps a newer dirty local edit over a pulled delete, leaves it dirty, and the next push restores the row', async () => {
+    const tombstone = {
+      entityId: 'X', seq: 9, deleted: true,
+      deletedAt: new Date('2026-01-01T00:00:00Z').getTime(),
+    };
+    const vault = tombstoneVault(tombstone);
+    const local = new Map([['X', { id: 'X', lastModified: '2026-02-01T00:00:00Z', v: 'newer-local-edit' }]]);
+    const { engine, deleted, local: store } = makeEngine({ vault, local });
+    engine.markDirty('X');
+
+    await engine.pullRemoteChanges();
+
+    // The delete lost LWW: local copy retained, delete callback never fired,
+    // and the entity is still dirty (not pruned) so it will re-push.
+    expect(deleted).toEqual([]);
+    expect(store.get('X').v).toBe('newer-local-edit');
+    expect(engine.getDirtySet()).toEqual(['X']);
+    // The cursor still advances past the tombstone.
+    expect(engine.getHighWaterMark()).toBe(9);
+
+    // The next push re-upserts X over the tombstone (fleet-wide restore).
+    await engine.pushDirtyRows();
+    expect(vault.calls.batch).toHaveLength(1);
+    expect(vault.calls.batch[0].map(r => r.entityId)).toEqual(['X']);
+    expect(engine.getDirtySet()).toEqual([]);
+  });
+
+  it('marks a CLEAN newer local copy dirty when it beats a pulled delete, so the restore still pushes', async () => {
+    const tombstone = {
+      entityId: 'X', seq: 3, deleted: true,
+      deletedAt: new Date('2026-01-01T00:00:00Z').getTime(),
+    };
+    const vault = tombstoneVault(tombstone);
+    const local = new Map([['X', { id: 'X', lastModified: '2026-02-01T00:00:00Z', v: 'newer-clean-copy' }]]);
+    const { engine, deleted, local: store } = makeEngine({ vault, local });
+    expect(engine.getDirtySet()).toEqual([]); // clean before the pull
+
+    await engine.pullRemoteChanges();
+
+    expect(deleted).toEqual([]);
+    expect(store.has('X')).toBe(true);
+    // Without this the server keeps the tombstone and every peer deletes X.
+    expect(engine.getDirtySet()).toEqual(['X']);
+  });
+
+  it('applies a pulled delete that is newer than the local edit and prunes the dirty set', async () => {
+    const tombstone = {
+      entityId: 'X', seq: 5, deleted: true,
+      deletedAt: new Date('2026-03-01T00:00:00Z').getTime(),
+    };
+    const local = new Map([['X', { id: 'X', lastModified: '2026-02-01T00:00:00Z' }]]);
+    const { engine, deleted, local: store } = makeEngine({ vault: tombstoneVault(tombstone), local });
+    engine.markDirty('X');
+
+    await engine.pullRemoteChanges();
+
+    expect(deleted).toEqual(['X']);
+    expect(store.has('X')).toBe(false);
+    expect(engine.getDirtySet()).toEqual([]);
+  });
+
+  it('the delete wins a timestamp tie (deletedAt is stamped at push time, after the deleting device\'s own edit)', async () => {
+    const t = new Date('2026-02-01T00:00:00Z').getTime();
+    const tombstone = { entityId: 'X', seq: 5, deleted: true, deletedAt: t };
+    const local = new Map([['X', { id: 'X', lastModified: t }]]);
+    const { engine, deleted, local: store } = makeEngine({ vault: tombstoneVault(tombstone), local });
+    engine.markDirty('X');
+
+    await engine.pullRemoteChanges();
+
+    expect(deleted).toEqual(['X']);
+    expect(store.has('X')).toBe(false);
+    expect(engine.getDirtySet()).toEqual([]);
+  });
+
+  it('a timestamp-less tombstone (pre-1.6 server or row) still wins unconditionally — old behavior preserved', async () => {
+    const tombstone = { entityId: 'X', seq: 5, deleted: true }; // no deletedAt
+    const local = new Map([['X', { id: 'X', lastModified: '2026-02-01T00:00:00Z', v: 'newer-local-edit' }]]);
+    const { engine, deleted, local: store } = makeEngine({ vault: tombstoneVault(tombstone), local });
+    engine.markDirty('X');
+
+    await engine.pullRemoteChanges();
+
+    expect(deleted).toEqual(['X']);
+    expect(store.has('X')).toBe(false);
+    expect(engine.getDirtySet()).toEqual([]);
+  });
+});
+
+// ---------- push ordering: upserts before deletes ----------
+//
+// Regression for the transient fleet-wide delete window: a cross-list move
+// pushes a delete ("unscheduledTasks:X") and its replacement upsert ("tasks:X")
+// in the same dirty set. Deletes used to go first, so a failure between the
+// two left the delete on the server with no replacement row — every peer
+// pulled the delete and the task vanished fleet-wide until a successful retry.
+
+describe('push ordering (upserts before deletes)', () => {
+  it('sends the batched upserts before any deleteRow calls, and stamps each delete with deletedAt', async () => {
+    const order = [];
+    const deleteOpts = [];
+    const vault = {
+      async batch(_app, { rows }) { order.push('batch'); return { written: rows.length, maxSeq: 1 }; },
+      async deleteRow(_app, entityId, _acct, opts) { order.push(`delete:${entityId}`); deleteOpts.push(opts); return { seq: 2 }; },
+      async list() { return { rows: [], hasMore: false }; },
+      async device() { return { updated: true }; },
+    };
+    const local = new Map([['tasks:X', { id: 'X', lastModified: '2026-02-01T00:00:00Z' }]]);
+    const { engine } = makeEngine({ vault, local });
+    engine.markDirty('unscheduledTasks:X'); // no local entity -> pushed as delete
+    engine.markDirty('tasks:X');            // present locally  -> pushed as upsert
+
+    await engine.pushDirtyRows();
+
+    expect(order).toEqual(['batch', 'delete:unscheduledTasks:X']);
+    expect(deleteOpts[0]).toBeTruthy();
+    expect(typeof deleteOpts[0].deletedAt).toBe('number');
+    expect(engine.getDirtySet()).toEqual([]);
+  });
+
+  it('a failure between the two steps can no longer leave a delete without its paired upsert', async () => {
+    // Server state: rows keyed by entityId, tombstones tracked separately.
+    const server = new Map();
+    const tombstones = [];
+    let failDeletes = true;
+    const order = [];
+    const vault = {
+      async batch(_app, { rows }) {
+        order.push('batch');
+        for (const r of rows) server.set(r.entityId, r);
+        return { written: rows.length, maxSeq: 1 };
+      },
+      async deleteRow(_app, entityId, _acct, opts) {
+        order.push(`delete:${entityId}`);
+        if (failDeletes) throw new Error('server error 500');
+        tombstones.push({ entityId, deletedAt: opts?.deletedAt });
+        server.delete(entityId);
+        return { seq: 2 };
+      },
+      async list() { return { rows: [], hasMore: false }; },
+      async device() { return { updated: true }; },
+    };
+    const local = new Map([['tasks:X', { id: 'X', lastModified: '2026-02-01T00:00:00Z' }]]);
+    const { engine } = makeEngine({ vault, local });
+    engine.markDirty('tasks:X');
+    engine.markDirty('unscheduledTasks:X');
+
+    // First push: the upsert lands, then the delete fails.
+    await expect(engine.pushDirtyRows()).rejects.toThrow('server error 500');
+
+    // The replacement row is already on the server, and no tombstone exists —
+    // peers pulling now see the moved task, never a bare delete.
+    expect(server.has('tasks:X')).toBe(true);
+    expect(tombstones).toEqual([]);
+    // Nothing was acked: the whole dirty set is retained for an idempotent retry.
+    expect(engine.getDirtySet().sort()).toEqual(['tasks:X', 'unscheduledTasks:X']);
+
+    // Retry succeeds end-to-end: re-sent upsert is harmless (keyed by entityId),
+    // the delete lands with its stamp, and the dirty set clears.
+    failDeletes = false;
+    await engine.pushDirtyRows();
+    expect(order).toEqual(['batch', 'delete:unscheduledTasks:X', 'batch', 'delete:unscheduledTasks:X']);
+    expect(server.has('tasks:X')).toBe(true);
+    expect(tombstones).toHaveLength(1);
+    expect(tombstones[0].entityId).toBe('unscheduledTasks:X');
+    expect(typeof tombstones[0].deletedAt).toBe('number');
+    expect(engine.getDirtySet()).toEqual([]);
   });
 });
 

@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-07-10
+
+### Fixed
+
+- **DB engine: a pulled delete no longer unconditionally beats a newer local
+  edit.** `applyRemoteRow` applied a pulled `deleted: true` row without any
+  timestamp comparison AND pruned the entity from the dirty set, so a device
+  that edited an entity offline (with a newer `lastModified`) and then pulled a
+  peer's delete before pushing silently discarded its own newer edit — the
+  opposite of the engine's upsert conflict rule and of the file tier's
+  newest-write-wins over tombstones. Deletes now participate in the same
+  entity-grain LWW: the engine stamps each pushed soft-delete with a
+  `deletedAt` (epoch ms, taken at push time) and applies a pulled delete only
+  when the local copy's `lastModified` does not exceed that stamp. When the
+  local edit is strictly newer, the delete is discarded and the entity is
+  marked (or kept) dirty so the next push re-upserts it over the tombstone and
+  restores the row fleet-wide.
+  - **Tie-break:** on an exact timestamp tie the DELETE wins (unlike the upsert
+    rule, where local wins ties), because `deletedAt` is stamped at push time
+    and therefore already post-dates the deleting device's own last edit.
+  - **Backward compatibility:** a tombstone with no `deletedAt` — from a
+    GLANCEvault server that predates the stamp, or a row deleted by an older
+    client — keeps the previous unconditional delete-wins behavior. `deletedAt`
+    rides the DELETE request as an extra query param, which old servers ignore.
+- **DB engine: push sends upserts before deletes, closing the transient
+  fleet-wide delete window.** `pushDirtyRows` used to issue the per-entity
+  `deleteRow` calls before the batched upserts. A cross-list move (delete
+  `unscheduledTasks:X` + upsert `tasks:X` in the same dirty set) that failed
+  between the two steps (5xx / network drop) left the delete on the server with
+  no replacement row, so every peer pulled a bare delete and the entity
+  vanished fleet-wide until the origin device successfully retried. The batch
+  upsert now runs first; a failure between the steps leaves the benign inverse
+  (both rows briefly exist) and the retained dirty set retries both
+  idempotently. No invariant depended on the old order: upserts and deletes in
+  one push can never share an `entityId`, and `maxSeq`/ack accounting is
+  order-independent.
+
+### Changed — behavior notes for consumers
+
+- Delete/edit races now resolve by newest-write-wins instead of delete-always-
+  wins. An entity edited on one device *after* (per wall clock) another
+  device's deletion will be **restored on all devices** rather than deleted.
+  Apps relying on "delete always sticks" semantics should treat this as a
+  breaking behavior change. Clock skew caveat: `deletedAt` comes from the
+  deleting device's clock at push time, so a device with a fast clock can win
+  conflicts it shouldn't — same trust model as the existing `lastModified` LWW.
+- During a partial push failure, peers may transiently observe a moved entity
+  in both its old and new lists (previously: in neither) until the retry lands.
+- Unchanged (regression-guarded): upsert LWW keeps local on ties and prunes a
+  remotely-superseded entity from the dirty set; the split pull/push cursors
+  and their persistence keys; the exported `getRow` vault surface and
+  `decryptEntity`; push idempotency for re-sent upserts and soft-deletes.
+
+### Added
+
+- `createVaultClient().deleteRow(app, entityId, accountId, { deletedAt })` —
+  optional fourth argument; the stamp is sent as a `deletedAt` query param.
+  `VaultPulledRow` gains an optional `deletedAt` field.
+
 ## [1.5.3] - 2026-07-04
 
 ### Fixed
@@ -315,7 +374,8 @@ entire sync infrastructure can be shared across the GLANCE app family.
 - TypeScript declarations in `types/index.d.ts`.
 - WebDAV CORS proxy handler in `api/webdav-proxy.js`.
 
-[Unreleased]: https://github.com/glance-apps/glance-sync/compare/v1.5.3...HEAD
+[Unreleased]: https://github.com/glance-apps/glance-sync/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/glance-apps/glance-sync/compare/v1.5.3...v1.6.0
 [1.5.3]: https://github.com/glance-apps/glance-sync/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/glance-apps/glance-sync/compare/v1.5.1...v1.5.2
 [1.1.2]: https://github.com/glance-apps/glance-sync/compare/v1.1.1...v1.1.2
