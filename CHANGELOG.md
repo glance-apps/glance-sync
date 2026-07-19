@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-07-19
+
+### Fixed
+
+- **File engine: persistent PRECONDITION_FAILED (412) sync loop on servers
+  that mangle ETags** (lastGLANCE issue #232). The optimistic-concurrency
+  cycle (GET capturing an ETag, merge, PUT with If-Match) can never converge
+  against a server whose GET responses carry a mangled validator: Apache
+  mod_deflate rewrites the ETag on gzip-encoded responses to `"xyz-gzip"`
+  (Android's HttpURLConnection silently requests gzip, so native apps always
+  hit this on Apache-fronted servers such as standard Nextcloud installs), and
+  nginx's gzip filter downgrades strong ETags to weak (`W/"xyz"`), which
+  If-Match's strong comparison rejects. Either way every PUT 412s, the
+  single conditional retry fetches another mangled ETag and 412s again, and
+  sync wedges until the user hand-deletes the sync file from the server. Two
+  complementary fixes:
+  - **ETag normalization at capture time.** A new exported pure helper,
+    `normalizeEtag(raw)`, strips the weak-validator prefix (`W/"abc"` becomes
+    `"abc"`) and the known content-coding suffixes Apache appends inside the
+    quotes (`"abc-gzip"` / `"abc-br"` become `"abc"`), preserving surrounding
+    quotes and passing null/undefined through. `parseDownloadResponse` now
+    normalizes every ETag it captures, so If-Match round-trips the entity's
+    real validator. Clean ETags are unchanged, so servers that never mangle
+    see identical behavior.
+  - **Termination guarantee: a second consecutive 412 falls back to an
+    unconditional upload.** If the conditional retry after a 412 itself fails
+    with PRECONDITION_FAILED (any other error keeps the existing
+    backoff-and-surface behavior), the engine runs one final
+    download-merge-upload cycle whose PUT omits If-Match entirely
+    (last-writer-wins). The uploaded payload is the merge of local state with
+    the remote fetched milliseconds earlier in the same cycle, so the
+    lost-update window is tiny - far safer than a permanently wedged sync
+    that pushes users toward deleting the sync file. If the fallback cycle
+    itself fails, the error is surfaced exactly as the old retry-failure path
+    did (exponential backoff, `onError`, status `'error'`).
+
+### Added
+
+- `normalizeEtag(raw)` exported from the package root for reuse by apps.
+
 ## [1.6.0] - 2026-07-10
 
 ### Fixed
@@ -374,7 +414,8 @@ entire sync infrastructure can be shared across the GLANCE app family.
 - TypeScript declarations in `types/index.d.ts`.
 - WebDAV CORS proxy handler in `api/webdav-proxy.js`.
 
-[Unreleased]: https://github.com/glance-apps/glance-sync/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/glance-apps/glance-sync/compare/v1.6.1...HEAD
+[1.6.1]: https://github.com/glance-apps/glance-sync/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/glance-apps/glance-sync/compare/v1.5.3...v1.6.0
 [1.5.3]: https://github.com/glance-apps/glance-sync/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/glance-apps/glance-sync/compare/v1.5.1...v1.5.2

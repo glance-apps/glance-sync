@@ -90,13 +90,46 @@ export const webdavFetch = (config) => async (method, targetUrl, authHeaders, bo
 };
 
 // ---------------------------------------------------------------------------
+// ETag normalization
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalizes an ETag as captured from a GET response so it can be echoed back
+ * in If-Match. Proxies and content-encoding filters mangle ETags in ways that
+ * make the stored entity's validator unreachable:
+ *   - Apache mod_deflate/mod_brotli append `-gzip`/`-br` inside the quotes
+ *     (`"abc"` becomes `"abc-gzip"` on gzip-encoded responses).
+ *   - nginx's gzip filter downgrades strong ETags to weak (`W/"abc"`), and
+ *     If-Match requires strong comparison.
+ * Either way, a PUT with the mangled value 412s forever. Stripping the weak
+ * prefix and the known coding suffixes recovers the entity's real validator.
+ *
+ * Surrounding quotes are preserved; null/undefined pass through unchanged.
+ *
+ * @param {string|null|undefined} raw - raw ETag header value
+ * @returns {string|null|undefined} normalized ETag
+ */
+export function normalizeEtag(raw) {
+  if (raw == null) return raw;
+  let etag = raw;
+  if (etag.startsWith('W/')) etag = etag.slice(2);
+  if (etag.length >= 2 && etag.startsWith('"') && etag.endsWith('"')) {
+    const inner = etag.slice(1, -1).replace(/-(gzip|br)$/, '');
+    etag = `"${inner}"`;
+  } else {
+    etag = etag.replace(/-(gzip|br)$/, '');
+  }
+  return etag;
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
 async function parseDownloadResponse(res, engineConfig) {
   const parsed = await res.json();
   const payload = isEncryptedEnvelope(parsed) ? await decryptData(parsed, engineConfig) : parsed;
-  const etag = res.headers.get('etag') || null;
+  const etag = normalizeEtag(res.headers.get('etag')) || null;
   return { payload, etag };
 }
 

@@ -266,6 +266,14 @@ export interface CloudSyncProvider {
 export function webdavFetch(config: SyncEngineConfig): WebdavFetch;
 export function createProviders(config: SyncEngineConfig): Record<string, CloudSyncProvider>;
 
+/**
+ * Normalizes a raw ETag header value for use in If-Match: strips a weak-
+ * validator prefix (`W/"abc"` -> `"abc"`) and the content-coding suffixes
+ * Apache mod_deflate/mod_brotli append inside the quotes (`"abc-gzip"` /
+ * `"abc-br"` -> `"abc"`). Quotes are preserved; null/undefined pass through.
+ */
+export function normalizeEtag(raw: string | null | undefined): string | null | undefined;
+
 // ---------------------------------------------------------------------------
 // Sync engine
 // ---------------------------------------------------------------------------

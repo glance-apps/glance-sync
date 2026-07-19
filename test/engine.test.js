@@ -287,7 +287,47 @@ describe('createSyncEngine — 412 retry', () => {
     vi.useRealTimers();
   });
 
-  it('applies exponential backoff and emits error when the 412 retry itself fails', async () => {
+  it('falls back to an unconditional upload when the 412 retry also 412s', async () => {
+    vi.useFakeTimers();
+    const downloadEnvelope = {
+      schemaVersion: 1, appId: 'test-app', version: 2,
+      lastModified: '2026-01-02T00:00:00Z',
+      data: { tasks: [] },
+    };
+    // Simulates an ETag-mangling server (Apache mod_deflate): any PUT carrying
+    // If-Match 412s; an unconditional PUT succeeds.
+    const provider = {
+      name: 'fake', configFields: [],
+      download: vi.fn(async () => ({ payload: downloadEnvelope, etag: '"e1-gzip"' })),
+      upload:   vi.fn(async (cfg, envelope, etag) => {
+        if (etag) throw new Error('PRECONDITION_FAILED');
+        return true;
+      }),
+      test:     vi.fn(),
+    };
+    const { engine, calls } = makeEngine({
+      provider,
+      mergeResult: { data: { tasks: [] }, localChanged: false, remoteChanged: true },
+    });
+    localStorage.setItem('test-cloud-sync-last-synced', '2026-01-01T00:00:00Z');
+    const p = engine.download();
+    // Worst case: 3 s jitter + 2 s MIN_SYNC hold on the fallback upload + buffer.
+    await vi.advanceTimersByTimeAsync(8000);
+    await p;
+    // Three cycles ran: initial 412, conditional retry 412, unconditional success.
+    expect(provider.upload.mock.calls.length).toBe(3);
+    expect(provider.upload.mock.calls[0][2]).toBeTruthy();
+    expect(provider.upload.mock.calls[1][2]).toBeTruthy();
+    expect(provider.upload.mock.calls[2][2]).toBeNull();
+    // The cycle converged: success emitted, no error surfaced, no backoff.
+    expect(calls.statusChanges.some(c => c.s === 'success')).toBe(true);
+    expect(calls.statusChanges.some(c => c.s === 'error')).toBe(false);
+    expect(calls.errors).toHaveLength(0);
+    expect(engine.getDownloadBackoffUntil()).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it('does not take the unconditional path when the conditional retry succeeds', async () => {
     vi.useFakeTimers();
     const downloadEnvelope = {
       schemaVersion: 1, appId: 'test-app', version: 2,
@@ -299,7 +339,36 @@ describe('createSyncEngine — 412 retry', () => {
       download: vi.fn(async () => ({ payload: downloadEnvelope, etag: 'e1' })),
       upload:   vi.fn()
         .mockRejectedValueOnce(new Error('PRECONDITION_FAILED'))
-        .mockRejectedValueOnce(new Error('PRECONDITION_FAILED')),
+        .mockResolvedValueOnce(true),
+      test:     vi.fn(),
+    };
+    const { engine } = makeEngine({
+      provider,
+      mergeResult: { data: { tasks: [] }, localChanged: false, remoteChanged: true },
+    });
+    localStorage.setItem('test-cloud-sync-last-synced', '2026-01-01T00:00:00Z');
+    const p = engine.download();
+    await vi.advanceTimersByTimeAsync(6000);
+    await p;
+    // A single 412 followed by a successful conditional retry: exactly two
+    // uploads, and the second one still carried If-Match.
+    expect(provider.upload.mock.calls.length).toBe(2);
+    expect(provider.upload.mock.calls[1][2]).toBe('e1');
+    vi.useRealTimers();
+  });
+
+  it('applies exponential backoff and emits error when the unconditional fallback itself fails', async () => {
+    vi.useFakeTimers();
+    const downloadEnvelope = {
+      schemaVersion: 1, appId: 'test-app', version: 2,
+      lastModified: '2026-01-02T00:00:00Z',
+      data: { tasks: [] },
+    };
+    const provider = {
+      name: 'fake', configFields: [],
+      download: vi.fn(async () => ({ payload: downloadEnvelope, etag: 'e1' })),
+      // Every upload 412s — even the unconditional fallback (degenerate server).
+      upload:   vi.fn().mockRejectedValue(new Error('PRECONDITION_FAILED')),
       test:     vi.fn(),
     };
     const { engine, calls } = makeEngine({
@@ -310,11 +379,47 @@ describe('createSyncEngine — 412 retry', () => {
     const p = engine.download();
     await vi.advanceTimersByTimeAsync(4000);
     await p;
-    // Both download calls happened (initial + retry).
-    expect(provider.download.mock.calls.length).toBe(2);
+    // Three cycles ran: initial, conditional retry, unconditional fallback.
+    expect(provider.download.mock.calls.length).toBe(3);
+    expect(provider.upload.mock.calls.length).toBe(3);
     // Backoff must be set to a future timestamp.
     expect(engine.getDownloadBackoffUntil()).toBeGreaterThan(Date.now());
     // An error status must have been emitted.
+    expect(calls.statusChanges.some(c => c.s === 'error')).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it('surfaces a non-412 retry failure without attempting the unconditional fallback', async () => {
+    vi.useFakeTimers();
+    const downloadEnvelope = {
+      schemaVersion: 1, appId: 'test-app', version: 2,
+      lastModified: '2026-01-02T00:00:00Z',
+      data: { tasks: [] },
+    };
+    const provider = {
+      name: 'fake', configFields: [],
+      // Retry cycle's re-download fails with a non-412 error (a 500). Upload
+      // errors other than 412 are handled inside upload() and never reach
+      // download()'s catch, so a download failure is the non-412 path here.
+      download: vi.fn()
+        .mockResolvedValueOnce({ payload: downloadEnvelope, etag: 'e1' })
+        .mockRejectedValueOnce(new Error('Download failed: 500 Internal Server Error')),
+      upload:   vi.fn().mockRejectedValueOnce(new Error('PRECONDITION_FAILED')),
+      test:     vi.fn(),
+    };
+    const { engine, calls } = makeEngine({
+      provider,
+      mergeResult: { data: { tasks: [] }, localChanged: false, remoteChanged: true },
+    });
+    localStorage.setItem('test-cloud-sync-last-synced', '2026-01-01T00:00:00Z');
+    const p = engine.download();
+    await vi.advanceTimersByTimeAsync(4000);
+    await p;
+    // No third (unconditional) cycle for a non-412 retry failure.
+    expect(provider.download.mock.calls.length).toBe(2);
+    expect(provider.upload.mock.calls.length).toBe(1);
+    expect(engine.getDownloadBackoffUntil()).toBeGreaterThan(Date.now());
+    expect(calls.errors.some(e => e.code === 'NETWORK_ERROR')).toBe(true);
     expect(calls.statusChanges.some(c => c.s === 'error')).toBe(true);
     vi.useRealTimers();
   });

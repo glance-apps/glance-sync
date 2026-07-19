@@ -314,7 +314,9 @@ export const createSyncEngine = (config) => {
 
     // Inner helper: download, merge, apply, upload (if anything changed).
     // Returns true if a reload was triggered (caller should bail).
-    const doCycle = async (overrideEtag) => {
+    // skipIfMatch forces an unconditional upload (no If-Match) — the
+    // last-writer-wins fallback used after two consecutive 412s.
+    const doCycle = async (overrideEtag, { skipIfMatch = false } = {}) => {
       const downloaded = await provider.download(cfg);
       if (!downloaded) {
         // Empty remote — seed it with local state.
@@ -365,7 +367,7 @@ export const createSyncEngine = (config) => {
         await upload({
           prebuiltPayload: mergedPayload,
           skipLockCheck: true,
-          etag: etag || overrideEtag || null,
+          etag: skipIfMatch ? null : (etag || overrideEtag || null),
         });
 
         if (localChanged) {
@@ -425,6 +427,7 @@ export const createSyncEngine = (config) => {
         // jitter (1–3 s) to reduce collision probability, then retry once.
         const jitterMs = 1000 + Math.random() * 2000;
         await new Promise(r => setTimeout(r, jitterMs));
+        let finalErr = null;
         try {
           await doCycle(null);
           downloadErrorCount = 0;
@@ -432,12 +435,35 @@ export const createSyncEngine = (config) => {
         } catch (retryErr) {
           // eslint-disable-next-line no-console
           console.error(`[${appId}] cloud sync retry after 412 failed:`, retryErr);
+          if (classifyError(retryErr).code === 'PRECONDITION_FAILED') {
+            // Two consecutive 412s with fresh ETags is not a write race — it's
+            // a server whose ETags can't round-trip through If-Match (e.g. a
+            // proxy mangling them in a way normalizeEtag doesn't cover), and a
+            // conditional retry can never succeed. Run one last cycle whose
+            // upload omits If-Match (last-writer-wins). The payload is the
+            // merge of local state with the remote fetched milliseconds
+            // earlier in the same cycle, so the lost-update window is tiny —
+            // far safer than a permanently wedged sync.
+            try {
+              await doCycle(null, { skipIfMatch: true });
+              downloadErrorCount = 0;
+              downloadBackoffUntil = 0;
+            } catch (fallbackErr) {
+              // eslint-disable-next-line no-console
+              console.error(`[${appId}] cloud sync unconditional fallback after 412 failed:`, fallbackErr);
+              finalErr = fallbackErr;
+            }
+          } else {
+            finalErr = retryErr;
+          }
+        }
+        if (finalErr) {
           // Apply the same exponential backoff used for other transient errors so
           // the engine backs off rather than hammering the server every poll cycle.
           downloadErrorCount += 1;
           const ms = Math.min(30 * Math.pow(2, downloadErrorCount - 1), MAX_DOWNLOAD_BACKOFF_S) * 1000;
           downloadBackoffUntil = Date.now() + ms;
-          onError?.(formatErrorMessage(classifyError(retryErr)), classifyError(retryErr).code, false);
+          onError?.(formatErrorMessage(classifyError(finalErr)), classifyError(finalErr).code, false);
           onStatusChange?.('error');
           scheduleAutoRevert('error', ERROR_HOLD_MS);
         }
