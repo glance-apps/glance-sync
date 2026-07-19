@@ -1,6 +1,6 @@
 import 'fake-indexeddb/auto'; // providers import crypto.js which needs IndexedDB
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { webdavFetch, createProviders } from '../src/providers.js';
+import { webdavFetch, createProviders, normalizeEtag } from '../src/providers.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -223,6 +223,57 @@ describe('auth header encoding', () => {
     const p = createProviders(BASE_ENGINE);
     // Emoji / CJK — toBase64 uses TextEncoder to avoid btoa codepoint limit
     expect(() => p.nextcloud.getAuthHeaders({ username: '用戶', appPassword: '密碼' })).not.toThrow();
+  });
+});
+
+// ─── ETag normalization ───────────────────────────────────────────────────────
+
+describe('normalizeEtag', () => {
+  it('passes a plain strong etag through untouched', () => {
+    expect(normalizeEtag('"abc123"')).toBe('"abc123"');
+  });
+
+  it('strips the weak-validator prefix', () => {
+    expect(normalizeEtag('W/"abc123"')).toBe('"abc123"');
+  });
+
+  it('strips the Apache mod_deflate -gzip suffix', () => {
+    expect(normalizeEtag('"abc123-gzip"')).toBe('"abc123"');
+  });
+
+  it('strips the Apache mod_brotli -br suffix', () => {
+    expect(normalizeEtag('"abc123-br"')).toBe('"abc123"');
+  });
+
+  it('strips a combined weak prefix and -gzip suffix', () => {
+    expect(normalizeEtag('W/"abc123-gzip"')).toBe('"abc123"');
+  });
+
+  it('passes null and undefined through unchanged', () => {
+    expect(normalizeEtag(null)).toBe(null);
+    expect(normalizeEtag(undefined)).toBe(undefined);
+  });
+
+  it('handles unquoted etag values', () => {
+    expect(normalizeEtag('abc123')).toBe('abc123');
+    expect(normalizeEtag('abc123-gzip')).toBe('abc123');
+    expect(normalizeEtag('W/abc123')).toBe('abc123');
+  });
+
+  it('leaves etags that merely contain "gzip" or "br" untouched', () => {
+    expect(normalizeEtag('"abcgzip"')).toBe('"abcgzip"');
+    expect(normalizeEtag('"gzip-abc"')).toBe('"gzip-abc"');
+    expect(normalizeEtag('"abc-gzipped"')).toBe('"abc-gzipped"');
+    expect(normalizeEtag('"abr"')).toBe('"abr"');
+  });
+
+  it('is applied to etags captured from download responses', async () => {
+    const nativeFn = vi.fn().mockReturnValue({
+      status: 200, ok: true, body: '{}', headers: { etag: 'W/"v1-gzip"' }
+    });
+    const p = createProviders({ ...BASE_ENGINE, nativeHttpRequest: nativeFn });
+    const result = await p.webdav.download(USER_CFG);
+    expect(result.etag).toBe('"v1"');
   });
 });
 
