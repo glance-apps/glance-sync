@@ -156,6 +156,7 @@ Pass `encryptionEnabled: true` in the sync config object stored via `engine.setC
 |--------|-------------|
 | `webdavFetch(config)` | Creates a transport-selecting WebDAV fetcher. Prefers Android HTTP bridge → Electron proxy → CORS proxy, in that order. |
 | `createProviders(config)` | Creates cloud sync provider objects (`nextcloud`, `koofr`, `webdav`). |
+| `normalizeEtag(raw)` | Normalizes a raw ETag header value for If-Match use: strips a weak-validator prefix (`W/"abc"` → `"abc"`) and the content-coding suffixes some servers append inside the quotes (`"abc-gzip"` / `"abc-br"` → `"abc"`). Quotes are preserved; `null`/`undefined` pass through unchanged. |
 
 ### Auto-backup
 
