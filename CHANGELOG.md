@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-07-31
+
+### Added
+
+- **Per-account vault auth, client half (GLANCEvault Phase 1.4b).** A
+  GLANCEvault server can run `authMode: 'per-account'`, where each device
+  authenticates with its own enrolled credential instead of the instance-wide
+  shared device token. The package owns the whole client-side flow — apps hand
+  it a bootstrap secret (or the shared token) and get a working engine back,
+  without implementing discovery, branching, credential persistence, or
+  secret discard themselves. Shared mode remains the default path and is
+  byte-for-byte unchanged.
+  - **`connectVaultSyncEngine(config)`** — the packaged connect flow.
+    Discovers the server's auth mode from `/healthz`, then branches:
+    `shared` → builds the engine from `config.vaultToken` exactly as before;
+    `per-account` → uses the credential persisted under
+    `{prefix}-vault-credential`, enrolling with `config.enrollmentSecret`
+    only when no credential is stored for this exact (server, account). The
+    credential is persisted durably (write + read-back verify) **before**
+    enrollment is treated as complete, and a storage canary runs **before**
+    minting so broken storage cannot orphan one server row per launch. The
+    bootstrap secret is never written to storage, never logged, never placed
+    on the engine config, and not retained past the call. **No code path
+    re-enrolls automatically** — once a credential is stored it is always
+    reused, even after rejection (recovery is Phase 2.2), so revocation
+    (vault Phase 2.1) cannot be silently undone by a client loop. Discovery
+    failure (server unreachable, unexpected body) falls back to the last
+    known auth state — stored credential, else `vaultToken` — which is
+    exactly the pre-1.4b behavior for existing installs; an unrecognized
+    future mode string does the same rather than guessing. A `/healthz`
+    without `authMode` (a pre-1.4a server) is ordinary shared mode, not an
+    error. Typed failures: `VAULT_TOKEN_REQUIRED`,
+    `ENROLLMENT_SECRET_REQUIRED`, `CREDENTIAL_PERSIST_FAILED`,
+    `VAULT_UNREACHABLE`, plus the enrollment errors below.
+  - **`getOrCreateDeviceId(storageKeyPrefix)`** — the package now owns the
+    stable device identity: generated once (`crypto.randomUUID`, with a
+    `getRandomValues` fallback for old WebViews) and persisted under
+    `{prefix}-device-id`; used for both the device cursor and enrollment. An
+    explicit `config.deviceId` still wins. This also fixes a latent bug: the
+    engine's device-cursor update silently no-oped (`{updated:false}`) when
+    no `deviceId` was configured, so such installs never reported cursors —
+    on upgrade they get a generated id and start reporting for the first
+    time (server-side effect: a `devices` row appears and tombstone GC gains
+    an accurate cursor; pure improvement, no data risk).
+  - **Substrate exports** (used by the flow, available standalone):
+    `fetchVaultHealth({ vaultUrl, fetchImpl? })` — unauthenticated
+    `GET /healthz`, `authMode` normalized to `'shared'` when the server
+    predates the field; and `enrollVaultDevice({ vaultUrl, enrollmentSecret,
+    accountId, deviceId, fetchImpl? })` — `POST /enroll`, secret in the body
+    only, values sent byte-exact, typed `ENROLLMENT_REJECTED` (401) /
+    `ENROLLMENT_UNSUPPORTED` (404, shared-mode server) failures, and
+    `*_REQUIRED` codes thrown before touching the wire on missing fields.
+  - **`CREDENTIAL_INVALID` and the credential halt.** `createVaultClient`
+    now reads error bodies best-effort: a 401 whose body says
+    `invalid credential` (the server's chosen signal for "this device must
+    re-enroll") surfaces as code `CREDENTIAL_INVALID`; a missing, non-JSON,
+    or unrecognized body degrades to the generic `VAULT_ERROR`, so client
+    correctness never depends on server wording. On `CREDENTIAL_INVALID` the
+    DB engine persists a stop under `{prefix}-db-sync-credential-halt`,
+    surfaces `onError(message, 'CREDENTIAL_INVALID', /* isHardStop */ true)`,
+    and makes **no further network calls** — across restarts. Nothing in
+    this version clears the halt (that is Phase 2.2's recovery flow);
+    `isCredentialHalted()` / `getCredentialHalt()` expose the state.
+    Shared-mode 401s (`invalid device token`) keep today's retryable
+    behavior. The key verifier passes `CREDENTIAL_INVALID` through instead
+    of relabeling it `VERIFIER_UNSUPPORTED`, so `allowUnverified` can never
+    wave a rejected device through.
+  - `createVaultClient` is otherwise unchanged on the wire; `vaultToken`
+    accepts either the shared device token or an enrolled credential — the
+    credential IS the Bearer token.
+
+### Security notes
+
+- The persisted credential lives in localStorage, exactly as exposed as the
+  shared device token and the file tier's provider passwords are today:
+  parity, not a regression. Secure-storage migration is explicitly out of
+  scope for this phase.
+
 ## [1.6.1] - 2026-07-19
 
 ### Fixed

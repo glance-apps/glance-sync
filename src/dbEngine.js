@@ -36,6 +36,41 @@ const ts = (v) => {
   return Number.isNaN(t) ? 0 : t;
 };
 
+// randomUUID is missing in some non-secure-context WebViews; getRandomValues
+// is everywhere the rest of this package's crypto already runs.
+const randomUUID = () => {
+  if (typeof globalThis.crypto?.randomUUID === 'function') return globalThis.crypto.randomUUID();
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+};
+
+/**
+ * The package-owned stable device identifier (vault Phase 1.4b). Generated
+ * once per storageKeyPrefix and persisted under `{prefix}-device-id`; used
+ * for both the device cursor and per-account enrollment, so the identity a
+ * credential is bound to is the same one the server's tombstone-GC cursor
+ * tracks. An explicit config.deviceId still wins for callers that already
+ * manage their own.
+ *
+ * Existing installs that never passed a deviceId get one generated on first
+ * launch of this version — which also means their device cursor starts
+ * updating for the first time (updateDeviceCursor previously no-oped
+ * silently without a deviceId).
+ */
+export const getOrCreateDeviceId = (storageKeyPrefix) => {
+  if (!storageKeyPrefix) throw new Error('getOrCreateDeviceId: storageKeyPrefix is required');
+  const key = `${storageKeyPrefix}-device-id`;
+  let id = localStorage.getItem(key);
+  if (!id) {
+    id = randomUUID();
+    localStorage.setItem(key, id);
+  }
+  return id;
+};
+
 /**
  * Creates the database sync engine.
  *
@@ -46,7 +81,7 @@ const ts = (v) => {
  * @param {string}  config.vaultUrl
  * @param {string}  config.vaultToken
  * @param {string}  config.accountId
- * @param {string} [config.deviceId]
+ * @param {string} [config.deviceId]        - stable device identity; defaults to the persisted package-owned id (getOrCreateDeviceId)
  * @param {string}  config.cryptoDBName     - device storage name for the root key
  * @param {Function|null} [config.nativeGetSyncKey]
  * @param {Function|null} [config.nativeStoreSyncKey]
@@ -61,7 +96,7 @@ const ts = (v) => {
  *
  * Event callbacks (optional):
  * @param {Function} [config.onStatusChange]
- * @param {Function} [config.onError]      - (message, code, isHardStop) called with code 'KEY_MISMATCH' on a wrong key, or 'VERIFIER_UNSUPPORTED' when the server can't host the verifier
+ * @param {Function} [config.onError]      - (message, code, isHardStop) called with code 'KEY_MISMATCH' on a wrong key, 'VERIFIER_UNSUPPORTED' when the server can't host the verifier, or 'CREDENTIAL_INVALID' (isHardStop true) when the server rejects this device's credential — the cycle then halts until Phase 2.2 recovery exists
  * @param {Function} [config.onRowsSkipped] - (count, entityIds) called when a cycle skipped undecryptable rows
  * @param {boolean}  [config.allowUnverified=false] - operator escape hatch: downgrade VERIFIER_UNSUPPORTED to a logged warning and proceed (unsafe; off by default)
  */
@@ -104,6 +139,9 @@ export const createDbSyncEngine = (config) => {
   if (typeof applyRemoteDelete !== 'function') throw new Error('createDbSyncEngine: applyRemoteDelete is required');
 
   const app = vaultApp || appId;
+  // Package-owned device identity: an explicit config.deviceId wins, else the
+  // persisted per-prefix id (generated on first use).
+  const resolvedDeviceId = deviceId || getOrCreateDeviceId(storageKeyPrefix);
   const lastModifiedOf = typeof getEntityLastModified === 'function'
     ? getEntityLastModified
     : (entity) => entity && entity.lastModified;
@@ -135,6 +173,16 @@ export const createDbSyncEngine = (config) => {
   // on pull so one bad row cannot wedge the cycle, and re-attempted each cycle
   // so a row recovers if the correct key later becomes available.
   const KEY_QUARANTINE = `${storageKeyPrefix}-db-sync-quarantine`;
+  // KEY_CRED_HALT persists the credential-rejected stop state (vault Phase
+  // 1.4b), as { message, at }. Once the server has said 401 "invalid
+  // credential", retrying is pure hammering — the only recovery is
+  // re-enrollment, which is Phase 2.2's flow. So the cycle stops, across
+  // restarts, and NOTHING in this phase clears the flag: it exists precisely
+  // so 2.2 has a legible state to build recovery on. Shared-mode auth
+  // failures (401 "invalid device token") do NOT set it — those are operator
+  // config problems that a config fix resolves, so they keep the ordinary
+  // retry behavior.
+  const KEY_CRED_HALT = `${storageKeyPrefix}-db-sync-credential-halt`;
 
   // ── In-memory guards ──────────────────────────────────────────────────────
   let syncing = false;
@@ -219,6 +267,21 @@ export const createDbSyncEngine = (config) => {
     writeQuarantine(getQuarantine().filter((q) => q.entityId !== entityId));
   };
 
+  // Credential-rejected stop state. Read/written only here; deliberately no
+  // clear function on the engine (recovery is Phase 2.2).
+  const getCredentialHalt = () => {
+    const raw = localStorage.getItem(KEY_CRED_HALT);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  };
+  const setCredentialHalt = (message) => {
+    localStorage.setItem(KEY_CRED_HALT, JSON.stringify({ message, at: new Date().toISOString() }));
+  };
+
   // markDirty: called by the app on every local write (and at creation time for
   // insert-only types). Idempotent and synchronous so it can run inside the
   // app's own write path.
@@ -253,9 +316,14 @@ export const createDbSyncEngine = (config) => {
   // typed, retryable code instead of being mislabeled "update your server".
   const isClientNotReady = (err) =>
     err && (err.code === 'ACCOUNT_ID_REQUIRED' || err.code === 'PASSPHRASE_REQUIRED');
+  // Likewise a rejected credential (401 "invalid credential") is an auth
+  // outcome, not a capability one: pass it through so the cycle's halt
+  // handling sees it — and so allowUnverified can never wave a revoked
+  // device through.
+  const isPassThrough = (err) => isClientNotReady(err) || (err && err.code === 'CREDENTIAL_INVALID');
 
   const verifierUnsupported = (cause) => {
-    if (isClientNotReady(cause)) throw cause;
+    if (isPassThrough(cause)) throw cause;
     if (allowUnverified) {
       // eslint-disable-next-line no-console
       console.warn(`[${appId}] db sync proceeding UNVERIFIED: the server cannot host the key verifier (${KEYCHECK_ENTITY_ID}).`, cause);
@@ -564,11 +632,10 @@ export const createDbSyncEngine = (config) => {
   // progress is the conservative value for server-side tombstone GC, since it
   // never lets the server reclaim a tombstone this device has not yet seen.
   const updateDeviceCursor = async () => {
-    if (!deviceId) return { updated: false };
     try {
       return await vault.device(app, {
         accountId,
-        deviceId,
+        deviceId: resolvedDeviceId,
         lastSeenSeq: getHighWaterMark(),
       });
     } catch (err) {
@@ -582,6 +649,15 @@ export const createDbSyncEngine = (config) => {
   const dbSyncCycle = async () => {
     const cfg = getConfig();
     if (cfg && cfg.enabled === false) return;
+    // Standing credential-rejected stop: no network calls at all. The state is
+    // re-surfaced on every attempted cycle so a UI constructed after the halt
+    // (e.g. next app launch) still learns about it through its own onError.
+    const halt = getCredentialHalt();
+    if (halt) {
+      onError?.(halt.message, 'CREDENTIAL_INVALID', true);
+      onStatusChange?.('error');
+      return { applied: 0, skipped: 0, skippedEntityIds: [], halted: true };
+    }
     if (syncing) return;
     syncing = true;
     onStatusChange?.('uploading');
@@ -607,7 +683,18 @@ export const createDbSyncEngine = (config) => {
       // eslint-disable-next-line no-console
       console.error(`[${appId}] db sync cycle error:`, err);
       const code = err && err.code ? err.code : 'NETWORK_ERROR';
-      onError?.(err?.message || String(err), code, false);
+      if (code === 'CREDENTIAL_INVALID') {
+        // The server rejected this device's credential. Persist the stop so no
+        // future cycle retries (a rejected credential never heals by retry —
+        // recovery is re-enrollment, Phase 2.2) and surface it as a hard stop.
+        // Under NO circumstances does the engine re-enroll here: enrollment is
+        // non-idempotent, so an automatic retry would mint a server row per
+        // failure and would let a revoked device silently re-admit itself.
+        setCredentialHalt(err?.message || String(err));
+        onError?.(err?.message || String(err), 'CREDENTIAL_INVALID', true);
+      } else {
+        onError?.(err?.message || String(err), code, false);
+      }
       onStatusChange?.('error');
       return { applied: 0, skipped: 0, skippedEntityIds: [] };
     } finally {
@@ -650,6 +737,10 @@ export const createDbSyncEngine = (config) => {
     isSyncing:        () => syncing,
     isKeyVerified:    () => verified,
     hasEncryptionReady: hasDbRootKey,
+    // Credential-rejected stop state (read-only this phase; recovery is 2.2).
+    isCredentialHalted: () => getCredentialHalt() !== null,
+    getCredentialHalt,
+    deviceId: resolvedDeviceId,
 
     // Sub-modules
     vault,

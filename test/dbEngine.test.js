@@ -944,3 +944,139 @@ describe.skipIf(!VAULT_URL)('salt registration (real vault)', () => {
     expect(await decryptEntity(ciphertext, 'e1')).toEqual({ shared: true });
   });
 });
+
+// ---------- credential-rejected halt (vault Phase 1.4b) ----------
+//
+// A 401 "invalid credential" from a per-account server must stop the retry
+// loop: persist a halt, surface CREDENTIAL_INVALID with isHardStop true, make
+// no further network calls, survive engine recreation, and NEVER enroll.
+
+describe('credential-rejected halt', () => {
+  const makeCredRejectingFetch = (requests) => async (url, init) => {
+    requests.push({ url, init });
+    return { ok: false, status: 401, json: async () => ({ error: 'invalid credential' }) };
+  };
+
+  const makeHaltEngine = (requests, onError) => createDbSyncEngine({
+    storageKeyPrefix: 'halt-test',
+    appId: 'test-app',
+    accountId: 'acct-1',
+    deviceId: 'device-1',
+    cryptoDBName: CRYPTO_CFG.cryptoDBName, // root key set up in beforeEach
+    vaultUrl: 'https://vault.example',
+    vaultToken: 'gvc_dead',
+    fetchImpl: makeCredRejectingFetch(requests),
+    getLocalEntity: () => null,
+    applyRemoteEntity: () => {},
+    applyRemoteDelete: () => {},
+    onError,
+  });
+
+  it('halts on 401 invalid credential: hard-stop surfaced, persisted, no further requests, no enrollment', async () => {
+    const requests = [];
+    const errors = [];
+    const engine = makeHaltEngine(requests, (msg, code, isHardStop) => errors.push({ msg, code, isHardStop }));
+
+    await engine.sync();
+    expect(errors.pop()).toMatchObject({ code: 'CREDENTIAL_INVALID', isHardStop: true });
+    expect(engine.isCredentialHalted()).toBe(true);
+    expect(engine.getCredentialHalt()).toMatchObject({ at: expect.any(String) });
+    const requestsAfterFirstCycle = requests.length;
+    expect(requestsAfterFirstCycle).toBeGreaterThan(0);
+
+    // Further cycles: zero network traffic, state re-surfaced each attempt.
+    await engine.sync();
+    await engine.sync();
+    expect(requests.length).toBe(requestsAfterFirstCycle);
+    expect(errors.pop()).toMatchObject({ code: 'CREDENTIAL_INVALID', isHardStop: true });
+
+    // Nothing ever tried to enroll (the invariant 2.1 revocation depends on).
+    expect(requests.some(r => r.url.includes('/enroll'))).toBe(false);
+  });
+
+  it('the halt survives engine recreation (persisted, not in-memory)', async () => {
+    const requests = [];
+    await makeHaltEngine(requests, () => {}).sync();
+    const requestsAfterFirstCycle = requests.length;
+
+    const relaunched = makeHaltEngine(requests, () => {});
+    expect(relaunched.isCredentialHalted()).toBe(true);
+    await relaunched.sync();
+    expect(requests.length).toBe(requestsAfterFirstCycle);
+  });
+
+  it('a shared-mode 401 ("invalid device token") does NOT halt — ordinary retryable error', async () => {
+    const requests = [];
+    const errors = [];
+    const engine = createDbSyncEngine({
+      storageKeyPrefix: 'no-halt-test',
+      appId: 'test-app',
+      accountId: 'acct-1',
+      deviceId: 'device-1',
+      cryptoDBName: CRYPTO_CFG.cryptoDBName,
+      vaultUrl: 'https://vault.example',
+      vaultToken: 'wrong-shared-token',
+      fetchImpl: async (url, init) => {
+        requests.push({ url, init });
+        return { ok: false, status: 401, json: async () => ({ error: 'invalid device token' }) };
+      },
+      getLocalEntity: () => null,
+      applyRemoteEntity: () => {},
+      applyRemoteDelete: () => {},
+      onError: (msg, code, isHardStop) => errors.push({ msg, code, isHardStop }),
+    });
+
+    await engine.sync();
+    // Pre-existing shared-mode behavior, unchanged by 1.4b: a verifier-path
+    // 401 surfaces as VERIFIER_UNSUPPORTED (any getRow error does). What
+    // matters here is what it is NOT: not CREDENTIAL_INVALID, not a hard
+    // stop, not a halt.
+    const surfaced = errors.pop();
+    expect(surfaced.code).not.toBe('CREDENTIAL_INVALID');
+    expect(surfaced.isHardStop).toBe(false);
+    expect(engine.isCredentialHalted()).toBe(false);
+
+    // Next cycle retries (requests keep flowing).
+    const before = requests.length;
+    await engine.sync();
+    expect(requests.length).toBeGreaterThan(before);
+  });
+});
+
+// ---------- package-owned deviceId in the engine ----------
+
+describe('device cursor without an explicit deviceId', () => {
+  it('generates and uses a persisted deviceId — the cursor updates instead of silently no-oping', async () => {
+    const vault = makeStatefulVault();
+    const engine = createDbSyncEngine({
+      storageKeyPrefix: 'autodev-test',
+      appId: 'test-app',
+      accountId: 'acct-1',
+      // deviceId deliberately omitted — pre-1.4b this meant {updated:false} forever
+      cryptoDBName: CRYPTO_CFG.cryptoDBName,
+      vaultClient: vault,
+      getLocalEntity: () => null,
+      applyRemoteEntity: () => {},
+      applyRemoteDelete: () => {},
+    });
+
+    await engine.sync();
+    expect(vault.calls.device.length).toBe(1);
+    const sent = vault.calls.device[0].deviceId;
+    expect(sent).toBe(localStorage.getItem('autodev-test-device-id'));
+    expect(engine.deviceId).toBe(sent);
+
+    // Stable across engine instances.
+    const again = createDbSyncEngine({
+      storageKeyPrefix: 'autodev-test',
+      appId: 'test-app',
+      accountId: 'acct-1',
+      cryptoDBName: CRYPTO_CFG.cryptoDBName,
+      vaultClient: vault,
+      getLocalEntity: () => null,
+      applyRemoteEntity: () => {},
+      applyRemoteDelete: () => {},
+    });
+    expect(again.deviceId).toBe(sent);
+  });
+});

@@ -27,7 +27,12 @@ export type SyncErrorCode =
   | 'VERIFIER_UNSUPPORTED'
   // DB transport: a row-scoped call (incl. the key verifier) was made before the
   // accountId was populated — retryable once the account id is available.
-  | 'ACCOUNT_ID_REQUIRED';
+  | 'ACCOUNT_ID_REQUIRED'
+  // DB transport, per-account auth: the server rejected this device's
+  // credential (401 "invalid credential"). Surfaced with isHardStop === true;
+  // the engine persists a halt and stops retrying. Recovery (re-enrollment)
+  // is Phase 2.2 — nothing in this version clears the halt.
+  | 'CREDENTIAL_INVALID';
 
 export type SyncStatus = 'idle' | 'uploading' | 'downloading' | 'success' | 'error';
 
@@ -421,9 +426,52 @@ export interface VaultClient {
 
 export function createVaultClient(config: {
   vaultUrl: string;
+  /** Shared device token, or the device's enrolled credential in per-account mode. */
   vaultToken: string;
   fetchImpl?: typeof fetch;
 }): VaultClient;
+
+// Per-account auth (vault Phase 1.4b).
+
+/** Which trust model a GLANCEvault server runs. Discoverable via fetchVaultHealth. */
+export type VaultAuthMode = 'shared' | 'per-account';
+
+export interface VaultHealth {
+  status: string;
+  version: string;
+  schemaVersion: number;
+  /** Normalized to 'shared' when the server predates the field. */
+  authMode: VaultAuthMode;
+}
+
+/** Unauthenticated GET /healthz. Safe to call before any token exists. */
+export function fetchVaultHealth(config: {
+  vaultUrl: string;
+  fetchImpl?: typeof fetch;
+}): Promise<VaultHealth>;
+
+export interface VaultEnrollment {
+  credentialId: string;
+  /** Returned once, never retrievable again. Persist it, then discard the bootstrap secret. */
+  credential: string;
+  accountId: string;
+  deviceId: string;
+  createdAt: string;
+}
+
+/**
+ * POST /enroll — exchanges the bootstrap secret for this device's own credential.
+ * Rejects with err.code 'ENROLLMENT_REJECTED' (401, secret not accepted),
+ * 'ENROLLMENT_UNSUPPORTED' (404, server runs shared mode or predates enrollment),
+ * or 'VAULT_ERROR' with err.status for other failures.
+ */
+export function enrollVaultDevice(config: {
+  vaultUrl: string;
+  enrollmentSecret: string;
+  accountId: string;
+  deviceId: string;
+  fetchImpl?: typeof fetch;
+}): Promise<VaultEnrollment>;
 
 export interface DbSyncEngineConfig {
   // Identity / local state
@@ -510,7 +558,47 @@ export interface DbSyncEngine {
   isKeyVerified(): boolean;
   hasEncryptionReady(): boolean;
 
+  /** True while the persisted credential-rejected stop is set (CREDENTIAL_INVALID). */
+  isCredentialHalted(): boolean;
+  /** The persisted stop record, or null. Read-only this phase; recovery is Phase 2.2. */
+  getCredentialHalt(): { message: string; at: string } | null;
+  /** The resolved stable device identity this engine runs as. */
+  deviceId: string;
+
   vault: VaultClient;
 }
 
 export function createDbSyncEngine(config: DbSyncEngineConfig): DbSyncEngine;
+
+/**
+ * Package-owned stable device identifier: generated once (crypto.randomUUID)
+ * and persisted under `{prefix}-device-id`. Used for both the device cursor
+ * and per-account enrollment. An explicit config.deviceId overrides it.
+ */
+export function getOrCreateDeviceId(storageKeyPrefix: string): string;
+
+/**
+ * The packaged vault connect flow: discovers the server's auth mode, resolves
+ * the Bearer value (enrolling with the bootstrap secret when the server is
+ * per-account and no credential is stored yet), persists the credential under
+ * `{prefix}-vault-credential`, and returns a ready engine. The bootstrap
+ * secret is never written to storage, never logged, and never retained past
+ * the call. No path re-enrolls automatically once a credential is stored.
+ *
+ * Typed failures: VAULT_TOKEN_REQUIRED, ENROLLMENT_SECRET_REQUIRED,
+ * CREDENTIAL_PERSIST_FAILED, VAULT_UNREACHABLE, plus enrollVaultDevice's
+ * ENROLLMENT_REJECTED / ENROLLMENT_UNSUPPORTED.
+ */
+export function connectVaultSyncEngine(
+  config: Omit<DbSyncEngineConfig, 'vaultToken'> & {
+    vaultToken?: string;
+    enrollmentSecret?: string;
+  }
+): Promise<{
+  engine: DbSyncEngine;
+  /** null when discovery failed and the flow fell back to the last known auth state. */
+  authMode: VaultAuthMode | null;
+  /** True only when this call minted a credential. */
+  enrolled: boolean;
+  deviceId: string;
+}>;
