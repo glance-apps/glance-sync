@@ -51,7 +51,10 @@ export {
 // The packaged connect flow: discover -> branch -> enroll if needed ->
 // persist credential -> build engine. Apps hand it a secret or token and get
 // a working engine back; the bootstrap secret never touches storage.
-export { connectVaultSyncEngine } from './vaultConnect.js';
+// recoverVaultSyncEngine (Phase 2.2) is the halt-gated, user-initiated exit
+// from a rejected credential: re-enrollment that rotates the dead credential
+// away server-side.
+export { connectVaultSyncEngine, recoverVaultSyncEngine } from './vaultConnect.js';
 export {
   setupDbRootKey,
   initDbRootKey,

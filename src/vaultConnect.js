@@ -36,12 +36,61 @@
 // Recovery from a rejected credential is Phase 2.2.
 
 import { fetchVaultHealth, enrollVaultDevice } from './vaultClient.js';
-import { createDbSyncEngine, getOrCreateDeviceId } from './dbEngine.js';
+import {
+  createDbSyncEngine,
+  getOrCreateDeviceId,
+  vaultCredentialKey,
+  credentialHaltKey,
+} from './dbEngine.js';
 
 const typedError = (message, code) => {
   const err = new Error(message);
   err.code = code;
   return err;
+};
+
+// Storage canary: prove the credential slot is writable BEFORE minting.
+// Enrollment is non-idempotent, so if device storage cannot hold the
+// credential we must find out before the server creates a row, not after.
+// (A crash between mint and persist can still orphan one row; since 2.1 the
+// next successful enrollment with the same (accountId, deviceId) supersedes
+// it, so even that is no longer a live orphan. Broken storage must still not
+// orphan one per attempt.)
+const ensureCredentialSlotWritable = (key, context) => {
+  // The slot's prior contents are RESTORED, not discarded: during recovery
+  // the slot holds the stale record, and a failed enrollment after the canary
+  // must leave that record exactly as it was (a failed recovery leaves the
+  // device halted with its state intact, never ambiguous).
+  const prior = localStorage.getItem(key);
+  const canary = JSON.stringify({ canary: true });
+  try {
+    localStorage.setItem(key, canary);
+    if (localStorage.getItem(key) !== canary) throw new Error('read-back mismatch');
+    if (prior === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, prior);
+  } catch {
+    throw typedError(
+      `${context}: device storage cannot persist a credential; refusing to enroll.`,
+      'CREDENTIAL_PERSIST_FAILED'
+    );
+  }
+};
+
+// Persist durably, then read back and verify, BEFORE enrollment is treated as
+// complete. Overwrites whatever was in the slot — the credential slot holds
+// exactly one record, so a stale credential never survives alongside a new
+// one. Only the credential and its metadata are written — never the secret.
+const persistCredentialRecord = (key, record, context) => {
+  try {
+    localStorage.setItem(key, JSON.stringify(record));
+    const readBack = JSON.parse(localStorage.getItem(key));
+    if (!readBack || readBack.credential !== record.credential) throw new Error('read-back mismatch');
+  } catch {
+    throw typedError(
+      `${context}: enrolled but could not persist the credential; not treating enrollment as complete.`,
+      'CREDENTIAL_PERSIST_FAILED'
+    );
+  }
 };
 
 // Byte-exact everywhere: validation only rejects missing/whitespace-only
@@ -96,7 +145,7 @@ export async function connectVaultSyncEngine(config = {}) {
   // stored credential's server binding survives a trailing-slash difference.
   const base = vaultUrl.replace(/\/+$/, '');
   const deviceId = engineConfig.deviceId || getOrCreateDeviceId(storageKeyPrefix);
-  const KEY_CREDENTIAL = `${storageKeyPrefix}-vault-credential`;
+  const KEY_CREDENTIAL = vaultCredentialKey(storageKeyPrefix);
 
   // A stored credential is only usable for the exact (server, account) it was
   // minted for: the server binds it to an account and 403s any other claim.
@@ -144,22 +193,7 @@ export async function connectVaultSyncEngine(config = {}) {
         );
       }
 
-      // Storage canary BEFORE minting: enrollment is non-idempotent, so if
-      // device storage cannot hold the credential we must find out before the
-      // server creates a row, not after. (A crash between mint and persist
-      // can still orphan one row; broken storage must not orphan one per
-      // launch.)
-      const canary = JSON.stringify({ canary: true });
-      try {
-        localStorage.setItem(KEY_CREDENTIAL, canary);
-        if (localStorage.getItem(KEY_CREDENTIAL) !== canary) throw new Error('read-back mismatch');
-        localStorage.removeItem(KEY_CREDENTIAL);
-      } catch {
-        throw typedError(
-          'connectVaultSyncEngine: device storage cannot persist a credential; refusing to enroll.',
-          'CREDENTIAL_PERSIST_FAILED'
-        );
-      }
+      ensureCredentialSlotWritable(KEY_CREDENTIAL, 'connectVaultSyncEngine');
 
       const enrollment = await enrollVaultDevice({
         vaultUrl: base,
@@ -169,27 +203,14 @@ export async function connectVaultSyncEngine(config = {}) {
         fetchImpl,
       });
 
-      // Persist durably, then read back and verify, BEFORE treating
-      // enrollment as complete. Only the credential and its metadata are
-      // written — the secret is not part of this record.
-      const record = {
+      persistCredentialRecord(KEY_CREDENTIAL, {
         credentialId: enrollment.credentialId,
         credential: enrollment.credential,
         accountId,
         deviceId,
         vaultUrl: base,
         createdAt: enrollment.createdAt,
-      };
-      try {
-        localStorage.setItem(KEY_CREDENTIAL, JSON.stringify(record));
-        const readBack = JSON.parse(localStorage.getItem(KEY_CREDENTIAL));
-        if (!readBack || readBack.credential !== enrollment.credential) throw new Error('read-back mismatch');
-      } catch {
-        throw typedError(
-          'connectVaultSyncEngine: enrolled but could not persist the credential; not treating enrollment as complete.',
-          'CREDENTIAL_PERSIST_FAILED'
-        );
-      }
+      }, 'connectVaultSyncEngine');
 
       token = enrollment.credential;
       enrolled = true;
@@ -221,4 +242,150 @@ export async function connectVaultSyncEngine(config = {}) {
 
   const engine = createDbSyncEngine({ ...engineConfig, deviceId, vaultToken: token });
   return { engine, authMode, enrolled, deviceId };
+}
+
+/**
+ * The exit from the credential halt (Phase 2.2): USER-INITIATED re-enrollment
+ * with the bootstrap secret, against a per-account server. Call this only
+ * from a deliberate UI action in which the user supplied the secret — never
+ * from a startup path, a retry path, or an error handler. Two structural
+ * guards enforce that: the package holds no secret (recovery cannot run
+ * without one being supplied fresh), and the call REFUSES unless the device
+ * is actually halted, so it cannot be wired in as an on-demand rotator.
+ *
+ * Order of operations — each failure leaves the device HALTED, never
+ * ambiguous, and the halt is cleared only after a verified success:
+ *   1. halt gate           (NOT_HALTED if the device isn't halted)
+ *   2. deviceId resolution (stale record's deviceId is ground truth — see below)
+ *   3. mode guard          (per-account only; NO fallback: VAULT_UNREACHABLE /
+ *                           RECOVERY_UNSUPPORTED leave everything untouched)
+ *   4. storage canary      (CREDENTIAL_PERSIST_FAILED before minting)
+ *   5. enroll              (ENROLLMENT_REJECTED etc. leave the halt + stale
+ *                           record intact)
+ *   6. persist + verify    (overwrites the stale record — it does not survive
+ *                           recovery; CREDENTIAL_PERSIST_FAILED leaves the
+ *                           halt intact)
+ *   7. clear the halt      (the LAST state change)
+ *   8. build a fresh engine
+ *
+ * DEVICE IDENTITY: the stale record's deviceId wins. Recovery's defining
+ * property is rotation — the server (Phase 2.1) revokes every still-active
+ * predecessor for the same byte-exact (accountId, deviceId) inside the
+ * enrollment transaction — and rotation only lands if we enroll under the
+ * identity the dead credential is actually bound to, for which the stored
+ * record is ground truth. An explicit config.deviceId that DIFFERS from the
+ * record is a conflict surfaced as DEVICE_ID_CONFLICT, not resolved
+ * silently: either choice would orphan something (a live predecessor or the
+ * device's cursor), so the caller decides. With no readable record, the
+ * explicit config value, then the persisted package-owned id, fill in.
+ *
+ * The engine returned is FRESH — the old engine's client closes over the
+ * dead credential and must be discarded by the app. If a stale reference
+ * survives anyway, its next 401 finds the stored record differs from its
+ * bearer and it goes inert in memory instead of re-halting the device (see
+ * isBearerSuperseded in dbEngine.js).
+ *
+ * SECRET LIFETIME: identical to connectVaultSyncEngine — the secret exists
+ * as this call's argument, rides once in the enroll request body, and is
+ * never stored, logged, placed on the engine config, or retained.
+ *
+ * @returns {Promise<{ engine: object, authMode: 'per-account',
+ *   enrolled: true, deviceId: string }>} — same shape as
+ *   connectVaultSyncEngine, so apps can swap their engine reference uniformly.
+ */
+export async function recoverVaultSyncEngine(config = {}) {
+  const { enrollmentSecret, ...engineConfig } = config;
+  const { storageKeyPrefix, vaultUrl, accountId, fetchImpl } = engineConfig;
+
+  requireString(storageKeyPrefix, 'storageKeyPrefix', 'STORAGE_KEY_PREFIX_REQUIRED');
+  requireString(vaultUrl, 'vaultUrl', 'VAULT_URL_REQUIRED');
+  requireString(accountId, 'accountId', 'ACCOUNT_ID_REQUIRED');
+  if (typeof enrollmentSecret !== 'string' || enrollmentSecret.trim() === '') {
+    throw typedError(
+      'recoverVaultSyncEngine: recovery requires the bootstrap secret to be supplied (it is never stored).',
+      'ENROLLMENT_SECRET_REQUIRED'
+    );
+  }
+
+  const base = vaultUrl.replace(/\/+$/, '');
+  const KEY_CREDENTIAL = vaultCredentialKey(storageKeyPrefix);
+  const KEY_HALT = credentialHaltKey(storageKeyPrefix);
+
+  // 1. Halt gate. Recovery is the exit from the halt and nothing else; a
+  // device that isn't halted has nothing to recover from, and refusing here
+  // is what makes "no routine code path can re-enroll" structural.
+  if (localStorage.getItem(KEY_HALT) === null) {
+    throw typedError(
+      'recoverVaultSyncEngine: this device is not credential-halted; recovery only runs from the halted state.',
+      'NOT_HALTED'
+    );
+  }
+
+  // 2. Device identity, from the stale record when one is readable.
+  let staleRecord = null;
+  try {
+    const raw = localStorage.getItem(KEY_CREDENTIAL);
+    staleRecord = raw ? JSON.parse(raw) : null;
+  } catch {
+    staleRecord = null;
+  }
+  const recordDeviceId =
+    staleRecord && typeof staleRecord.deviceId === 'string' && staleRecord.deviceId !== ''
+      ? staleRecord.deviceId
+      : null;
+  if (recordDeviceId && typeof engineConfig.deviceId === 'string' && engineConfig.deviceId !== recordDeviceId) {
+    throw typedError(
+      `recoverVaultSyncEngine: config.deviceId ("${engineConfig.deviceId}") differs from the deviceId the stale credential is bound to ("${recordDeviceId}"). Enrolling under either would orphan the other's credential or cursor — resolve the conflict explicitly.`,
+      'DEVICE_ID_CONFLICT'
+    );
+  }
+  const deviceId = recordDeviceId || engineConfig.deviceId || getOrCreateDeviceId(storageKeyPrefix);
+
+  // 3. Mode guard. Unlike connect, recovery NEVER falls back on discovery
+  // failure — it exists only to enroll, and enrolling blind could hit a
+  // shared-mode server. Shared mode has no credentials and therefore no
+  // recovery; this refusal is what keeps it structurally unreachable.
+  let health;
+  try {
+    health = await fetchVaultHealth({ vaultUrl: base, fetchImpl });
+  } catch {
+    throw typedError(
+      `recoverVaultSyncEngine: could not reach ${base}/healthz; the device stays halted.`,
+      'VAULT_UNREACHABLE'
+    );
+  }
+  if (health.authMode !== 'per-account') {
+    throw typedError(
+      `recoverVaultSyncEngine: this server reports auth mode "${health.authMode}", not per-account — there is no credential to recover; the device stays halted.`,
+      'RECOVERY_UNSUPPORTED'
+    );
+  }
+
+  // 4-6. Canary, enroll (the rotation: same byte-exact accountId + deviceId
+  // revokes every still-active predecessor server-side), persist + verify.
+  ensureCredentialSlotWritable(KEY_CREDENTIAL, 'recoverVaultSyncEngine');
+
+  const enrollment = await enrollVaultDevice({
+    vaultUrl: base,
+    enrollmentSecret,
+    accountId,
+    deviceId,
+    fetchImpl,
+  });
+
+  persistCredentialRecord(KEY_CREDENTIAL, {
+    credentialId: enrollment.credentialId,
+    credential: enrollment.credential,
+    accountId,
+    deviceId,
+    vaultUrl: base,
+    createdAt: enrollment.createdAt,
+  }, 'recoverVaultSyncEngine');
+
+  // 7. Clear the halt — the last state change, after verified persistence.
+  localStorage.removeItem(KEY_HALT);
+
+  // 8. Fresh engine on the new credential.
+  const engine = createDbSyncEngine({ ...engineConfig, deviceId, vaultToken: enrollment.credential });
+  return { engine, authMode: 'per-account', enrolled: true, deviceId };
 }

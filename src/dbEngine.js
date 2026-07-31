@@ -71,6 +71,11 @@ export const getOrCreateDeviceId = (storageKeyPrefix) => {
   return id;
 };
 
+// Storage keys shared between this engine and the connect/recovery flow in
+// vaultConnect.js. Defined once here so the two modules cannot drift.
+export const vaultCredentialKey = (storageKeyPrefix) => `${storageKeyPrefix}-vault-credential`;
+export const credentialHaltKey = (storageKeyPrefix) => `${storageKeyPrefix}-db-sync-credential-halt`;
+
 /**
  * Creates the database sync engine.
  *
@@ -175,17 +180,23 @@ export const createDbSyncEngine = (config) => {
   const KEY_QUARANTINE = `${storageKeyPrefix}-db-sync-quarantine`;
   // KEY_CRED_HALT persists the credential-rejected stop state (vault Phase
   // 1.4b), as { message, at }. Once the server has said 401 "invalid
-  // credential", retrying is pure hammering — the only recovery is
-  // re-enrollment, which is Phase 2.2's flow. So the cycle stops, across
-  // restarts, and NOTHING in this phase clears the flag: it exists precisely
-  // so 2.2 has a legible state to build recovery on. Shared-mode auth
-  // failures (401 "invalid device token") do NOT set it — those are operator
-  // config problems that a config fix resolves, so they keep the ordinary
-  // retry behavior.
-  const KEY_CRED_HALT = `${storageKeyPrefix}-db-sync-credential-halt`;
+  // credential", retrying is pure hammering — the only way out is
+  // user-initiated re-enrollment (recoverVaultSyncEngine, Phase 2.2), which
+  // is the ONLY code that clears this key, and only after a verified
+  // successful enrollment. Shared-mode auth failures (401 "invalid device
+  // token") do NOT set it — those are operator config problems that a config
+  // fix resolves, so they keep the ordinary retry behavior.
+  const KEY_CRED_HALT = credentialHaltKey(storageKeyPrefix);
+  const KEY_CREDENTIAL = vaultCredentialKey(storageKeyPrefix);
 
   // ── In-memory guards ──────────────────────────────────────────────────────
   let syncing = false;
+  // Set when this instance's bearer is proven superseded (see
+  // isBearerSuperseded): the instance goes inert IN MEMORY ONLY — it never
+  // touches the shared halt key, and it stops generating network traffic. A
+  // stale reference the app forgot after recovery dies quietly instead of
+  // hammering the server with a dead credential.
+  let supersededInert = false;
   // Per-session cache: once the derived root key is proven against the account's
   // existing data (Part A), we never re-verify for the life of this engine.
   let verified = false;
@@ -280,6 +291,31 @@ export const createDbSyncEngine = (config) => {
   };
   const setCredentialHalt = (message) => {
     localStorage.setItem(KEY_CRED_HALT, JSON.stringify({ message, at: new Date().toISOString() }));
+  };
+
+  // The halt-set identity rule (Phase 2.2). The halt key is shared by every
+  // engine instance on this device, so a STALE instance — one still holding a
+  // credential that recovery has since replaced — must not be able to re-set
+  // the halt and brick the recovered engine. A superseded bearer is provable:
+  // the stored credential record exists, is readable, and holds a DIFFERENT
+  // credential than this engine speaks.
+  //
+  // THE RULE FAILS TOWARD HALTING, deliberately: halt when the record is
+  // missing or unreadable, or when it matches this engine's bearer. Skip the
+  // halt ONLY on that provable-superseded case. The naive simplification
+  // ("no record -> no halt") would leave an engine with a dead credential and
+  // a wiped record retrying forever — exactly what the halt exists to
+  // prevent. Do not simplify this condition.
+  const isBearerSuperseded = () => {
+    if (typeof vaultToken !== 'string' || vaultToken === '') return false;
+    const raw = localStorage.getItem(KEY_CREDENTIAL);
+    if (!raw) return false;
+    try {
+      const rec = JSON.parse(raw);
+      return !!(rec && typeof rec.credential === 'string' && rec.credential !== vaultToken);
+    } catch {
+      return false;
+    }
   };
 
   // markDirty: called by the app on every local write (and at creation time for
@@ -649,6 +685,13 @@ export const createDbSyncEngine = (config) => {
   const dbSyncCycle = async () => {
     const cfg = getConfig();
     if (cfg && cfg.enabled === false) return;
+    // A superseded stale instance is dead silently: no network, and no
+    // onError either — its failure was surfaced once when detected, and
+    // re-surfacing would fight the recovered engine's own status/error
+    // signals through the app's shared callbacks.
+    if (supersededInert) {
+      return { applied: 0, skipped: 0, skippedEntityIds: [], superseded: true };
+    }
     // Standing credential-rejected stop: no network calls at all. The state is
     // re-surfaced on every attempted cycle so a UI constructed after the halt
     // (e.g. next app launch) still learns about it through its own onError.
@@ -684,14 +727,24 @@ export const createDbSyncEngine = (config) => {
       console.error(`[${appId}] db sync cycle error:`, err);
       const code = err && err.code ? err.code : 'NETWORK_ERROR';
       if (code === 'CREDENTIAL_INVALID') {
-        // The server rejected this device's credential. Persist the stop so no
-        // future cycle retries (a rejected credential never heals by retry —
-        // recovery is re-enrollment, Phase 2.2) and surface it as a hard stop.
-        // Under NO circumstances does the engine re-enroll here: enrollment is
-        // non-idempotent, so an automatic retry would mint a server row per
-        // failure and would let a revoked device silently re-admit itself.
-        setCredentialHalt(err?.message || String(err));
-        onError?.(err?.message || String(err), 'CREDENTIAL_INVALID', true);
+        // The server rejected this engine's credential. Under NO circumstances
+        // does the engine re-enroll here: enrollment is non-idempotent, so an
+        // automatic retry would mint a server row per failure and would let a
+        // revoked device silently re-admit itself. Recovery is user-initiated
+        // only (recoverVaultSyncEngine).
+        if (isBearerSuperseded()) {
+          // This instance was replaced by recovery and the app kept a stale
+          // reference. Go inert in memory — surfaced once, then silent — and
+          // leave the shared halt key alone so the recovered engine keeps
+          // syncing.
+          supersededInert = true;
+          onError?.(err?.message || String(err), 'CREDENTIAL_INVALID', true);
+        } else {
+          // Persist the stop so no future cycle retries (a rejected
+          // credential never heals by retry) and surface it as a hard stop.
+          setCredentialHalt(err?.message || String(err));
+          onError?.(err?.message || String(err), 'CREDENTIAL_INVALID', true);
+        }
       } else {
         onError?.(err?.message || String(err), code, false);
       }
@@ -737,9 +790,13 @@ export const createDbSyncEngine = (config) => {
     isSyncing:        () => syncing,
     isKeyVerified:    () => verified,
     hasEncryptionReady: hasDbRootKey,
-    // Credential-rejected stop state (read-only this phase; recovery is 2.2).
+    // Credential-rejected stop state. Cleared only by recoverVaultSyncEngine
+    // after a verified successful re-enrollment — never by the engine.
     isCredentialHalted: () => getCredentialHalt() !== null,
     getCredentialHalt,
+    // True once this instance proved its bearer was superseded by recovery
+    // and went inert (in-memory only; a fresh instance is unaffected).
+    isSuperseded: () => supersededInert,
     deviceId: resolvedDeviceId,
 
     // Sub-modules
