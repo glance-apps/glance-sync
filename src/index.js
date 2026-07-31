@@ -40,14 +40,18 @@ export {
 } from './engine.js';
 
 // Phase 3: database transport (selected via transportMode: 'database').
-export { createDbSyncEngine } from './dbEngine.js';
+export { createDbSyncEngine, getOrCreateDeviceId } from './dbEngine.js';
 export {
   createVaultClient,
-  // Per-account auth (vault Phase 1.4b): unauthenticated auth-mode discovery
-  // and the bootstrap-secret -> per-device-credential exchange.
+  // Per-account auth substrate (vault Phase 1.4b): unauthenticated auth-mode
+  // discovery and the bootstrap-secret -> per-device-credential exchange.
   fetchVaultHealth,
   enrollVaultDevice,
 } from './vaultClient.js';
+// The packaged connect flow: discover -> branch -> enroll if needed ->
+// persist credential -> build engine. Apps hand it a secret or token and get
+// a working engine back; the bootstrap secret never touches storage.
+export { connectVaultSyncEngine } from './vaultConnect.js';
 export {
   setupDbRootKey,
   initDbRootKey,

@@ -146,6 +146,43 @@ describe('enrollVaultDevice', () => {
   });
 });
 
+describe('error-body classification (best-effort, degrades to VAULT_ERROR)', () => {
+  const client = (responder) => createVaultClient({
+    vaultUrl: 'https://vault.example',
+    vaultToken: 'tok',
+    fetchImpl: async () => responder(),
+  });
+
+  it('401 with body {error:"invalid credential"} -> CREDENTIAL_INVALID', async () => {
+    const c = client(() => jsonResponse(401, { error: 'invalid credential' }));
+    await expect(c.list('app', { accountId: 'a', since: 0 }))
+      .rejects.toMatchObject({ code: 'CREDENTIAL_INVALID', status: 401 });
+  });
+
+  it('401 with shared-mode wording ("invalid device token") stays VAULT_ERROR', async () => {
+    const c = client(() => jsonResponse(401, { error: 'invalid device token' }));
+    await expect(c.list('app', { accountId: 'a', since: 0 }))
+      .rejects.toMatchObject({ code: 'VAULT_ERROR', status: 401 });
+  });
+
+  it('401 with a missing/non-JSON body degrades to VAULT_ERROR (never throws in the parse)', async () => {
+    const c = client(() => ({ ok: false, status: 401, json: async () => { throw new Error('no body'); } }));
+    await expect(c.list('app', { accountId: 'a', since: 0 }))
+      .rejects.toMatchObject({ code: 'VAULT_ERROR', status: 401 });
+  });
+
+  it('"invalid credential" wording on a non-401 status stays VAULT_ERROR', async () => {
+    const c = client(() => jsonResponse(500, { error: 'invalid credential' }));
+    await expect(c.list('app', { accountId: 'a', since: 0 }))
+      .rejects.toMatchObject({ code: 'VAULT_ERROR', status: 500 });
+  });
+
+  it('classification applies on every scoped call, e.g. getSalt', async () => {
+    const c = client(() => jsonResponse(401, { error: 'invalid credential' }));
+    await expect(c.getSalt('acct')).rejects.toMatchObject({ code: 'CREDENTIAL_INVALID' });
+  });
+});
+
 describe('credential as Bearer token (scoped calls are mode-agnostic)', () => {
   it('createVaultClient sends an enrolled credential exactly as it sends the shared token', async () => {
     const credential = 'gvc_' + 'cd'.repeat(32);

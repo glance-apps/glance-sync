@@ -191,9 +191,33 @@ export function createVaultClient({ vaultUrl, vaultToken, fetchImpl } = {}) {
     return res;
   };
 
+  // Error-body inspection is BEST-EFFORT and deliberately narrow. The server
+  // made the 401 body wording the only signal separating shared mode's
+  // "invalid device token" (server misconfigured / wrong token) from
+  // per-account mode's "invalid credential" (this device must re-enroll —
+  // a Phase 2.2 recovery flow; nothing in this package re-enrolls). Only that
+  // exact wording upgrades the code to CREDENTIAL_INVALID; a missing,
+  // non-JSON, or unrecognized body degrades to the generic VAULT_ERROR, so
+  // the client's correctness never depends on server wording.
+  const errorFromResponse = async (res, context) => {
+    let bodyError = null;
+    try {
+      const body = await res.json();
+      if (body && typeof body.error === 'string') bodyError = body.error;
+    } catch {
+      // Empty or non-JSON error body: keep the generic classification.
+    }
+    if (res.status === 401 && bodyError === 'invalid credential') {
+      const err = new VaultError(`${context} failed: 401 — the server rejected this device's credential`, 401);
+      err.code = 'CREDENTIAL_INVALID';
+      return err;
+    }
+    return new VaultError(`${context} failed: ${res.status}`, res.status);
+  };
+
   const jsonOrThrow = async (res, context) => {
     if (!res.ok) {
-      throw new VaultError(`${context} failed: ${res.status}`, res.status);
+      throw await errorFromResponse(res, context);
     }
     return res.json();
   };
