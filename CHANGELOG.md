@@ -62,6 +62,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   credential minted and then lost to a persistence failure is superseded by
   the next successful enrollment for the same `(accountId, deviceId)`.
 
+### Fixed
+
+- **Device cursors now report on installs that never configured a
+  `deviceId`, automatically on upgrade.** Such installs have never updated
+  their device cursor: the cursor step silently no-opped (`{updated:
+  false}`) whenever no `deviceId` was passed, so the server's tombstone GC
+  had no cursor for those devices. On upgrade, a device id is generated and
+  persisted (`{prefix}-device-id`) at engine construction, and cursor
+  reporting begins on the first completed sync cycle — **no app changes
+  required**; this applies to plain `createDbSyncEngine` construction, not
+  only the new connect flow, and identically in shared and per-account
+  mode. Installs that already pass an explicit `deviceId` are unaffected
+  and keep using it. Operator note: an install this fixes has no prior
+  cursor history, so the newly generated id strands nothing.
+  (This shipped in 1.7.0's device-identity work but 1.7.0 was never
+  published; it reaches consumers with this release.)
+
+### Upgrade notes
+
+Two behavior changes arrive with the fix above, without opt-in:
+
+- **Engine construction now touches localStorage.** `getOrCreateDeviceId`
+  reads and writes `{prefix}-device-id` at construction time; previously
+  construction deferred all localStorage access to cycle time. In an
+  environment without a `localStorage` global, construction now fails where
+  it previously succeeded and failed later at first sync. Theoretical for
+  browser and WebView hosts (all three GLANCE apps), but if construction
+  throws before any network activity, look here first.
+- **Injected `vaultClient` consumers see new `device()` calls.** An engine
+  constructed with `config.vaultClient` and no `deviceId` previously made
+  zero `device()` calls; it now makes one per cycle. A mock or bridge
+  client without a `device()` method will throw inside the cursor step —
+  swallowed and warned, never fatal — but the console warning is new and
+  recurring. Affects tests with mock clients and native shells that inject
+  a bridge client.
+
 ## [1.7.0] - 2026-07-31
 
 ### Added
