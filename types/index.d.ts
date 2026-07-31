@@ -421,9 +421,52 @@ export interface VaultClient {
 
 export function createVaultClient(config: {
   vaultUrl: string;
+  /** Shared device token, or the device's enrolled credential in per-account mode. */
   vaultToken: string;
   fetchImpl?: typeof fetch;
 }): VaultClient;
+
+// Per-account auth (vault Phase 1.4b).
+
+/** Which trust model a GLANCEvault server runs. Discoverable via fetchVaultHealth. */
+export type VaultAuthMode = 'shared' | 'per-account';
+
+export interface VaultHealth {
+  status: string;
+  version: string;
+  schemaVersion: number;
+  /** Normalized to 'shared' when the server predates the field. */
+  authMode: VaultAuthMode;
+}
+
+/** Unauthenticated GET /healthz. Safe to call before any token exists. */
+export function fetchVaultHealth(config: {
+  vaultUrl: string;
+  fetchImpl?: typeof fetch;
+}): Promise<VaultHealth>;
+
+export interface VaultEnrollment {
+  credentialId: string;
+  /** Returned once, never retrievable again. Persist it, then discard the bootstrap secret. */
+  credential: string;
+  accountId: string;
+  deviceId: string;
+  createdAt: string;
+}
+
+/**
+ * POST /enroll — exchanges the bootstrap secret for this device's own credential.
+ * Rejects with err.code 'ENROLLMENT_REJECTED' (401, secret not accepted),
+ * 'ENROLLMENT_UNSUPPORTED' (404, server runs shared mode or predates enrollment),
+ * or 'VAULT_ERROR' with err.status for other failures.
+ */
+export function enrollVaultDevice(config: {
+  vaultUrl: string;
+  enrollmentSecret: string;
+  accountId: string;
+  deviceId: string;
+  fetchImpl?: typeof fetch;
+}): Promise<VaultEnrollment>;
 
 export interface DbSyncEngineConfig {
   // Identity / local state

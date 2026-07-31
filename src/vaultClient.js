@@ -15,6 +15,16 @@
 //   GET    /salt/:accountId                      fetch the account root-key salt
 //   PUT    /salt/:accountId                      register a salt (first-write-wins)
 //
+// Auth models (vault Phase 1.4b — the client half of per-account credentials):
+// a vault runs in one of two modes, discoverable unauthenticated via
+// fetchVaultHealth. In "shared" mode every device presents the instance-wide
+// device token as the Bearer value. In "per-account" mode each device first
+// exchanges the admin-configured bootstrap secret for its own credential at
+// POST /enroll (enrollVaultDevice below) and presents THAT as the Bearer
+// value — the wire shape of every scoped call is identical in both modes, so
+// createVaultClient is mode-agnostic: callers pass the shared token or the
+// per-device credential as vaultToken and nothing else changes.
+//
 // Salts cross the wire as base64 in a { salt } field. The client converts to and
 // from Uint8Array at the boundary so callers always deal in bytes.
 
@@ -29,23 +39,138 @@ class VaultError extends Error {
   }
 }
 
+// Shared by createVaultClient and the standalone pre-credential helpers below.
+const resolveFetch = (fetchImpl, context) => {
+  const doFetch = fetchImpl || globalThis.fetch;
+  if (typeof doFetch !== 'function') {
+    throw new Error(`${context}: no fetch implementation available`);
+  }
+  return doFetch;
+};
+
+const requireBaseUrl = (vaultUrl, context) => {
+  if (typeof vaultUrl !== 'string' || vaultUrl.trim() === '') {
+    throw new Error(`${context}: vaultUrl is required`);
+  }
+  return vaultUrl.replace(/\/+$/, '');
+};
+
+/**
+ * Fetches the vault's public health document. Unauthenticated — /healthz is
+ * the one endpoint that never requires a token, in either auth mode, so this
+ * is safe to call before the user has pasted anything.
+ *
+ * `authMode` is normalized to 'shared' when the field is absent: servers that
+ * predate it are all shared-token servers, so a client can branch on
+ * `health.authMode === 'per-account'` against any server version.
+ *
+ * @param {object} config
+ * @param {string} config.vaultUrl - base URL of the GLANCEvault server
+ * @param {Function} [config.fetchImpl] - fetch implementation (defaults to global fetch)
+ * @returns {Promise<{ status: string, version: string, schemaVersion: number, authMode: 'shared'|'per-account' }>}
+ */
+export async function fetchVaultHealth({ vaultUrl, fetchImpl } = {}) {
+  const base = requireBaseUrl(vaultUrl, 'fetchVaultHealth');
+  const doFetch = resolveFetch(fetchImpl, 'fetchVaultHealth');
+  const res = await doFetch(`${base}/healthz`, { method: 'GET', headers: {} });
+  if (!res.ok) {
+    throw new VaultError(`health check failed: ${res.status}`, res.status);
+  }
+  const body = await res.json();
+  return {
+    ...body,
+    authMode: typeof body.authMode === 'string' ? body.authMode : 'shared',
+  };
+}
+
+/**
+ * Enrolls this device with a per-account vault: exchanges the admin-configured
+ * bootstrap secret for the device's own credential (POST /enroll). The secret
+ * rides in the request body, never the query string (query strings appear in
+ * proxy logs), and no Authorization header is sent — the secret IS this
+ * route's authentication.
+ *
+ * The returned `credential` appears in the response ONCE and is never
+ * retrievable again (the server stores only a hash). Callers must persist it
+ * and then DISCARD the bootstrap secret: nothing ever asks for the secret
+ * again, and a device that loses its credential simply re-enrolls — every
+ * successful call mints a fresh credential. Pass the credential as
+ * `vaultToken` to createVaultClient / the DB engine; the wire shape of scoped
+ * calls is unchanged.
+ *
+ * Typed failures:
+ *  - `ENROLLMENT_REJECTED` (401): the server did not accept the secret.
+ *  - `ENROLLMENT_UNSUPPORTED` (404): the server does not offer enrollment —
+ *    it runs shared auth mode (the route is registration-gated off) or
+ *    predates per-account auth. Check fetchVaultHealth().authMode first to
+ *    distinguish this up front.
+ *  - `VAULT_ERROR` with `status` for any other non-2xx response.
+ *
+ * @param {object} config
+ * @param {string} config.vaultUrl - base URL of the GLANCEvault server
+ * @param {string} config.enrollmentSecret - the admin-configured bootstrap secret
+ * @param {string} config.accountId - account to bind the credential to
+ * @param {string} config.deviceId - stable identifier for this device
+ * @param {Function} [config.fetchImpl] - fetch implementation (defaults to global fetch)
+ * @returns {Promise<{ credentialId: string, credential: string, accountId: string, deviceId: string, createdAt: string }>}
+ */
+export async function enrollVaultDevice({ vaultUrl, enrollmentSecret, accountId, deviceId, fetchImpl } = {}) {
+  const base = requireBaseUrl(vaultUrl, 'enrollVaultDevice');
+  const doFetch = resolveFetch(fetchImpl, 'enrollVaultDevice');
+
+  // Fail typed and off the wire on missing fields, like requireAccountId: the
+  // server rejects them with a 400 anyway, but a client-side throw is clearer
+  // and never puts a malformed enrollment on the network. Values are sent
+  // byte-exact — validation only rejects missing/whitespace-only input, it
+  // never trims what goes on the wire (matching the server's semantics).
+  const requireField = (value, name, code) => {
+    if (typeof value !== 'string' || value.trim() === '') {
+      const err = new Error(`enrollVaultDevice: ${name} is required but was missing or empty.`);
+      err.code = code;
+      throw err;
+    }
+  };
+  requireField(enrollmentSecret, 'enrollmentSecret', 'ENROLLMENT_SECRET_REQUIRED');
+  requireField(accountId, 'accountId', 'ACCOUNT_ID_REQUIRED');
+  requireField(deviceId, 'deviceId', 'DEVICE_ID_REQUIRED');
+
+  const res = await doFetch(`${base}/enroll`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enrollmentSecret, accountId, deviceId }),
+  });
+
+  if (res.status === 401) {
+    const err = new VaultError('enroll failed: enrollment secret rejected', 401);
+    err.code = 'ENROLLMENT_REJECTED';
+    throw err;
+  }
+  if (res.status === 404) {
+    // Express's default 404: the /enroll route is only registered in
+    // per-account mode, so this server cannot enroll anyone.
+    const err = new VaultError('enroll failed: this server does not offer enrollment (shared auth mode?)', 404);
+    err.code = 'ENROLLMENT_UNSUPPORTED';
+    throw err;
+  }
+  if (!res.ok) {
+    throw new VaultError(`enroll failed: ${res.status}`, res.status);
+  }
+  return res.json();
+}
+
 /**
  * Creates a vault client bound to a server URL and token.
  *
  * @param {object} config
  * @param {string} config.vaultUrl   - base URL of the GLANCEvault server
- * @param {string} config.vaultToken - Bearer token
+ * @param {string} config.vaultToken - Bearer token: the shared device token
+ *   (shared mode) or this device's enrolled credential (per-account mode)
  * @param {Function} [config.fetchImpl] - fetch implementation (defaults to global fetch)
  */
 export function createVaultClient({ vaultUrl, vaultToken, fetchImpl } = {}) {
-  if (!vaultUrl)   throw new Error('createVaultClient: vaultUrl is required');
+  const base = requireBaseUrl(vaultUrl, 'createVaultClient');
   if (!vaultToken) throw new Error('createVaultClient: vaultToken is required');
-  const doFetch = fetchImpl || globalThis.fetch;
-  if (typeof doFetch !== 'function') {
-    throw new Error('createVaultClient: no fetch implementation available');
-  }
-
-  const base = vaultUrl.replace(/\/+$/, '');
+  const doFetch = resolveFetch(fetchImpl, 'createVaultClient');
   const authHeaders = (extra = {}) => ({
     Authorization: `Bearer ${vaultToken}`,
     ...extra,

@@ -41,7 +41,13 @@ export {
 
 // Phase 3: database transport (selected via transportMode: 'database').
 export { createDbSyncEngine } from './dbEngine.js';
-export { createVaultClient } from './vaultClient.js';
+export {
+  createVaultClient,
+  // Per-account auth (vault Phase 1.4b): unauthenticated auth-mode discovery
+  // and the bootstrap-secret -> per-device-credential exchange.
+  fetchVaultHealth,
+  enrollVaultDevice,
+} from './vaultClient.js';
 export {
   setupDbRootKey,
   initDbRootKey,

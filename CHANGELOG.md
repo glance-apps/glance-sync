@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-07-31
+
+### Added
+
+- **Per-account vault auth, client half (GLANCEvault Phase 1.4b).** A
+  GLANCEvault server can now run `authMode: 'per-account'`, where each device
+  authenticates with its own credential instead of the instance-wide shared
+  device token. Two new exports cover the flow that happens before a
+  credential exists; scoped calls are unchanged because the credential IS the
+  Bearer token — switching modes changes only what string the client sends as
+  `vaultToken`.
+  - `fetchVaultHealth({ vaultUrl, fetchImpl? })` — unauthenticated
+    `GET /healthz`. Returns `{ status, version, schemaVersion, authMode }`
+    with `authMode` normalized to `'shared'` when the server predates the
+    field (all such servers are shared-token), so a client can branch on
+    `health.authMode === 'per-account'` against any server version and pick
+    the right setup flow before the user pastes anything.
+  - `enrollVaultDevice({ vaultUrl, enrollmentSecret, accountId, deviceId,
+    fetchImpl? })` — `POST /enroll`, exchanging the admin-configured
+    bootstrap secret for the device's own credential. The secret rides in
+    the request body only (never the query string) with no Authorization
+    header. The returned `credential` appears once and is never retrievable
+    again; callers persist it, pass it as `vaultToken`, and discard the
+    bootstrap secret. Typed failures: `ENROLLMENT_REJECTED` (401, secret not
+    accepted), `ENROLLMENT_UNSUPPORTED` (404, shared-mode server — the
+    route is registration-gated off), `VAULT_ERROR` + `status` otherwise,
+    and `ENROLLMENT_SECRET_REQUIRED` / `ACCOUNT_ID_REQUIRED` /
+    `DEVICE_ID_REQUIRED` thrown before touching the wire on missing fields
+    (values are sent byte-exact; validation never trims what goes on the
+    wire, matching the server's semantics).
+  - `createVaultClient` is mode-agnostic and unchanged on the wire; its
+    `vaultToken` doc now states it accepts either the shared device token or
+    an enrolled per-device credential.
+
 ## [1.6.1] - 2026-07-19
 
 ### Fixed
