@@ -560,8 +560,10 @@ export interface DbSyncEngine {
 
   /** True while the persisted credential-rejected stop is set (CREDENTIAL_INVALID). */
   isCredentialHalted(): boolean;
-  /** The persisted stop record, or null. Read-only this phase; recovery is Phase 2.2. */
+  /** The persisted stop record, or null. Cleared only by recoverVaultSyncEngine after a verified successful re-enrollment. */
   getCredentialHalt(): { message: string; at: string } | null;
+  /** True once this instance proved its bearer was superseded by recovery and went inert (in-memory only). */
+  isSuperseded(): boolean;
   /** The resolved stable device identity this engine runs as. */
   deviceId: string;
 
@@ -600,5 +602,30 @@ export function connectVaultSyncEngine(
   authMode: VaultAuthMode | null;
   /** True only when this call minted a credential. */
   enrolled: boolean;
+  deviceId: string;
+}>;
+
+/**
+ * The exit from the credential halt (Phase 2.2): USER-INITIATED re-enrollment
+ * with the bootstrap secret. Refuses unless the device is halted (NOT_HALTED)
+ * and unless the server runs per-account auth (RECOVERY_UNSUPPORTED /
+ * VAULT_UNREACHABLE — recovery never falls back on discovery failure). The
+ * stale record's deviceId is used for enrollment so the server (2.1) revokes
+ * every still-active predecessor; an explicit config.deviceId differing from
+ * it is DEVICE_ID_CONFLICT. Order: canary -> enroll -> persist + verify
+ * (overwriting the stale record) -> clear the halt LAST -> fresh engine.
+ * Every failure leaves the device halted with its state intact. The secret is
+ * confined to the call, exactly as in connectVaultSyncEngine. Call only from
+ * a deliberate user action; no code path in this package invokes it.
+ */
+export function recoverVaultSyncEngine(
+  config: Omit<DbSyncEngineConfig, 'vaultToken'> & {
+    vaultToken?: string;
+    enrollmentSecret: string;
+  }
+): Promise<{
+  engine: DbSyncEngine;
+  authMode: 'per-account';
+  enrolled: true;
   deviceId: string;
 }>;

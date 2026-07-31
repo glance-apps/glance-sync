@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-07-31
+
+### Added
+
+- **Recovery from a halted credential (GLANCEvault Phase 2.2).** The 1.7.0
+  credential halt was built with no exit; this release adds the one exit:
+  **`recoverVaultSyncEngine(config)`**, user-initiated re-enrollment with the
+  bootstrap secret. Since server Phase 2.1, enrolling the same byte-exact
+  `(accountId, deviceId)` revokes every still-active predecessor credential
+  in the same transaction, so recovery is a rotation — the dead credential is
+  superseded, not accumulated alongside.
+  - **Halt-gated, structurally.** The call refuses with `NOT_HALTED` unless
+    the device is credential-halted, so it cannot be wired into a startup or
+    retry path as an on-demand rotator. Combined with the package holding no
+    secret (one must be supplied fresh, and it is confined to the call
+    exactly as in `connectVaultSyncEngine` — never stored, logged, or
+    retained), user initiation is structural, not procedural. **No code path
+    recovers automatically**, including transport failures, startup, or a
+    halt discovered at launch.
+  - **Per-account only, no fallback.** Unlike connect, recovery never falls
+    back on discovery failure: an unreachable `/healthz` is
+    `VAULT_UNREACHABLE` and a non-per-account mode is
+    `RECOVERY_UNSUPPORTED`; both leave the device halted and untouched.
+    Shared mode has no credentials, no halt, and no reachable recovery path.
+  - **Order of operations**, each failure leaving the device halted rather
+    than ambiguous: halt gate → deviceId resolution → mode guard → storage
+    canary (now restores the slot's prior contents, so a failed recovery
+    keeps the stale record byte-identical) → enroll → persist + read-back
+    verify (overwriting the stale record — it does not survive recovery) →
+    **clear the halt last** → return a fresh engine. The old engine's client
+    closes over the dead credential; apps must swap to the returned engine.
+  - **deviceId: the stale record's value wins.** Rotation only lands if
+    enrollment uses the identity the dead credential is bound to, and the
+    stored record is ground truth for that. An explicit `config.deviceId`
+    that differs is surfaced as `DEVICE_ID_CONFLICT`, never resolved
+    silently (either choice orphans a credential or a cursor). With no
+    readable record: explicit value, else the persisted package-owned id.
+    Never minted fresh.
+- **Halt-set identity rule** (the stale-engine hazard fix). The halt key is
+  shared by every engine instance on a device, so an old instance still
+  holding the superseded credential could previously re-halt the device
+  after recovery. Now, on `CREDENTIAL_INVALID`, the engine halts **unless**
+  the stored credential record exists, is readable, and holds a *different*
+  credential than the engine's bearer — definitive proof the instance was
+  superseded. **The rule fails toward halting**: a missing or unreadable
+  record still halts (the naive "no record → no halt" would retry a dead
+  credential forever, exactly what the halt exists to prevent). A superseded
+  instance goes **inert in memory** instead — surfaced once via
+  `onError('CREDENTIAL_INVALID', isHardStop true)`, then silent, zero
+  network, never touching the shared halt key — killing both the bricking
+  and the pointless server load. New state query: `isSuperseded()`.
+- The 1.4b minted-but-lost-persistence residual is now self-healing: a
+  credential minted and then lost to a persistence failure is superseded by
+  the next successful enrollment for the same `(accountId, deviceId)`.
+
 ## [1.7.0] - 2026-07-31
 
 ### Added

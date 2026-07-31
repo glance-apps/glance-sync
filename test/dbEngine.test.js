@@ -1080,3 +1080,103 @@ describe('device cursor without an explicit deviceId', () => {
     expect(again.deviceId).toBe(sent);
   });
 });
+
+// ---------- halt-set identity rule (Phase 2.2) ----------
+//
+// The halt key is shared by every engine instance on the device. The rule
+// FAILS TOWARD HALTING: halt when the stored credential record is missing or
+// unreadable, or when it matches this engine's bearer. Skip the halt ONLY
+// when a readable record holds a DIFFERENT credential — definitive proof
+// this instance was superseded by recovery — in which case the instance goes
+// inert in memory without touching the shared halt key.
+
+describe('halt-set identity rule', () => {
+  const DEAD = 'gvc_' + 'de'.repeat(32);
+  const NEW_CRED = 'gvc_' + 'ff'.repeat(32);
+
+  const makeEngine22 = (prefix, requests, errors, bearer = DEAD) => createDbSyncEngine({
+    storageKeyPrefix: prefix,
+    appId: 'test-app',
+    accountId: 'acct-1',
+    deviceId: 'device-1',
+    cryptoDBName: CRYPTO_CFG.cryptoDBName,
+    vaultUrl: 'https://vault.example',
+    vaultToken: bearer,
+    fetchImpl: async (url, init) => {
+      requests.push({ url, init });
+      return { ok: false, status: 401, json: async () => ({ error: 'invalid credential' }) };
+    },
+    getLocalEntity: () => null,
+    applyRemoteEntity: () => {},
+    applyRemoteDelete: () => {},
+    onError: (msg, code, isHardStop) => errors.push({ msg, code, isHardStop }),
+  });
+
+  const seedRecord = (prefix, credential) => localStorage.setItem(`${prefix}-vault-credential`, JSON.stringify({
+    credentialId: 'c1', credential, accountId: 'acct-1', deviceId: 'device-1',
+    vaultUrl: 'https://vault.example', createdAt: 'x',
+  }));
+
+  it('record MATCHES the bearer -> halt is set (the device really holds a dead credential)', async () => {
+    seedRecord('idr-match', DEAD);
+    const engine = makeEngine22('idr-match', [], []);
+    await engine.sync();
+    expect(engine.isCredentialHalted()).toBe(true);
+    expect(engine.isSuperseded()).toBe(false);
+  });
+
+  it('record MISSING -> halt is set (fail toward halting, never retry forever)', async () => {
+    const engine = makeEngine22('idr-missing', [], []);
+    await engine.sync();
+    expect(engine.isCredentialHalted()).toBe(true);
+  });
+
+  it('record UNREADABLE -> halt is set (fail toward halting)', async () => {
+    localStorage.setItem('idr-garbage-vault-credential', 'not json {');
+    const engine = makeEngine22('idr-garbage', [], []);
+    await engine.sync();
+    expect(engine.isCredentialHalted()).toBe(true);
+  });
+
+  it('record DIFFERS -> no halt: the superseded instance goes inert in memory, surfaced once', async () => {
+    seedRecord('idr-super', NEW_CRED); // recovery already replaced the record
+    const requests = [];
+    const errors = [];
+    const stale = makeEngine22('idr-super', requests, errors, DEAD);
+
+    await stale.sync();
+    // Surfaced once as a hard stop, but the SHARED halt key is untouched.
+    expect(errors.filter(e => e.code === 'CREDENTIAL_INVALID')).toHaveLength(1);
+    expect(errors.pop()).toMatchObject({ code: 'CREDENTIAL_INVALID', isHardStop: true });
+    expect(stale.isSuperseded()).toBe(true);
+    expect(stale.isCredentialHalted()).toBe(false);
+    expect(localStorage.getItem('idr-super-db-sync-credential-halt')).toBeNull();
+
+    // Inert: further cycles produce zero requests and zero further onError.
+    const afterFirst = requests.length;
+    const errCount = errors.length;
+    await stale.sync();
+    await stale.sync();
+    expect(requests.length).toBe(afterFirst);
+    expect(errors.length).toBe(errCount);
+
+    // A fresh engine on the same prefix (the recovered one) is unaffected:
+    // not halted, not inert, requests flow.
+    const okVault = makeStatefulVault();
+    const recovered = createDbSyncEngine({
+      storageKeyPrefix: 'idr-super',
+      appId: 'test-app',
+      accountId: 'acct-1',
+      deviceId: 'device-1',
+      cryptoDBName: CRYPTO_CFG.cryptoDBName,
+      vaultClient: okVault,
+      getLocalEntity: () => null,
+      applyRemoteEntity: () => {},
+      applyRemoteDelete: () => {},
+    });
+    expect(recovered.isCredentialHalted()).toBe(false);
+    expect(recovered.isSuperseded()).toBe(false);
+    await recovered.sync();
+    expect(okVault.calls.list.length).toBeGreaterThan(0);
+  });
+});

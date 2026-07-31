@@ -10,17 +10,17 @@ import { describe, it, expect, beforeEach } from 'vitest';
 // Minimal in-memory localStorage shim (same pattern as dbEngine.test.js), with
 // a write recorder so tests can assert what never touches storage.
 const __store = new Map();
-const __writes = [];
+const __writes = []; // setItem entries plus removeItem markers, in order — lets tests prove operation ordering
 globalThis.localStorage = {
   getItem:    (k) => (__store.has(k) ? __store.get(k) : null),
   setItem:    (k, v) => { __writes.push({ key: k, value: String(v) }); __store.set(k, String(v)); },
-  removeItem: (k) => { __store.delete(k); },
+  removeItem: (k) => { __writes.push({ key: k, value: '', removed: true }); __store.delete(k); },
   clear:      () => { __store.clear(); },
   key:        (i) => Array.from(__store.keys())[i] ?? null,
   get length() { return __store.size; },
 };
 
-const { connectVaultSyncEngine } = await import('../src/vaultConnect.js');
+const { connectVaultSyncEngine, recoverVaultSyncEngine } = await import('../src/vaultConnect.js');
 const { getOrCreateDeviceId } = await import('../src/dbEngine.js');
 
 const SECRET = 'the-bootstrap-secret';
@@ -301,5 +301,215 @@ describe('deviceId ownership', () => {
     expect(deviceId).toBe('my-own-id');
     const enroll = server.requests.find(r => r.url.endsWith('/enroll'));
     expect(JSON.parse(enroll.init.body).deviceId).toBe('my-own-id');
+  });
+});
+
+// ═══════════════════════════ Phase 2.2: recovery ═══════════════════════════
+
+const HALT_KEY = 'connect-test-db-sync-credential-halt';
+const CRED_KEY = 'connect-test-vault-credential';
+
+const seedHalt = () =>
+  localStorage.setItem(HALT_KEY, JSON.stringify({ message: 'get salt failed: 401', at: '2026-07-31T00:00:00Z' }));
+
+const seedStaleRecord = (overrides = {}) => {
+  const rec = {
+    credentialId: 'stale-cred-id',
+    credential: 'gvc_' + 'aa'.repeat(32),
+    accountId: 'acct-1',
+    deviceId: 'dev-real',
+    vaultUrl: 'https://vault.example',
+    createdAt: '2026-07-01T00:00:00Z',
+    ...overrides,
+  };
+  localStorage.setItem(CRED_KEY, JSON.stringify(rec));
+  return rec;
+};
+
+describe('recovery: the halt gate is structural', () => {
+  it('refuses when the device is not halted (NOT_HALTED), touching nothing', async () => {
+    const server = makeServer();
+    seedStaleRecord();
+    await expect(recoverVaultSyncEngine(baseConfig(server, { enrollmentSecret: SECRET })))
+      .rejects.toMatchObject({ code: 'NOT_HALTED' });
+    expect(server.requests).toHaveLength(0);
+    expect(server.enrollCalls()).toBe(0);
+  });
+
+  it('refuses without a freshly supplied secret (the package holds none)', async () => {
+    const server = makeServer();
+    seedHalt();
+    seedStaleRecord();
+    await expect(recoverVaultSyncEngine(baseConfig(server)))
+      .rejects.toMatchObject({ code: 'ENROLLMENT_SECRET_REQUIRED' });
+    expect(server.requests).toHaveLength(0);
+    expect(localStorage.getItem(HALT_KEY)).not.toBeNull();
+  });
+});
+
+describe('recovery: mode guard (shared mode is structurally unreachable)', () => {
+  it('a shared-mode server -> RECOVERY_UNSUPPORTED; halt and stale record untouched, nothing enrolled', async () => {
+    const server = makeServer({ authMode: 'shared' });
+    seedHalt();
+    const stale = seedStaleRecord();
+    await expect(recoverVaultSyncEngine(baseConfig(server, { enrollmentSecret: SECRET })))
+      .rejects.toMatchObject({ code: 'RECOVERY_UNSUPPORTED' });
+    expect(server.enrollCalls()).toBe(0);
+    expect(localStorage.getItem(HALT_KEY)).not.toBeNull();
+    expect(JSON.parse(localStorage.getItem(CRED_KEY))).toEqual(stale);
+  });
+
+  it('unreachable /healthz -> VAULT_UNREACHABLE (recovery NEVER falls back); device stays halted', async () => {
+    const server = makeServer({ healthzStatus: 503 });
+    seedHalt();
+    seedStaleRecord();
+    await expect(recoverVaultSyncEngine(baseConfig(server, { enrollmentSecret: SECRET })))
+      .rejects.toMatchObject({ code: 'VAULT_UNREACHABLE' });
+    expect(server.enrollCalls()).toBe(0);
+    expect(localStorage.getItem(HALT_KEY)).not.toBeNull();
+  });
+});
+
+describe('recovery: the successful path', () => {
+  it('enrolls under the stale record\'s deviceId, replaces the record, clears the halt LAST, returns a fresh engine', async () => {
+    const server = makeServer();
+    seedHalt();
+    const stale = seedStaleRecord();
+    __writes.length = 0;
+
+    const { engine, authMode, enrolled, deviceId } = await recoverVaultSyncEngine(
+      baseConfig(server, { enrollmentSecret: SECRET }));
+
+    expect(authMode).toBe('per-account');
+    expect(enrolled).toBe(true);
+    // Rotation identity: the record's deviceId, not the generated one.
+    expect(deviceId).toBe('dev-real');
+    const enroll = server.requests.find(r => r.url.endsWith('/enroll'));
+    expect(JSON.parse(enroll.init.body).deviceId).toBe('dev-real');
+
+    // The stale credential did not survive: single slot, replaced.
+    const newRec = JSON.parse(localStorage.getItem(CRED_KEY));
+    expect(newRec.credential).toBe(CREDENTIAL);
+    expect(newRec.credential).not.toBe(stale.credential);
+
+    // Halt cleared, and cleared LAST: after the new record's persist write.
+    expect(localStorage.getItem(HALT_KEY)).toBeNull();
+    const persistIdx = __writes.findIndex(w => !w.removed && w.key === CRED_KEY && w.value.includes(CREDENTIAL));
+    const haltClearIdx = __writes.findIndex(w => w.removed && w.key === HALT_KEY);
+    expect(persistIdx).toBeGreaterThanOrEqual(0);
+    expect(haltClearIdx).toBeGreaterThan(persistIdx);
+
+    // The fresh engine speaks the NEW credential.
+    await engine.vault.list('test-app', { accountId: 'acct-1', since: 0 });
+    const listed = server.requests.filter(r => r.url.includes('/list')).pop();
+    expect(listed.init.headers.Authorization).toBe(`Bearer ${CREDENTIAL}`);
+  });
+
+  it('the bootstrap secret never touches storage during recovery and never rides a URL', async () => {
+    const server = makeServer();
+    seedHalt();
+    seedStaleRecord();
+    __writes.length = 0;
+
+    await recoverVaultSyncEngine(baseConfig(server, { enrollmentSecret: SECRET }));
+
+    for (const w of __writes) {
+      expect(w.key).not.toContain(SECRET);
+      expect(w.value).not.toContain(SECRET);
+    }
+    for (const r of server.requests) {
+      expect(r.url).not.toContain(SECRET);
+    }
+    const enroll = server.requests.find(r => r.url.endsWith('/enroll'));
+    expect(JSON.parse(enroll.init.body).enrollmentSecret).toBe(SECRET);
+  });
+});
+
+describe('recovery: failure at each step leaves the device halted, never ambiguous', () => {
+  it('wrong secret -> ENROLLMENT_REJECTED; halt intact, stale record byte-identical', async () => {
+    const server = makeServer({ enrollStatus: 401 });
+    seedHalt();
+    const stale = seedStaleRecord();
+    const rawBefore = localStorage.getItem(CRED_KEY);
+
+    await expect(recoverVaultSyncEngine(baseConfig(server, { enrollmentSecret: 'wrong' })))
+      .rejects.toMatchObject({ code: 'ENROLLMENT_REJECTED' });
+    expect(localStorage.getItem(HALT_KEY)).not.toBeNull();
+    expect(localStorage.getItem(CRED_KEY)).toBe(rawBefore);
+    expect(JSON.parse(localStorage.getItem(CRED_KEY))).toEqual(stale);
+  });
+
+  it('broken storage fails BEFORE enrolling (canary): no row minted, halt intact', async () => {
+    const server = makeServer();
+    seedHalt();
+    seedStaleRecord();
+    const realSetItem = localStorage.setItem;
+    localStorage.setItem = (k, v) => {
+      if (k === CRED_KEY) throw new Error('quota');
+      realSetItem(k, v);
+    };
+    try {
+      await expect(recoverVaultSyncEngine(baseConfig(server, { enrollmentSecret: SECRET })))
+        .rejects.toMatchObject({ code: 'CREDENTIAL_PERSIST_FAILED' });
+      expect(server.enrollCalls()).toBe(0);
+      expect(localStorage.getItem(HALT_KEY)).not.toBeNull();
+    } finally {
+      localStorage.setItem = realSetItem;
+    }
+  });
+
+  it('persist failure AFTER minting -> CREDENTIAL_PERSIST_FAILED; halt not cleared', async () => {
+    const server = makeServer();
+    seedHalt();
+    seedStaleRecord();
+    const realSetItem = localStorage.setItem;
+    // Canary and restore succeed; only the write carrying the NEW credential fails.
+    localStorage.setItem = (k, v) => {
+      if (k === CRED_KEY && String(v).includes(CREDENTIAL)) throw new Error('quota');
+      realSetItem(k, v);
+    };
+    try {
+      await expect(recoverVaultSyncEngine(baseConfig(server, { enrollmentSecret: SECRET })))
+        .rejects.toMatchObject({ code: 'CREDENTIAL_PERSIST_FAILED' });
+      expect(localStorage.getItem(HALT_KEY)).not.toBeNull();
+    } finally {
+      localStorage.setItem = realSetItem;
+    }
+  });
+});
+
+describe('recovery: deviceId resolution', () => {
+  it('explicit config.deviceId differing from the stale record -> DEVICE_ID_CONFLICT, nothing touched', async () => {
+    const server = makeServer();
+    seedHalt();
+    seedStaleRecord({ deviceId: 'dev-real' });
+    await expect(recoverVaultSyncEngine(
+      baseConfig(server, { enrollmentSecret: SECRET, deviceId: 'dev-other' })))
+      .rejects.toMatchObject({ code: 'DEVICE_ID_CONFLICT' });
+    expect(server.requests).toHaveLength(0);
+    expect(localStorage.getItem(HALT_KEY)).not.toBeNull();
+  });
+
+  it('explicit config.deviceId matching the record is fine', async () => {
+    const server = makeServer();
+    seedHalt();
+    seedStaleRecord({ deviceId: 'dev-real' });
+    const { deviceId } = await recoverVaultSyncEngine(
+      baseConfig(server, { enrollmentSecret: SECRET, deviceId: 'dev-real' }));
+    expect(deviceId).toBe('dev-real');
+  });
+
+  it('no readable record: explicit config.deviceId, else the persisted package-owned id', async () => {
+    const server = makeServer();
+    seedHalt();
+    localStorage.setItem(CRED_KEY, 'not json {');
+    const { deviceId } = await recoverVaultSyncEngine(
+      baseConfig(server, { enrollmentSecret: SECRET, deviceId: 'dev-explicit' }));
+    expect(deviceId).toBe('dev-explicit');
+
+    seedHalt(); // recover again, this time with no explicit id
+    localStorage.removeItem(CRED_KEY);
+    const second = await recoverVaultSyncEngine(baseConfig(server, { enrollmentSecret: SECRET }));
+    expect(second.deviceId).toBe(localStorage.getItem('connect-test-device-id'));
   });
 });
