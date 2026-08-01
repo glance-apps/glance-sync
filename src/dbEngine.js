@@ -36,6 +36,18 @@ const ts = (v) => {
   return Number.isNaN(t) ? 0 : t;
 };
 
+// Quota suppression window (Phase 3.3). A quota rejection is the OPPOSITE of a
+// credential rejection: it clears when the operator raises the limit or
+// reclaim runs — with no client action at all — so the client must neither
+// halt (it would stay stopped after the condition resolved) nor retry every
+// cycle (pointless load on a write that cannot succeed until someone acts).
+// The middle is a bounded, self-resuming window: skip the write for a while,
+// then probe again on the ordinary cycle. Escalates on repeated rejection and
+// caps, mirroring the file tier's backoff shape (30s doubling, 15 min cap) so
+// this codebase has one retry idiom rather than two.
+const QUOTA_SUPPRESSION_BASE_MS = 30_000;
+const QUOTA_SUPPRESSION_MAX_MS = 15 * 60 * 1000;
+
 // randomUUID is missing in some non-secure-context WebViews; getRandomValues
 // is everywhere the rest of this package's crypto already runs.
 const randomUUID = () => {
@@ -197,6 +209,14 @@ export const createDbSyncEngine = (config) => {
   // stale reference the app forgot after recovery dies quietly instead of
   // hammering the server with a dead credential.
   let supersededInert = false;
+  // Over-quota state (Phase 3.3). IN MEMORY ONLY, deliberately: this is
+  // server-side state that changes without us — the operator raises a limit,
+  // reclaim runs, intents expire — so a persisted copy would outlive the
+  // condition it describes and would need a clearing path that should not
+  // exist. A fresh engine simply re-learns the truth on its first write.
+  let quotaState = null;       // { quota, limit, used, requested, message, since, retryAt }
+  let quotaStrikes = 0;        // consecutive rejections, for the escalating window
+  let quotaSuppressedUntil = 0;
   // Per-session cache: once the derived root key is proven against the account's
   // existing data (Part A), we never re-verify for the life of this engine.
   let verified = false;
@@ -293,6 +313,36 @@ export const createDbSyncEngine = (config) => {
     localStorage.setItem(KEY_CRED_HALT, JSON.stringify({ message, at: new Date().toISOString() }));
   };
 
+  // ── Over-quota state (Phase 3.3) ──────────────────────────────────────────
+  // Recorded on a QUOTA_EXCEEDED rejection, cleared by the first write that
+  // succeeds. Nothing here is persisted and there is no clearing entry point:
+  // recovery is the operator's action, and the client simply discovers it on
+  // the next probe.
+  const recordQuotaRejection = (err) => {
+    quotaStrikes += 1;
+    const windowMs = Math.min(
+      QUOTA_SUPPRESSION_BASE_MS * Math.pow(2, quotaStrikes - 1),
+      QUOTA_SUPPRESSION_MAX_MS
+    );
+    quotaSuppressedUntil = Date.now() + windowMs;
+    const d = err && err.quota ? err.quota : null;
+    quotaState = {
+      quota: d ? d.quota : 'unknown',
+      limit: d ? d.limit : null,
+      used: d ? d.used : null,
+      requested: d ? d.requested : null,
+      message: err?.message || String(err),
+      since: new Date().toISOString(),
+      retryAt: new Date(quotaSuppressedUntil).toISOString(),
+    };
+  };
+  const clearQuotaState = () => {
+    quotaState = null;
+    quotaStrikes = 0;
+    quotaSuppressedUntil = 0;
+  };
+  const isQuotaSuppressed = () => quotaSuppressedUntil > Date.now();
+
   // The halt-set identity rule (Phase 2.2). The halt key is shared by every
   // engine instance on this device, so a STALE instance — one still holding a
   // credential that recovery has since replaced — must not be able to re-set
@@ -355,8 +405,13 @@ export const createDbSyncEngine = (config) => {
   // Likewise a rejected credential (401 "invalid credential") is an auth
   // outcome, not a capability one: pass it through so the cycle's halt
   // handling sees it — and so allowUnverified can never wave a revoked
-  // device through.
-  const isPassThrough = (err) => isClientNotReady(err) || (err && err.code === 'CREDENTIAL_INVALID');
+  // device through. A quota rejection (Phase 3.3) is the same kind of
+  // mistake to make: the verifier's establishing write is a net-new entity,
+  // so an account at the row cap gets a 413 here, and relabelling it
+  // VERIFIER_UNSUPPORTED tells the user to update a server that is working
+  // correctly. Pass it through so the cycle reports the truth.
+  const isPassThrough = (err) =>
+    isClientNotReady(err) || (err && (err.code === 'CREDENTIAL_INVALID' || err.code === 'QUOTA_EXCEEDED'));
 
   const verifierUnsupported = (cause) => {
     if (isPassThrough(cause)) throw cause;
@@ -709,18 +764,78 @@ export const createDbSyncEngine = (config) => {
       // Part A first: prove the key before we push anything. A globally wrong
       // key aborts here with KEY_MISMATCH (push gated, nothing uploaded) rather
       // than quarantining thousands of rows one by one on the pull.
+      //
+      // While a quota rejection is being suppressed AND the key is not yet
+      // verified, skip the cycle entirely: the verifier's establishing write
+      // is itself the rejected write (a net-new entity under a row cap), so
+      // running the cycle would re-attempt exactly the write we are backing
+      // off from. With a verified key only the push is suppressed and the
+      // pull below runs normally.
+      if (isQuotaSuppressed() && !verified) {
+        onError?.(quotaState.message, 'QUOTA_EXCEEDED', false);
+        onStatusChange?.('error');
+        return { applied: 0, skipped: 0, skippedEntityIds: [], pushSkipped: true, quota: quotaState };
+      }
       await ensureRootKey();
 
-      await pushDirtyRows();
+      // PARTIAL FUNCTION (Phase 3.3). A failed push must never cost us the
+      // pull: before this, any push error threw straight to the catch below,
+      // so pullRemoteChanges and updateDeviceCursor never ran and a device
+      // whose writes were blocked also stopped RECEIVING other devices'
+      // changes. That is true for every cause, not just quota — a transport
+      // blip, a 500, a row cap — so the push error is captured here and
+      // reported after the pull has had its turn. The dirty set is untouched
+      // by a failed push (pushDirtyRows only clears it on full ack), so the
+      // rows retry on the next cycle exactly as they always did.
+      let pushError = null;
+      let pushSkipped = false;
+      if (isQuotaSuppressed()) {
+        // Standing over-quota state: skip the write, keep everything else.
+        pushSkipped = true;
+      } else {
+        try {
+          await pushDirtyRows();
+          // A push that got through means whatever quota blocked us is gone
+          // (the operator raised the limit, reclaim ran, TTLs expired). No
+          // client action was needed and none was taken.
+          if (quotaState) clearQuotaState();
+        } catch (err) {
+          pushError = err;
+          if (err && err.code === 'QUOTA_EXCEEDED') recordQuotaRejection(err);
+        }
+      }
+
       onStatusChange?.('downloading');
       const pull = await pullRemoteChanges();
       await updateDeviceCursor();
+
+      if (pull.skipped > 0) onRowsSkipped?.(pull.skipped, pull.skippedEntityIds);
+
+      // lastSynced means "this device is fully in step with the server", so a
+      // cycle whose push did not land does not claim it — the pull still
+      // applied, and the return value below says so.
+      if (pushError || pushSkipped) {
+        const code = pushSkipped
+          ? 'QUOTA_EXCEEDED'
+          : (pushError && pushError.code ? pushError.code : 'NETWORK_ERROR');
+        const message = pushSkipped ? quotaState.message : (pushError?.message || String(pushError));
+        onError?.(message, code, false);
+        onStatusChange?.('error');
+        return {
+          applied: pull.applied,
+          skipped: pull.skipped,
+          skippedEntityIds: pull.skippedEntityIds,
+          pushFailed: !!pushError,
+          pushSkipped,
+          pushErrorCode: code,
+          quota: quotaState,
+        };
+      }
 
       const now = new Date().toISOString();
       localStorage.setItem(KEY_LAST_SYNCED, now);
       onStatusChange?.('success');
 
-      if (pull.skipped > 0) onRowsSkipped?.(pull.skipped, pull.skippedEntityIds);
       return { applied: pull.applied, skipped: pull.skipped, skippedEntityIds: pull.skippedEntityIds };
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -745,6 +860,14 @@ export const createDbSyncEngine = (config) => {
           setCredentialHalt(err?.message || String(err));
           onError?.(err?.message || String(err), 'CREDENTIAL_INVALID', true);
         }
+      } else if (code === 'QUOTA_EXCEEDED') {
+        // Reached when the rejected write was the key verifier's establishing
+        // row (the pass-through in verifyAccountKey keeps it from being
+        // relabelled VERIFIER_UNSUPPORTED). NEVER a halt: a quota condition
+        // clears when the operator acts, with no client action, so the engine
+        // stays live and simply probes again after the suppression window.
+        recordQuotaRejection(err);
+        onError?.(err?.message || String(err), 'QUOTA_EXCEEDED', false);
       } else {
         onError?.(err?.message || String(err), code, false);
       }
@@ -797,6 +920,12 @@ export const createDbSyncEngine = (config) => {
     // True once this instance proved its bearer was superseded by recovery
     // and went inert (in-memory only; a fresh instance is unaffected).
     isSuperseded: () => supersededInert,
+    // Over-quota state (Phase 3.3): null when clear, else the parsed
+    // descriptor plus when the next probe is due. In-memory only, never a
+    // hard stop, and there is nothing to clear — it lifts by itself once the
+    // server accepts a write again.
+    getQuotaState: () => quotaState,
+    isQuotaSuppressed,
     deviceId: resolvedDeviceId,
 
     // Sub-modules
