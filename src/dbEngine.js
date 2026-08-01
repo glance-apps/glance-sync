@@ -36,17 +36,34 @@ const ts = (v) => {
   return Number.isNaN(t) ? 0 : t;
 };
 
-// Quota suppression window (Phase 3.3). A quota rejection is the OPPOSITE of a
-// credential rejection: it clears when the operator raises the limit or
-// reclaim runs — with no client action at all — so the client must neither
-// halt (it would stay stopped after the condition resolved) nor retry every
-// cycle (pointless load on a write that cannot succeed until someone acts).
-// The middle is a bounded, self-resuming window: skip the write for a while,
-// then probe again on the ordinary cycle. Escalates on repeated rejection and
-// caps, mirroring the file tier's backoff shape (30s doubling, 15 min cap) so
-// this codebase has one retry idiom rather than two.
-const QUOTA_SUPPRESSION_BASE_MS = 30_000;
-const QUOTA_SUPPRESSION_MAX_MS = 15 * 60 * 1000;
+// ── The backoff ladder ──────────────────────────────────────────────────────
+//
+// ONE windowing mechanism for every recoverable failure, carrying a `reason`.
+// It replaces the separate quota-suppression window added in 3.3, which was
+// already built to this shape — this consolidates two parallel things rather
+// than forcing two different ones together.
+//
+// The numbers, the escalation curve, the reset rule and the in-memory
+// lifetime are the FILE TIER'S (src/engine.js): 30s doubling to a 15-minute
+// cap for writes and a 5-minute cap for reads, a flat hour on an auth
+// failure, and any success resets both the counter and the window. That file
+// was read and deliberately not refactored.
+//
+// The ONE thing that differs, and the reason this fix exists: the file tier's
+// backoff is ADVISORY — nothing reads uploadBackoffUntil except its getter,
+// so honouring it is the calling app's job. That is why "the DB engine
+// hammers" is live in every published version. Here the engine ENFORCES its
+// own window (it skips the work when called too soon, exactly as 3.3's quota
+// suppression did) AND exposes the same getters, so a scheduler can still be
+// smart without being obliged to be.
+//
+// A window never becomes terminal: it only ever delays. Whatever the
+// interval, the next ordinary cycle after it expires probes again, with no
+// user action and no restart.
+const BACKOFF_BASE_S = 30;
+const MAX_PUSH_BACKOFF_S = 15 * 60; // writes, matching the file tier's upload cap
+const MAX_PULL_BACKOFF_S = 5 * 60;  // reads, matching the file tier's download cap
+const AUTH_BACKOFF_MS = 60 * 60 * 1000; // flat hour, matching AUTH_FAILURE_BACKOFF_MS
 
 // randomUUID is missing in some non-secure-context WebViews; getRandomValues
 // is everywhere the rest of this package's crypto already runs.
@@ -209,14 +226,22 @@ export const createDbSyncEngine = (config) => {
   // stale reference the app forgot after recovery dies quietly instead of
   // hammering the server with a dead credential.
   let supersededInert = false;
-  // Over-quota state (Phase 3.3). IN MEMORY ONLY, deliberately: this is
-  // server-side state that changes without us — the operator raises a limit,
-  // reclaim runs, intents expire — so a persisted copy would outlive the
-  // condition it describes and would need a clearing path that should not
-  // exist. A fresh engine simply re-learns the truth on its first write.
-  let quotaState = null;       // { quota, limit, used, requested, message, since, retryAt }
-  let quotaStrikes = 0;        // consecutive rejections, for the escalating window
-  let quotaSuppressedUntil = 0;
+  // The two backoff windows. IN MEMORY ONLY, like the file tier's: a restart
+  // clears them, which is the right default — a relaunch is a user signalling
+  // "try now", and the failure re-opens the window immediately if it persists.
+  // Nothing here is persisted, so nothing can outlive the condition it
+  // describes or need a clearing path.
+  const newWindow = () => ({
+    until: 0,        // epoch ms; the work is skipped while this is in the future
+    strikes: 0,      // consecutive failures, driving the escalation
+    reason: null,    // 'quota' | 'auth' | 'transport'
+    code: null,      // the typed error code that opened it
+    message: null,
+    quota: null,     // the parsed descriptor, when reason === 'quota'
+    since: null,     // ISO of the most recent failure
+  });
+  const pushBackoff = newWindow();
+  const pullBackoff = newWindow();
   // Per-session cache: once the derived root key is proven against the account's
   // existing data (Part A), we never re-verify for the life of this engine.
   let verified = false;
@@ -313,35 +338,115 @@ export const createDbSyncEngine = (config) => {
     localStorage.setItem(KEY_CRED_HALT, JSON.stringify({ message, at: new Date().toISOString() }));
   };
 
-  // ── Over-quota state (Phase 3.3) ──────────────────────────────────────────
-  // Recorded on a QUOTA_EXCEEDED rejection, cleared by the first write that
-  // succeeds. Nothing here is persisted and there is no clearing entry point:
-  // recovery is the operator's action, and the client simply discovers it on
-  // the next probe.
-  const recordQuotaRejection = (err) => {
-    quotaStrikes += 1;
-    const windowMs = Math.min(
-      QUOTA_SUPPRESSION_BASE_MS * Math.pow(2, quotaStrikes - 1),
-      QUOTA_SUPPRESSION_MAX_MS
-    );
-    quotaSuppressedUntil = Date.now() + windowMs;
-    const d = err && err.quota ? err.quota : null;
-    quotaState = {
+  // ── The backoff ladder: classify, open, clear ─────────────────────────────
+
+  // WHICH FAILURES OPEN A WINDOW. Returns null for the classes that must NOT
+  // be delayed:
+  //  - Readiness (PASSPHRASE_REQUIRED / ACCOUNT_ID_REQUIRED) fires BEFORE any
+  //    network call and clears the instant the app supplies the value. A
+  //    30-second delay after a user types their passphrase would read as
+  //    broken. The file tier has no equivalent class, so copying it faithfully
+  //    would have missed this.
+  //  - CREDENTIAL_INVALID is owned by the credential halt, which is terminal.
+  //    Stacking a window on top would be meaningless at best and could soften
+  //    a terminal state at worst.
+  const backoffReasonFor = (err) => {
+    const code = err && err.code;
+    if (code === 'PASSPHRASE_REQUIRED' || code === 'ACCOUNT_ID_REQUIRED') return null;
+    if (code === 'CREDENTIAL_INVALID') return null;
+    // QUOTA_EXCEEDED keeps its own reason so its descriptor keeps surfacing —
+    // but it is ONE window, not a second one stacked on a transport window.
+    if (code === 'QUOTA_EXCEEDED') return 'quota';
+    // A shared-mode 401 ("invalid device token") is a wrong/rotated token: it
+    // will not fix itself in 30 seconds and hammering an auth endpoint is the
+    // worst kind of noise, so it gets the file tier's flat hour. This is NOT
+    // the credential halt — it stays retryable and self-resuming.
+    //
+    // `cause` is consulted because the key verifier re-wraps whatever it hits
+    // as VERIFIER_UNSUPPORTED (keeping the original on err.cause), which would
+    // otherwise hide a 401 behind a fresh error carrying no status.
+    if (err && (err.status === 401 || (err.cause && err.cause.status === 401))) return 'auth';
+    return 'transport';
+  };
+
+  const openWindow = (w, err, reason, maxSeconds) => {
+    w.strikes += 1;
+    const ms = reason === 'auth'
+      ? AUTH_BACKOFF_MS
+      : Math.min(BACKOFF_BASE_S * Math.pow(2, w.strikes - 1), maxSeconds) * 1000;
+    w.until = Date.now() + ms;
+    w.reason = reason;
+    w.code = (err && err.code) || 'NETWORK_ERROR';
+    w.message = err?.message || String(err);
+    w.quota = reason === 'quota' && err && err.quota ? err.quota : null;
+    w.since = new Date().toISOString();
+  };
+
+  const clearWindow = (w) => {
+    w.until = 0; w.strikes = 0; w.reason = null;
+    w.code = null; w.message = null; w.quota = null; w.since = null;
+  };
+
+  const isOpen = (w) => w.until > Date.now();
+
+  // Record a failure against a window, honouring the do-not-delay classes.
+  // Returns the reason, or null when the failure opened no window.
+  const recordFailure = (w, err, maxSeconds) => {
+    const reason = backoffReasonFor(err);
+    if (reason) openWindow(w, err, reason, maxSeconds);
+    return reason;
+  };
+
+  // Over-quota state, preserved exactly as 3.3 exposed it: non-null from the
+  // rejection until a write actually succeeds (not merely until the window
+  // expires), so an app can keep rendering "X of Y used" while the client
+  // probes. Now derived from the push window rather than a parallel variable.
+  const getQuotaState = () => {
+    if (pushBackoff.reason !== 'quota') return null;
+    const d = pushBackoff.quota;
+    return {
       quota: d ? d.quota : 'unknown',
       limit: d ? d.limit : null,
       used: d ? d.used : null,
       requested: d ? d.requested : null,
-      message: err?.message || String(err),
-      since: new Date().toISOString(),
-      retryAt: new Date(quotaSuppressedUntil).toISOString(),
+      message: pushBackoff.message,
+      since: pushBackoff.since,
+      retryAt: new Date(pushBackoff.until).toISOString(),
     };
   };
-  const clearQuotaState = () => {
-    quotaState = null;
-    quotaStrikes = 0;
-    quotaSuppressedUntil = 0;
+  const isQuotaSuppressed = () => pushBackoff.reason === 'quota' && isOpen(pushBackoff);
+
+  // PER-REASON SURFACING on a cycle whose work was SKIPPED because a window is
+  // open. A quota window keeps surfacing QUOTA_EXCEEDED with its descriptor
+  // every cycle, because apps render "X of Y used" from it and a UI built
+  // after the rejection must still learn about it. A transport or auth window
+  // stays quiet after its first signal — the failure was already reported and
+  // repeating it every cycle is the noise this fix exists to remove. The
+  // status still reads 'error' in both cases: sync genuinely is not working.
+  const surfaceStandingWindow = (w) => {
+    if (w.reason === 'quota') onError?.(w.message, 'QUOTA_EXCEEDED', false);
   };
-  const isQuotaSuppressed = () => quotaSuppressedUntil > Date.now();
+
+  // The credential-rejection path, extracted UNCHANGED from the cycle's catch
+  // so a 401 surfacing from the push or the pull reaches exactly the same
+  // logic it always reached from ensureRootKey. Nothing about the halt, the
+  // identity rule, or the superseded-inertness decision is altered — this is
+  // only about where the error is allowed to arrive from. Under NO
+  // circumstances does the engine re-enroll here; recovery is user-initiated
+  // (recoverVaultSyncEngine).
+  const applyCredentialRejection = (err) => {
+    const message = err?.message || String(err);
+    if (isBearerSuperseded()) {
+      // Replaced by recovery and the app kept a stale reference: go inert in
+      // memory — surfaced once, then silent — leaving the shared halt key
+      // alone so the recovered engine keeps syncing.
+      supersededInert = true;
+    } else {
+      setCredentialHalt(message);
+    }
+    onError?.(message, 'CREDENTIAL_INVALID', true);
+    onStatusChange?.('error');
+  };
 
   // The halt-set identity rule (Phase 2.2). The halt key is shared by every
   // engine instance on this device, so a STALE instance — one still holding a
@@ -707,11 +812,22 @@ export const createDbSyncEngine = (config) => {
         if (typeof R.seq === 'number') since = Math.max(since, R.seq);
       }
 
+      // Persist the cursor PER PAGE, not once at the end. Every row in a page
+      // reaches a terminal outcome before we get here — applied, quarantined,
+      // or skipped as engine-reserved — so the cursor may safely advance past
+      // the whole page. Previously a failure on page 3 discarded the progress
+      // of pages 1 and 2, so a large backlog on a flaky connection could
+      // re-download the same pages forever and never converge; that is exactly
+      // the situation backoff is meant to help, so the two changes belong
+      // together.
+      setHighWaterMark(Math.max(getHighWaterMark(), maxSeq));
+
       hasMore = !!more;
     }
 
     // Pull is the sole writer of the pull cursor. Advance it (monotonically)
-    // from the highest seq we actually listed this run.
+    // from the highest seq we actually listed this run. Retained for the
+    // zero-page case, and harmless after the per-page advance above.
     setHighWaterMark(Math.max(getHighWaterMark(), maxSeq));
     return { maxSeq, appliedRemote, applied, skipped, skippedEntityIds };
   };
@@ -757,69 +873,102 @@ export const createDbSyncEngine = (config) => {
       return { applied: 0, skipped: 0, skippedEntityIds: [], halted: true };
     }
     if (syncing) return;
+
+    // Nothing at all can proceed while the key is unverified AND both windows
+    // are open: proving the key needs the network, and both directions are
+    // backed off. (Once verified in-session, ensureRootKey is a local check,
+    // so a single open window only skips its own half of the cycle.)
+    if (!verified && isOpen(pushBackoff) && isOpen(pullBackoff)) {
+      surfaceStandingWindow(pushBackoff);
+      onStatusChange?.('error');
+      return {
+        applied: 0, skipped: 0, skippedEntityIds: [],
+        pushSkipped: true, pullSkipped: true, quota: getQuotaState(),
+      };
+    }
+
     syncing = true;
     onStatusChange?.('uploading');
     onError?.(null, null, false);
     try {
       // Part A first: prove the key before we push anything. A globally wrong
       // key aborts here with KEY_MISMATCH (push gated, nothing uploaded) rather
-      // than quarantining thousands of rows one by one on the pull.
-      //
-      // While a quota rejection is being suppressed AND the key is not yet
-      // verified, skip the cycle entirely: the verifier's establishing write
-      // is itself the rejected write (a net-new entity under a row cap), so
-      // running the cycle would re-attempt exactly the write we are backing
-      // off from. With a verified key only the push is suppressed and the
-      // pull below runs normally.
-      if (isQuotaSuppressed() && !verified) {
-        onError?.(quotaState.message, 'QUOTA_EXCEEDED', false);
-        onStatusChange?.('error');
-        return { applied: 0, skipped: 0, skippedEntityIds: [], pushSkipped: true, quota: quotaState };
-      }
+      // than quarantining thousands of rows one by one on the pull. A failure
+      // here blocks BOTH directions, so it opens both windows (see the catch).
       await ensureRootKey();
 
-      // PARTIAL FUNCTION (Phase 3.3). A failed push must never cost us the
-      // pull: before this, any push error threw straight to the catch below,
-      // so pullRemoteChanges and updateDeviceCursor never ran and a device
-      // whose writes were blocked also stopped RECEIVING other devices'
-      // changes. That is true for every cause, not just quota — a transport
-      // blip, a 500, a row cap — so the push error is captured here and
-      // reported after the pull has had its turn. The dirty set is untouched
-      // by a failed push (pushDirtyRows only clears it on full ack), so the
-      // rows retry on the next cycle exactly as they always did.
+      // PARTIAL FUNCTION (3.3, extended here to the pull). A failure in one
+      // direction must never cost the other: the push error is captured, the
+      // pull runs, and the pull's own error is captured too so the cursor
+      // report still happens. The dirty set is untouched by a failed push
+      // (pushDirtyRows only clears it on full ack), so backoff changes WHEN
+      // rows are retried, never WHETHER they are.
       let pushError = null;
       let pushSkipped = false;
-      if (isQuotaSuppressed()) {
-        // Standing over-quota state: skip the write, keep everything else.
+      if (isOpen(pushBackoff)) {
         pushSkipped = true;
       } else {
         try {
           await pushDirtyRows();
-          // A push that got through means whatever quota blocked us is gone
-          // (the operator raised the limit, reclaim ran, TTLs expired). No
-          // client action was needed and none was taken.
-          if (quotaState) clearQuotaState();
+          // Any success resets the window and its strike count, exactly as the
+          // file tier does. For a quota window this is also what clears the
+          // over-quota state: the operator acted, and no client action was
+          // needed or taken.
+          clearWindow(pushBackoff);
         } catch (err) {
           pushError = err;
-          if (err && err.code === 'QUOTA_EXCEEDED') recordQuotaRejection(err);
+          recordFailure(pushBackoff, err, MAX_PUSH_BACKOFF_S);
         }
       }
 
       onStatusChange?.('downloading');
-      const pull = await pullRemoteChanges();
-      await updateDeviceCursor();
+      let pullError = null;
+      let pullSkipped = false;
+      let pull = { applied: 0, skipped: 0, skippedEntityIds: [] };
+      if (isOpen(pullBackoff)) {
+        pullSkipped = true;
+      } else {
+        try {
+          pull = await pullRemoteChanges();
+          clearWindow(pullBackoff);
+        } catch (err) {
+          pullError = err;
+          recordFailure(pullBackoff, err, MAX_PULL_BACKOFF_S);
+        }
+        // The cursor report runs whenever the pull was ATTEMPTED, success or
+        // failure — that is the 3.3 decoupling applied to the pull. It is
+        // skipped only when the pull itself was skipped, because firing a
+        // write every cycle at a server we are backing off from is the exact
+        // hammering this fix removes.
+        await updateDeviceCursor();
+      }
+
+      // A rejected credential can surface from the push or the pull once the
+      // key is verified in-session (ensureRootKey then makes no network call,
+      // so it is no longer the first thing to see a 401). Route it to the
+      // halt path from wherever it surfaced — the halt logic itself is
+      // untouched.
+      const credentialRejection =
+        (pushError && pushError.code === 'CREDENTIAL_INVALID' && pushError) ||
+        (pullError && pullError.code === 'CREDENTIAL_INVALID' && pullError) || null;
+      if (credentialRejection) {
+        applyCredentialRejection(credentialRejection);
+        return { applied: pull.applied, skipped: pull.skipped, skippedEntityIds: pull.skippedEntityIds, halted: true };
+      }
 
       if (pull.skipped > 0) onRowsSkipped?.(pull.skipped, pull.skippedEntityIds);
 
       // lastSynced means "this device is fully in step with the server", so a
-      // cycle whose push did not land does not claim it — the pull still
-      // applied, and the return value below says so.
-      if (pushError || pushSkipped) {
-        const code = pushSkipped
-          ? 'QUOTA_EXCEEDED'
-          : (pushError && pushError.code ? pushError.code : 'NETWORK_ERROR');
-        const message = pushSkipped ? quotaState.message : (pushError?.message || String(pushError));
-        onError?.(message, code, false);
+      // cycle with any failed or skipped half does not claim it.
+      if (pushError || pushSkipped || pullError || pullSkipped) {
+        // Report the fresh failure if there was one; otherwise this is a
+        // suppressed cycle, and only a quota window keeps speaking.
+        if (pushError || pullError) {
+          const err = pushError || pullError;
+          onError?.(err?.message || String(err), (err && err.code) || 'NETWORK_ERROR', false);
+        } else {
+          surfaceStandingWindow(pushSkipped ? pushBackoff : pullBackoff);
+        }
         onStatusChange?.('error');
         return {
           applied: pull.applied,
@@ -827,8 +976,11 @@ export const createDbSyncEngine = (config) => {
           skippedEntityIds: pull.skippedEntityIds,
           pushFailed: !!pushError,
           pushSkipped,
-          pushErrorCode: code,
-          quota: quotaState,
+          pushErrorCode: pushError ? ((pushError.code) || 'NETWORK_ERROR') : (pushSkipped ? pushBackoff.code : undefined),
+          pullFailed: !!pullError,
+          pullSkipped,
+          pullErrorCode: pullError ? ((pullError.code) || 'NETWORK_ERROR') : (pullSkipped ? pullBackoff.code : undefined),
+          quota: getQuotaState(),
         };
       }
 
@@ -838,39 +990,18 @@ export const createDbSyncEngine = (config) => {
 
       return { applied: pull.applied, skipped: pull.skipped, skippedEntityIds: pull.skippedEntityIds };
     } catch (err) {
+      // Only ensureRootKey reaches here now (push and pull are captured
+      // above). It gates both directions, so its failure opens both windows.
       // eslint-disable-next-line no-console
       console.error(`[${appId}] db sync cycle error:`, err);
       const code = err && err.code ? err.code : 'NETWORK_ERROR';
       if (code === 'CREDENTIAL_INVALID') {
-        // The server rejected this engine's credential. Under NO circumstances
-        // does the engine re-enroll here: enrollment is non-idempotent, so an
-        // automatic retry would mint a server row per failure and would let a
-        // revoked device silently re-admit itself. Recovery is user-initiated
-        // only (recoverVaultSyncEngine).
-        if (isBearerSuperseded()) {
-          // This instance was replaced by recovery and the app kept a stale
-          // reference. Go inert in memory — surfaced once, then silent — and
-          // leave the shared halt key alone so the recovered engine keeps
-          // syncing.
-          supersededInert = true;
-          onError?.(err?.message || String(err), 'CREDENTIAL_INVALID', true);
-        } else {
-          // Persist the stop so no future cycle retries (a rejected
-          // credential never heals by retry) and surface it as a hard stop.
-          setCredentialHalt(err?.message || String(err));
-          onError?.(err?.message || String(err), 'CREDENTIAL_INVALID', true);
-        }
-      } else if (code === 'QUOTA_EXCEEDED') {
-        // Reached when the rejected write was the key verifier's establishing
-        // row (the pass-through in verifyAccountKey keeps it from being
-        // relabelled VERIFIER_UNSUPPORTED). NEVER a halt: a quota condition
-        // clears when the operator acts, with no client action, so the engine
-        // stays live and simply probes again after the suppression window.
-        recordQuotaRejection(err);
-        onError?.(err?.message || String(err), 'QUOTA_EXCEEDED', false);
-      } else {
-        onError?.(err?.message || String(err), code, false);
+        applyCredentialRejection(err);
+        return { applied: 0, skipped: 0, skippedEntityIds: [], halted: true };
       }
+      const reason = recordFailure(pushBackoff, err, MAX_PUSH_BACKOFF_S);
+      if (reason) recordFailure(pullBackoff, err, MAX_PULL_BACKOFF_S);
+      onError?.(err?.message || String(err), code, false);
       onStatusChange?.('error');
       return { applied: 0, skipped: 0, skippedEntityIds: [] };
     } finally {
@@ -923,9 +1054,24 @@ export const createDbSyncEngine = (config) => {
     // Over-quota state (Phase 3.3): null when clear, else the parsed
     // descriptor plus when the next probe is due. In-memory only, never a
     // hard stop, and there is nothing to clear — it lifts by itself once the
-    // server accepts a write again.
-    getQuotaState: () => quotaState,
+    // server accepts a write again. Now derived from the push backoff window.
+    getQuotaState,
     isQuotaSuppressed,
+
+    // Backoff. The timestamps use the file tier's getter names and meaning
+    // (epoch ms before which that direction will not be attempted), so a
+    // scheduler can treat both tiers identically. Unlike the file tier the
+    // engine ALSO enforces them itself, so honouring them is optional.
+    getUploadBackoffUntil:   () => pushBackoff.until,
+    getDownloadBackoffUntil: () => pullBackoff.until,
+    // The full picture, because the timestamp alone cannot distinguish a
+    // one-hour auth backoff from a thirty-second transport one without
+    // inferring from its magnitude. `reason` is 'quota' | 'auth' |
+    // 'transport'; `code` is the typed error that opened the window.
+    getBackoffState: () => ({
+      push: { until: pushBackoff.until, reason: pushBackoff.reason, code: pushBackoff.code, strikes: pushBackoff.strikes, since: pushBackoff.since },
+      pull: { until: pullBackoff.until, reason: pullBackoff.reason, code: pullBackoff.code, strikes: pullBackoff.strikes, since: pullBackoff.since },
+    }),
     deviceId: resolvedDeviceId,
 
     // Sub-modules

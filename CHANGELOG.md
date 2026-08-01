@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-08-01
+
+**Should you take this release?** Yes, for any deployment using the database
+(GLANCEvault) transport. Until now the DB sync engine had **no backoff of any
+kind**: on a persistent failure it re-sent the same request on every cycle,
+forever, at whatever rate the app polls. A server that was down, a device
+offline, a wrong token — all of them produced an unbounded request loop. This
+release adds the backoff the file tier has always had, and fixes two related
+defects found alongside it. The file-tier (WebDAV) engine is untouched.
+
+### Fixed
+
+- **The DB engine no longer hammers a failing server.** Both directions now
+  back off: 30s doubling to a 15-minute cap for pushes and a 5-minute cap for
+  pulls, with a flat one hour on an authentication failure — the file tier's
+  numbers, escalation curve and reset rule. Any success resets the window and
+  its strike count. A window only ever **delays**: the next ordinary cycle
+  after it expires probes again, with no user action and no restart, and
+  dirty rows are never dropped — backoff changes *when* a push is retried,
+  never *whether* it is.
+  - Unlike the file tier's, the DB engine's backoff is **self-enforcing**: the
+    engine skips its own work when called too soon. (The file tier's is
+    advisory — nothing reads `uploadBackoffUntil` except its getter, so
+    honouring it is the app's job. That is exactly why the hammering was live
+    in every published version.) `getUploadBackoffUntil()` and
+    `getDownloadBackoffUntil()` are exposed with the same names and meaning as
+    the file tier's so one scheduler can treat both tiers alike, but honouring
+    them is now an optimisation rather than a duty.
+- **A failed pull no longer aborts the cycle.** 1.9.0 contained push failures
+  but left pull failures throwing past the device-cursor report. A pull error
+  is now captured the same way, so the cursor still reports on a cycle whose
+  pull failed.
+- **The pull cursor is persisted per page.** It was written only after the
+  whole pagination loop, so a failure on page 3 discarded the progress of
+  pages 1 and 2 — a large backlog on a flaky connection could re-download the
+  same pages indefinitely and never converge. Every row in a page reaches a
+  terminal outcome (applied, quarantined, or skipped as engine-reserved)
+  before the page ends, so the cursor may safely advance past each completed
+  page.
+- **A rejected credential surfacing from the push or pull now halts.** Once
+  the key is verified in-session, `ensureRootKey` makes no network call, so a
+  mid-session revocation is first seen by the push or the pull — and 1.9.0's
+  error capture routed those away from the halt path. They now reach exactly
+  the same halt logic as before; the halt itself, its identity rule, and the
+  `invalid credential` body match are unchanged.
+
+### Changed
+
+- **Over-quota suppression is now one case of the backoff ladder**, not a
+  parallel mechanism. Its behaviour is unchanged — same curve, same
+  in-memory lifetime, still surfacing `QUOTA_EXCEEDED` with its descriptor on
+  every suppressed cycle so apps can render "X of Y used" — but
+  `getQuotaState()` and `isQuotaSuppressed()` are now derived from the push
+  window rather than a separate variable.
+- **A shared-mode 401 is now delayed rather than retried immediately.** It
+  opens the one-hour auth window instead of being re-sent every cycle. It is
+  still not terminal and still not the credential halt: it self-resumes.
+- New: `getBackoffState()` returns `{ push, pull }` windows with `until`,
+  `reason` (`'quota' | 'auth' | 'transport'`), `code`, `strikes` and `since`.
+  The `reason` is what lets an app distinguish a one-hour auth backoff from a
+  thirty-second transport one without inferring it from the timestamp.
+- The cycle result gains `pullFailed`, `pullSkipped` and `pullErrorCode`,
+  mirroring the push fields added in 1.9.0.
+
+### Notes
+
+- **Classes that are never delayed**, deliberately: `PASSPHRASE_REQUIRED` and
+  `ACCOUNT_ID_REQUIRED` fire before any network call and clear the instant the
+  app supplies the value, so a window would make the app feel broken for 30
+  seconds after a user types their passphrase; and `CREDENTIAL_INVALID` is
+  owned by the (terminal) credential halt, so stacking a window on it would be
+  meaningless at best. `QUOTA_EXCEEDED` opens exactly one window, its own.
+- A healthy client is unaffected: no window is ever opened, no added latency,
+  and an identical request pattern.
+
 ## [1.9.0] - 2026-08-01
 
 **Should you take this release?** Yes if you run, or might run, a GLANCEvault
