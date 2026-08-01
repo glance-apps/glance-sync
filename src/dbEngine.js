@@ -423,6 +423,14 @@ export const createDbSyncEngine = (config) => {
   // stays quiet after its first signal — the failure was already reported and
   // repeating it every cycle is the noise this fix exists to remove. The
   // status still reads 'error' in both cases: sync genuinely is not working.
+  //
+  // APP-INTEGRATION CONSEQUENCE (deliberate, do not "fix" by re-surfacing):
+  // because the cycle's onError(null) reset still fires on suppressed cycles,
+  // a quiet window means the app's LAST onError MESSAGE is cleared while
+  // onStatusChange reads 'error'. An app must therefore render standing
+  // backoff from getBackoffState() (reason + until — "retrying in Xs"), not
+  // from a remembered onError string. Surface this when integrating the
+  // three apps.
   const surfaceStandingWindow = (w) => {
     if (w.reason === 'quota') onError?.(w.message, 'QUOTA_EXCEEDED', false);
   };
@@ -434,18 +442,26 @@ export const createDbSyncEngine = (config) => {
   // only about where the error is allowed to arrive from. Under NO
   // circumstances does the engine re-enroll here; recovery is user-initiated
   // (recoverVaultSyncEngine).
+  // Returns the truthful result flag for the cycle to spread — { superseded }
+  // when this instance went inert, { halted } when the device halted — so the
+  // cycle result matches what isSuperseded()/isCredentialHalted() report,
+  // whichever path the rejection arrived by.
   const applyCredentialRejection = (err) => {
     const message = err?.message || String(err);
+    let outcome;
     if (isBearerSuperseded()) {
       // Replaced by recovery and the app kept a stale reference: go inert in
       // memory — surfaced once, then silent — leaving the shared halt key
       // alone so the recovered engine keeps syncing.
       supersededInert = true;
+      outcome = { superseded: true };
     } else {
       setCredentialHalt(message);
+      outcome = { halted: true };
     }
     onError?.(message, 'CREDENTIAL_INVALID', true);
     onStatusChange?.('error');
+    return outcome;
   };
 
   // The halt-set identity rule (Phase 2.2). The halt key is shared by every
@@ -952,8 +968,8 @@ export const createDbSyncEngine = (config) => {
         (pushError && pushError.code === 'CREDENTIAL_INVALID' && pushError) ||
         (pullError && pullError.code === 'CREDENTIAL_INVALID' && pullError) || null;
       if (credentialRejection) {
-        applyCredentialRejection(credentialRejection);
-        return { applied: pull.applied, skipped: pull.skipped, skippedEntityIds: pull.skippedEntityIds, halted: true };
+        const outcome = applyCredentialRejection(credentialRejection);
+        return { applied: pull.applied, skipped: pull.skipped, skippedEntityIds: pull.skippedEntityIds, ...outcome };
       }
 
       if (pull.skipped > 0) onRowsSkipped?.(pull.skipped, pull.skippedEntityIds);
@@ -996,8 +1012,8 @@ export const createDbSyncEngine = (config) => {
       console.error(`[${appId}] db sync cycle error:`, err);
       const code = err && err.code ? err.code : 'NETWORK_ERROR';
       if (code === 'CREDENTIAL_INVALID') {
-        applyCredentialRejection(err);
-        return { applied: 0, skipped: 0, skippedEntityIds: [], halted: true };
+        const outcome = applyCredentialRejection(err);
+        return { applied: 0, skipped: 0, skippedEntityIds: [], ...outcome };
       }
       const reason = recordFailure(pushBackoff, err, MAX_PUSH_BACKOFF_S);
       if (reason) recordFailure(pullBackoff, err, MAX_PULL_BACKOFF_S);
