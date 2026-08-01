@@ -1036,10 +1036,27 @@ describe('credential-rejected halt', () => {
     expect(surfaced.isHardStop).toBe(false);
     expect(engine.isCredentialHalted()).toBe(false);
 
-    // Next cycle retries (requests keep flowing).
+    // The retry is now DELAYED rather than immediate: a shared-mode 401 opens
+    // the auth backoff window (a wrong token does not fix itself in 30s, and
+    // hammering an auth endpoint is the worst kind of noise). The assertion
+    // this test exists for is unchanged — this is a delay, never a stop:
     const before = requests.length;
     await engine.sync();
-    expect(requests.length).toBeGreaterThan(before);
+    expect(requests.length).toBe(before); // backed off, not retried immediately
+    const { push } = engine.getBackoffState();
+    expect(push.reason).toBe('auth');
+    expect(push.until).toBeGreaterThan(Date.now());
+    expect(engine.isCredentialHalted()).toBe(false); // still not terminal
+
+    // ...and it self-resumes once the window elapses, with no user action.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(push.until + 1000));
+    try {
+      await engine.sync();
+      expect(requests.length).toBeGreaterThan(before);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -1406,5 +1423,378 @@ describe('the key verifier reports a quota rejection truthfully', () => {
     expect(surfaced.h).toBe(false);
     expect(engine.isCredentialHalted()).toBe(false);
     expect(engine.getQuotaState()).toMatchObject({ quota: 'rows' });
+  });
+});
+
+// ---------- the backoff ladder ----------
+//
+// One windowing mechanism for every recoverable failure, carrying a reason.
+// The file tier's numbers and reset rule, but ENFORCED by the engine (the
+// file tier's is advisory, which is why the hammering was live).
+
+describe('backoff: escalation, enforcement and reset', () => {
+  const mkErr = (code, status, extra = {}) => {
+    const e = new Error(`failed: ${status || code}`);
+    e.code = code;
+    if (status) e.status = status;
+    return Object.assign(e, extra);
+  };
+
+  // A vault whose batch and/or list fail on demand, counting every call.
+  const makeFlakyVault = ({ pushFails = false, pullFails = false, error = () => mkErr('VAULT_ERROR', 503) } = {}) => {
+    const base = makeStatefulVault();
+    const state = { pushFails, pullFails };
+    return {
+      ...base, calls: base.calls, rows: base.rows, state,
+      async batch(app, args) {
+        base.calls.batch.push(args.rows);
+        if (state.pushFails) throw error();
+        return { written: args.rows.length, maxSeq: 1 };
+      },
+      async list(app, args) {
+        base.calls.list.push(args.since);
+        if (state.pullFails) throw error();
+        return { rows: [], hasMore: false };
+      },
+    };
+  };
+
+  const engineWith = (vault, prefix, errors = []) => {
+    const local = new Map([['mine', { id: 'mine', lastModified: '2026-01-01T00:00:00Z' }]]);
+    const { engine } = makeEngine({
+      vault, local,
+      config: { storageKeyPrefix: prefix, onError: (m, c, h) => errors.push({ m, c, h }) },
+    });
+    return { engine, local };
+  };
+
+  it('a persistent push failure backs off instead of retrying every cycle, and escalates 30s -> 60s -> 120s', async () => {
+    const vault = makeFlakyVault({ pushFails: true });
+    const { engine } = engineWith(vault, 'bo-push');
+    engine.markDirty('mine');
+
+    await engine.sync();
+    expect(vault.calls.batch.length).toBe(1);
+    const first = engine.getBackoffState().push;
+    expect(first.reason).toBe('transport');
+    expect(first.strikes).toBe(1);
+    expect(first.until - Date.now()).toBeGreaterThan(25_000);
+    expect(first.until - Date.now()).toBeLessThanOrEqual(30_000);
+
+    // Inside the window: no further write attempts at all.
+    for (let i = 0; i < 4; i += 1) await engine.sync();
+    expect(vault.calls.batch.length).toBe(1);
+
+    // Each expiry probes once and doubles: 30s -> 60s -> 120s.
+    const seen = [];
+    for (const expected of [60_000, 120_000]) {
+      const { push } = engine.getBackoffState();
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(push.until + 1000));
+      try {
+        await engine.sync();
+        const next = engine.getBackoffState().push;
+        seen.push(next.until - Date.now());
+        expect(next.until - Date.now()).toBeLessThanOrEqual(expected);
+        expect(next.until - Date.now()).toBeGreaterThan(expected / 2);
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+    expect(vault.calls.batch.length).toBe(3); // one probe per expiry, never per cycle
+    expect(engine.getBackoffState().push.strikes).toBe(3);
+  });
+
+  it('the pull and the cursor report keep running while the push is backed off', async () => {
+    const vault = makeFlakyVault({ pushFails: true });
+    const { engine } = engineWith(vault, 'bo-pushonly');
+    engine.markDirty('mine');
+
+    await engine.sync();
+    for (let i = 0; i < 3; i += 1) await engine.sync();
+
+    expect(vault.calls.batch.length).toBe(1);   // suppressed
+    expect(vault.calls.list.length).toBe(4);    // every cycle
+    expect(vault.calls.device.length).toBe(4);  // every cycle
+    expect(engine.getBackoffState().pull.until).toBe(0); // pull window untouched
+  });
+
+  it('a persistent PULL failure backs off too, and the cursor still reports on the failing cycle', async () => {
+    const vault = makeFlakyVault({ pullFails: true });
+    const { engine } = engineWith(vault, 'bo-pull');
+
+    const result = await engine.sync();
+    expect(result.pullFailed).toBe(true);
+    expect(vault.calls.list.length).toBe(1);
+    expect(vault.calls.device.length).toBe(1); // attempted pull -> cursor still ran
+    const { pull } = engine.getBackoffState();
+    expect(pull.reason).toBe('transport');
+    expect(pull.until).toBeGreaterThan(Date.now());
+
+    // Inside the window the pull is skipped — and so is the cursor, because
+    // firing a write at a server we are backing off from is the hammering
+    // this fix removes.
+    for (let i = 0; i < 3; i += 1) await engine.sync();
+    expect(vault.calls.list.length).toBe(1);
+    expect(vault.calls.device.length).toBe(1);
+  });
+
+  it('the pull cap is 5 minutes and the push cap is 15 (the file tier\'s numbers)', async () => {
+    const vault = makeFlakyVault({ pushFails: true, pullFails: true });
+    const { engine } = engineWith(vault, 'bo-caps');
+    engine.markDirty('mine');
+
+    // Drive both windows well past their caps. Stay inside fake time for the
+    // assertions: the `until` values are computed against the fake clock, so
+    // comparing them to a restored real clock would be meaningless.
+    vi.useFakeTimers();
+    try {
+      for (let i = 0; i < 12; i += 1) {
+        const { push, pull } = engine.getBackoffState();
+        vi.setSystemTime(new Date(Math.max(push.until, pull.until) + 1000));
+        await engine.sync();
+      }
+      const { push, pull } = engine.getBackoffState();
+      expect(push.until - Date.now()).toBeLessThanOrEqual(15 * 60 * 1000);
+      expect(push.until - Date.now()).toBeGreaterThan(14 * 60 * 1000);
+      expect(pull.until - Date.now()).toBeLessThanOrEqual(5 * 60 * 1000);
+      expect(pull.until - Date.now()).toBeGreaterThan(4 * 60 * 1000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a shared-mode 401 gets the flat one-hour auth window, distinguishable by reason', async () => {
+    const vault = makeFlakyVault({ pushFails: true, error: () => mkErr('VAULT_ERROR', 401) });
+    const { engine } = engineWith(vault, 'bo-auth');
+    engine.markDirty('mine');
+
+    await engine.sync();
+    const { push } = engine.getBackoffState();
+    expect(push.reason).toBe('auth');
+    expect(push.until - Date.now()).toBeGreaterThan(59 * 60 * 1000);
+    expect(push.until - Date.now()).toBeLessThanOrEqual(60 * 60 * 1000);
+    // A consumer can tell it apart from a transport window WITHOUT inferring
+    // from the magnitude of the timestamp.
+    expect(engine.getUploadBackoffUntil()).toBe(push.until);
+  });
+
+  it('recovery is automatic: a success resets the window and its strike count', async () => {
+    const vault = makeFlakyVault({ pushFails: true });
+    const { engine } = engineWith(vault, 'bo-recover');
+    engine.markDirty('mine');
+
+    await engine.sync();
+    await engine.sync();
+    expect(engine.getBackoffState().push.strikes).toBe(1);
+    expect(engine.getDirtySet()).toContain('mine'); // dirty rows survive
+
+    vault.state.pushFails = false; // the underlying problem goes away
+    const { push } = engine.getBackoffState();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(push.until + 1000));
+    try {
+      const result = await engine.sync();
+      expect(result.pushFailed).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(engine.getBackoffState().push).toMatchObject({ until: 0, strikes: 0, reason: null });
+    expect(engine.getUploadBackoffUntil()).toBe(0);
+    expect(engine.getDirtySet()).toEqual([]); // the row finally landed, nothing lost
+  });
+
+  it('a healthy client opens no window and is untouched by any of this', async () => {
+    const vault = makeFlakyVault();
+    const { engine } = engineWith(vault, 'bo-healthy');
+    engine.markDirty('mine');
+
+    const result = await engine.sync();
+    expect(result.pushFailed).toBeUndefined();
+    expect(result.pullFailed).toBeUndefined();
+    expect(result.pushSkipped).toBeUndefined();
+    expect(result.pullSkipped).toBeUndefined();
+    expect(engine.getUploadBackoffUntil()).toBe(0);
+    expect(engine.getDownloadBackoffUntil()).toBe(0);
+    expect(engine.getBackoffState()).toMatchObject({
+      push: { until: 0, strikes: 0, reason: null },
+      pull: { until: 0, strikes: 0, reason: null },
+    });
+    expect(engine.getLastSynced()).not.toBeNull();
+  });
+});
+
+describe('backoff: the classes that must NOT be delayed', () => {
+  const mkErr = (code, status) => {
+    const e = new Error(`failed: ${code}`);
+    e.code = code;
+    if (status) e.status = status;
+    return e;
+  };
+
+  it.each(['PASSPHRASE_REQUIRED', 'ACCOUNT_ID_REQUIRED'])(
+    '%s retries IMMEDIATELY — no window, so supplying the value works on the very next cycle',
+    async (code) => {
+      const base = makeStatefulVault();
+      let fail = true;
+      const vault = {
+        ...base, calls: base.calls, rows: base.rows,
+        async batch(app, args) {
+          base.calls.batch.push(args.rows);
+          if (fail) throw mkErr(code);
+          return { written: args.rows.length, maxSeq: 1 };
+        },
+      };
+      const local = new Map([['mine', { id: 'mine', lastModified: '2026-01-01T00:00:00Z' }]]);
+      const { engine } = makeEngine({ vault, local, config: { storageKeyPrefix: `imm-${code}` } });
+      engine.markDirty('mine');
+
+      await engine.sync();
+      expect(engine.getBackoffState().push).toMatchObject({ until: 0, strikes: 0, reason: null });
+
+      // The app supplies the missing value; the very next cycle proceeds with
+      // no waiting at all.
+      fail = false;
+      const result = await engine.sync();
+      expect(result.pushFailed).toBeUndefined();
+      expect(vault.calls.batch.length).toBe(2);
+    });
+
+  it('CREDENTIAL_INVALID halts and opens NO window (no double-delay on a terminal state)', async () => {
+    const requests = [];
+    const engine = createDbSyncEngine({
+      storageKeyPrefix: 'no-double-cred',
+      appId: 'test-app', accountId: 'acct-1', deviceId: 'device-1',
+      cryptoDBName: CRYPTO_CFG.cryptoDBName,
+      vaultUrl: 'https://vault.example', vaultToken: 'gvc_dead',
+      fetchImpl: async (url, init) => {
+        requests.push({ url, init });
+        return { ok: false, status: 401, json: async () => ({ error: 'invalid credential' }) };
+      },
+      getLocalEntity: () => null, applyRemoteEntity: () => {}, applyRemoteDelete: () => {},
+    });
+
+    await engine.sync();
+    expect(engine.isCredentialHalted()).toBe(true);
+    expect(engine.getBackoffState()).toMatchObject({
+      push: { until: 0, reason: null },
+      pull: { until: 0, reason: null },
+    });
+  });
+
+  it('QUOTA_EXCEEDED opens ONE window (its own), not a quota window plus a transport window', async () => {
+    const base = makeStatefulVault();
+    const vault = {
+      ...base, calls: base.calls, rows: base.rows,
+      async batch(app, args) {
+        base.calls.batch.push(args.rows);
+        const e = new Error('batch upsert failed: 413 — rows quota exceeded (100 of 100, requested 1)');
+        e.code = 'QUOTA_EXCEEDED';
+        e.status = 413;
+        e.quota = { quota: 'rows', limit: 100, used: 100, requested: 1 };
+        throw e;
+      },
+    };
+    const local = new Map([['mine', { id: 'mine', lastModified: '2026-01-01T00:00:00Z' }]]);
+    const { engine } = makeEngine({ vault, local, config: { storageKeyPrefix: 'no-double-quota' } });
+    engine.markDirty('mine');
+
+    await engine.sync();
+    const { push, pull } = engine.getBackoffState();
+    expect(push.reason).toBe('quota');
+    expect(push.strikes).toBe(1);              // ONE strike, not two
+    expect(pull.until).toBe(0);                // the pull is not delayed by a push-side quota
+    // 3.3's surface is preserved exactly.
+    expect(engine.isQuotaSuppressed()).toBe(true);
+    expect(engine.getQuotaState()).toMatchObject({ quota: 'rows', limit: 100, used: 100, requested: 1 });
+  });
+
+  it('a quota window keeps surfacing its descriptor each cycle; a transport window goes quiet', async () => {
+    const mk = (code, extra) => {
+      const base = makeStatefulVault();
+      const errors = [];
+      const vault = {
+        ...base, calls: base.calls, rows: base.rows,
+        async batch(app, args) {
+          base.calls.batch.push(args.rows);
+          const e = new Error(`failed: ${code}`);
+          e.code = code;
+          Object.assign(e, extra || {});
+          throw e;
+        },
+      };
+      const local = new Map([['mine', { id: 'mine', lastModified: '2026-01-01T00:00:00Z' }]]);
+      const { engine } = makeEngine({
+        vault, local,
+        config: { storageKeyPrefix: `surf-${code}`, onError: (m, c, h) => { if (c) errors.push({ m, c, h }); } },
+      });
+      engine.markDirty('mine');
+      return { engine, errors };
+    };
+
+    const quota = mk('QUOTA_EXCEEDED', { status: 413, quota: { quota: 'rows', limit: 1, used: 1, requested: 1 } });
+    await quota.engine.sync();
+    const afterFirstQuota = quota.errors.length;
+    await quota.engine.sync();
+    await quota.engine.sync();
+    expect(quota.errors.length).toBe(afterFirstQuota + 2); // keeps speaking
+    expect(quota.errors.pop().c).toBe('QUOTA_EXCEEDED');
+
+    const transport = mk('VAULT_ERROR', { status: 503 });
+    await transport.engine.sync();
+    const afterFirstTransport = transport.errors.length;
+    await transport.engine.sync();
+    await transport.engine.sync();
+    expect(transport.errors.length).toBe(afterFirstTransport); // quiet after one signal
+  });
+});
+
+describe('backoff: the pull cursor advances per page', () => {
+  it('a failure on a later page keeps the progress of the pages already applied', async () => {
+    // Three pages; the third throws. Before the per-page advance, the cursor
+    // stayed at 0 and pages 1-2 were re-downloaded forever on a flaky link.
+    const mk = async (entityId, seq) => ({
+      entityId, envelope: await encryptEntity({ id: entityId, lastModified: '2026-01-01T00:00:00Z' }, entityId),
+      createdAt: Date.now(), seq, deleted: false,
+    });
+    const pages = [
+      [await mk('p1a', 1), await mk('p1b', 2)],
+      [await mk('p2a', 3), await mk('p2b', 4)],
+    ];
+    let call = 0;
+    const vault = {
+      calls: { list: [], device: [] },
+      async list(app, { since }) {
+        this.calls.list.push(since);
+        call += 1;
+        if (call === 1) return { rows: pages[0], hasMore: true };
+        if (call === 2) return { rows: pages[1], hasMore: true };
+        throw Object.assign(new Error('failed: 503'), { code: 'VAULT_ERROR', status: 503 });
+      },
+      async device(app, args) { this.calls.device.push(args); return { updated: true }; },
+      async getSalt() { return FIXED_SALT; },
+      async putSalt(_a, s) { return s; },
+      async getRow() { return null; },
+      async batch() { return { written: 1, maxSeq: 1 }; },
+    };
+
+    const { engine, local } = makeEngine({ vault, config: { storageKeyPrefix: 'pagecursor' } });
+    const result = await engine.sync();
+
+    expect(result.pullFailed).toBe(true);
+    // Four rows from two complete pages were applied and their cursor kept.
+    expect(local.size).toBe(4);
+    expect(engine.getHighWaterMark()).toBe(4);
+
+    // The next attempt resumes from 4 rather than re-listing from 0.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(engine.getBackoffState().pull.until + 1000));
+    try {
+      await engine.sync();
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(vault.calls.list[vault.calls.list.length - 1]).toBe(4);
   });
 });

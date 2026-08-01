@@ -529,10 +529,16 @@ export interface DbSyncResult {
   skippedEntityIds: string[];
   /** True when the push threw but the pull still ran (Phase 3.3 partial function). */
   pushFailed?: boolean;
-  /** True when the push was skipped because an over-quota suppression window is open. */
+  /** True when the push was skipped because its backoff window is open. */
   pushSkipped?: boolean;
   /** The push error's code when pushFailed/pushSkipped — the pull's own result is still reported above. */
   pushErrorCode?: SyncErrorCode | string;
+  /** True when the pull threw but the cursor report still ran. */
+  pullFailed?: boolean;
+  /** True when the pull was skipped because its backoff window is open. */
+  pullSkipped?: boolean;
+  /** The pull error's code when pullFailed/pullSkipped. */
+  pullErrorCode?: SyncErrorCode | string;
   /** The standing over-quota descriptor, when one applies. */
   quota?: QuotaState | null;
   /** True when the cycle no-opped because the credential halt is set. */
@@ -554,6 +560,31 @@ export interface DbSyncResult {
  * and counts otherwise, and render "X of Y used" directly; they are null only
  * in the defensive case where a rejection was typed without a full body.
  */
+/**
+ * One backoff window. The DB engine keeps two (push and pull) and enforces
+ * them itself; both are IN MEMORY ONLY, like the file tier's, so a restart
+ * clears them — a relaunch is a user saying "try now", and a persisting
+ * failure re-opens the window immediately.
+ *
+ * A window only ever DELAYS: the next cycle after `until` probes again, with
+ * no user action and no restart. Failures that must not be delayed at all
+ * (PASSPHRASE_REQUIRED / ACCOUNT_ID_REQUIRED, which clear the moment the app
+ * supplies the value) and failures owned by another state (CREDENTIAL_INVALID,
+ * which halts) never open one.
+ */
+export interface BackoffWindow {
+  /** Epoch ms; the direction is skipped while this is in the future. 0 when clear. */
+  until: number;
+  /** Consecutive failures driving the escalation (30s doubling; 15 min push cap, 5 min pull cap). */
+  strikes: number;
+  /** 'quota' (keeps surfacing its descriptor), 'auth' (flat hour on a 401), 'transport' (quiet after one signal). */
+  reason: 'quota' | 'auth' | 'transport' | null;
+  /** The typed error code that opened the window. */
+  code: SyncErrorCode | string | null;
+  /** ISO timestamp of the most recent failure. */
+  since: string | null;
+}
+
 export interface QuotaState {
   quota: string;
   limit: number | null;
@@ -611,8 +642,23 @@ export interface DbSyncEngine {
   isSuperseded(): boolean;
   /** The standing over-quota descriptor, or null. In-memory only; never a hard stop; nothing to clear. */
   getQuotaState(): QuotaState | null;
-  /** True while the bounded over-quota suppression window is open (writes skipped, pulls continue). */
+  /** True while the bounded over-quota window is open (writes skipped, pulls continue). */
   isQuotaSuppressed(): boolean;
+
+  /**
+   * Epoch ms before which the push/pull will not be attempted, or 0. Same
+   * getter names and meaning as the file engine's, so one scheduler can treat
+   * both tiers identically — but unlike the file tier, the DB engine also
+   * ENFORCES these itself, so honouring them is an optimisation, not a duty.
+   */
+  getUploadBackoffUntil(): number;
+  getDownloadBackoffUntil(): number;
+  /**
+   * The full backoff picture. `reason` distinguishes a one-hour auth window
+   * from a thirty-second transport one without inferring from the timestamp's
+   * magnitude, which is what an app needs to tell a user why and for how long.
+   */
+  getBackoffState(): { push: BackoffWindow; pull: BackoffWindow };
   /** The resolved stable device identity this engine runs as. */
   deviceId: string;
 
