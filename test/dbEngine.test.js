@@ -1137,9 +1137,12 @@ describe('halt-set identity rule', () => {
   it('record MATCHES the bearer -> halt is set (the device really holds a dead credential)', async () => {
     seedRecord('idr-match', DEAD);
     const engine = makeEngine22('idr-match', [], []);
-    await engine.sync();
+    const result = await engine.sync();
     expect(engine.isCredentialHalted()).toBe(true);
     expect(engine.isSuperseded()).toBe(false);
+    // The cycle result agrees with the state queries.
+    expect(result.halted).toBe(true);
+    expect(result.superseded).toBeUndefined();
   });
 
   it('record MISSING -> halt is set (fail toward halting, never retry forever)', async () => {
@@ -1161,7 +1164,12 @@ describe('halt-set identity rule', () => {
     const errors = [];
     const stale = makeEngine22('idr-super', requests, errors, DEAD);
 
-    await stale.sync();
+    const result = await stale.sync();
+    // The cycle result reports the truthful outcome — superseded, NOT halted —
+    // matching isSuperseded()/isCredentialHalted(), whichever path the
+    // rejection arrived by.
+    expect(result.superseded).toBe(true);
+    expect(result.halted).toBeUndefined();
     // Surfaced once as a hard stop, but the SHARED halt key is untouched.
     expect(errors.filter(e => e.code === 'CREDENTIAL_INVALID')).toHaveLength(1);
     expect(errors.pop()).toMatchObject({ code: 'CREDENTIAL_INVALID', isHardStop: true });

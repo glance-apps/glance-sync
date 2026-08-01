@@ -79,6 +79,20 @@ defects found alongside it. The file-tier (WebDAV) engine is untouched.
   seconds after a user types their passphrase; and `CREDENTIAL_INVALID` is
   owned by the (terminal) credential halt, so stacking a window on it would be
   meaningless at best. `QUOTA_EXCEEDED` opens exactly one window, its own.
+- **For app integration — do not render backoff from the last `onError`
+  message.** On a cycle suppressed by a quiet (transport or auth) window, the
+  cycle's usual `onError(null, null, false)` reset still fires and nothing is
+  re-surfaced, so an app that remembers the last error string will see it
+  *cleared* while `onStatusChange` reads `'error'`. This is deliberate (quiet
+  windows report once; repeating every cycle is the noise this release
+  removes). Render standing backoff from `getBackoffState()` — `reason` plus
+  `until` gives "retrying in Xs" — and treat `onError` as an event stream, not
+  a status store. Quota windows are the exception and keep re-surfacing
+  `QUOTA_EXCEEDED` with the descriptor each cycle.
+- The cycle result now reports a superseded stale instance truthfully:
+  `{ superseded: true }` rather than `{ halted: true }`, matching
+  `isSuperseded()` / `isCredentialHalted()` whichever path the credential
+  rejection arrived by.
 - A healthy client is unaffected: no window is ever opened, no added latency,
   and an identical request pattern.
 

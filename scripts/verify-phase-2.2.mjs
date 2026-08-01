@@ -283,7 +283,11 @@ section('8. shared mode: unchanged, unhaltable, and recovery refuses it');
   noErrors(s);
   PASS('a correctly configured shared-mode device syncs exactly as today');
 
-  // A WRONG shared token errors but never halts, and keeps retrying.
+  // A WRONG shared token errors but never halts. Since v1.10.0 the retry is
+  // DELAYED rather than immediate — the 401 opens the one-hour auth backoff
+  // window — so the assertion is "window open, not halted", not "requests
+  // keep flowing". Self-resumption once the window elapses is proven in
+  // scripts/verify-db-backoff.mjs (item 8), which owns the backoff behavior.
   await freshKeys('s-bad');
   const bad = makeDevice('s-bad', { vaultUrl: SHARED, vaultToken: 'wrong-token' });
   const engineBad = createDbSyncEngine(bad.cfg);
@@ -292,8 +296,12 @@ section('8. shared mode: unchanged, unhaltable, and recovery refuses it');
   assert.ok(bad.errors.every(e => e.code !== 'CREDENTIAL_INVALID'));
   const before = wire.length;
   await engineBad.sync();
-  assert.ok(wire.length > before, 'still retrying — no halt in shared mode');
-  PASS('a wrong shared token is an ordinary retryable error: no CREDENTIAL_INVALID, no halt');
+  assert.equal(wire.length, before, 'inside the auth window: delayed, not retried immediately');
+  const badBackoff = engineBad.getBackoffState().push;
+  assert.equal(badBackoff.reason, 'auth');
+  assert.ok(badBackoff.until > Date.now(), 'the window is open, and it expires on its own');
+  assert.equal(engineBad.isCredentialHalted(), false, 'a delay, never a halt');
+  PASS('a wrong shared token is a DELAYED retryable error (auth backoff window): no CREDENTIAL_INVALID, no halt');
 
   // Recovery structurally refuses a shared-mode server, even if a halt
   // record somehow exists on the device.
