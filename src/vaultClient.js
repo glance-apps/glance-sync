@@ -39,6 +39,45 @@ class VaultError extends Error {
   }
 }
 
+// Quota rejection parsing (GLANCEvault Phase 3.2 / client Phase 3.3).
+//
+// The server rejects an over-quota write with 413 (storage-shaped: `storage`,
+// `rows`) or 429 (volume/concurrency-shaped: `intents`, `concurrent-uploads`)
+// and a uniform body:
+//   { error: "quota exceeded", quota, limit, used, requested }
+// The three numbers are bytes for `storage` and counts otherwise, and are
+// meant to render "X of Y used" directly.
+//
+// DEFENSIVE BY CONSTRUCTION — this shape is a contract across two repos, so
+// a body must earn the typed classification rather than be assumed into it.
+// ALL of: the exact `error` wording, a non-empty string `quota`, and three
+// finite numbers. Anything short of that (a missing field, a non-JSON body, a
+// 413 with no quota fields at all, an older server that never sends this
+// shape) degrades to the generic VAULT_ERROR the client already handled —
+// never a throw, never a mis-classification.
+//
+// The `quota` DIMENSION is deliberately NOT allowlisted. A newer server may
+// add dimensions, and an unknown one is still a quota condition with the same
+// remedy (wait; it clears when the operator acts, with no client action), so
+// passing the string through verbatim is more truthful than pretending the
+// rejection was a generic failure. Consumers that do not recognise a
+// dimension render it generically. See the PR for this decision.
+//
+// The legacy SSE per-account cap (429 {"error":"too many connections for
+// account"}) predates this shape and is NOT a quota rejection: its wording
+// fails the `error` check on the first line, so it degrades generically with
+// no special-casing. Nothing in this package speaks SSE regardless.
+const parseQuotaBody = (status, body, bodyError) => {
+  if (status !== 413 && status !== 429) return null;
+  if (bodyError !== 'quota exceeded') return null;
+  if (!body || typeof body.quota !== 'string' || body.quota === '') return null;
+  const { limit, used, requested } = body;
+  if (typeof limit !== 'number' || !Number.isFinite(limit)) return null;
+  if (typeof used !== 'number' || !Number.isFinite(used)) return null;
+  if (typeof requested !== 'number' || !Number.isFinite(requested)) return null;
+  return { quota: body.quota, limit, used, requested };
+};
+
 // Shared by createVaultClient and the standalone pre-credential helpers below.
 const resolveFetch = (fetchImpl, context) => {
   const doFetch = fetchImpl || globalThis.fetch;
@@ -200,9 +239,10 @@ export function createVaultClient({ vaultUrl, vaultToken, fetchImpl } = {}) {
   // non-JSON, or unrecognized body degrades to the generic VAULT_ERROR, so
   // the client's correctness never depends on server wording.
   const errorFromResponse = async (res, context) => {
+    let body = null;
     let bodyError = null;
     try {
-      const body = await res.json();
+      body = await res.json();
       if (body && typeof body.error === 'string') bodyError = body.error;
     } catch {
       // Empty or non-JSON error body: keep the generic classification.
@@ -210,6 +250,16 @@ export function createVaultClient({ vaultUrl, vaultToken, fetchImpl } = {}) {
     if (res.status === 401 && bodyError === 'invalid credential') {
       const err = new VaultError(`${context} failed: 401 — the server rejected this device's credential`, 401);
       err.code = 'CREDENTIAL_INVALID';
+      return err;
+    }
+    const quota = parseQuotaBody(res.status, body, bodyError);
+    if (quota) {
+      const err = new VaultError(
+        `${context} failed: ${res.status} — ${quota.quota} quota exceeded (${quota.used} of ${quota.limit}, requested ${quota.requested})`,
+        res.status
+      );
+      err.code = 'QUOTA_EXCEEDED';
+      err.quota = quota;
       return err;
     }
     return new VaultError(`${context} failed: ${res.status}`, res.status);

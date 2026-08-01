@@ -195,3 +195,87 @@ describe('credential as Bearer token (scoped calls are mode-agnostic)', () => {
     expect(calls[0].init.headers.Authorization).toBe(`Bearer ${credential}`);
   });
 });
+
+// ═══════════ Phase 3.3: quota rejection parsing (defensive by construction) ═══════════
+//
+// The shape is a contract across two repos, so a body must EARN the typed
+// classification: the exact wording, a non-empty string dimension, and three
+// finite numbers. Everything else degrades to the generic VAULT_ERROR the
+// client already handled — never a throw, never a mis-classification.
+
+describe('quota rejection parsing', () => {
+  const client = (status, body) => createVaultClient({
+    vaultUrl: 'https://vault.example',
+    vaultToken: 'tok',
+    fetchImpl: async () => (body === undefined
+      ? { ok: false, status, json: async () => { throw new Error('no body'); } }
+      : { ok: false, status, json: async () => body }),
+  });
+  const push = (c) => c.batch('app', { accountId: 'a', rows: [] });
+
+  const FULL = { error: 'quota exceeded', quota: 'rows', limit: 100, used: 100, requested: 3 };
+
+  it('413 with the full shape -> QUOTA_EXCEEDED carrying the descriptor', async () => {
+    await expect(push(client(413, FULL))).rejects.toMatchObject({
+      code: 'QUOTA_EXCEEDED',
+      status: 413,
+      quota: { quota: 'rows', limit: 100, used: 100, requested: 3 },
+    });
+  });
+
+  it('429 with the full shape -> QUOTA_EXCEEDED (volume/concurrency-shaped)', async () => {
+    const body = { error: 'quota exceeded', quota: 'intents', limit: 500, used: 500, requested: 1 };
+    await expect(push(client(429, body))).rejects.toMatchObject({
+      code: 'QUOTA_EXCEEDED', status: 429, quota: { quota: 'intents' },
+    });
+  });
+
+  it('the message renders the numbers so a bare log line is still useful', async () => {
+    await expect(push(client(413, FULL))).rejects.toThrow(/rows quota exceeded \(100 of 100, requested 3\)/);
+  });
+
+  it('an UNRECOGNISED dimension is still a quota condition, passed through verbatim', async () => {
+    const body = { error: 'quota exceeded', quota: 'bandwidth-from-a-newer-server', limit: 5, used: 5, requested: 1 };
+    await expect(push(client(413, body))).rejects.toMatchObject({
+      code: 'QUOTA_EXCEEDED', quota: { quota: 'bandwidth-from-a-newer-server' },
+    });
+  });
+
+  it('413 with NO quota fields at all -> generic VAULT_ERROR', async () => {
+    await expect(push(client(413, { error: 'payload too large' })))
+      .rejects.toMatchObject({ code: 'VAULT_ERROR', status: 413 });
+  });
+
+  it('413 with an empty body -> generic VAULT_ERROR (no throw in the parse)', async () => {
+    await expect(push(client(413, undefined))).rejects.toMatchObject({ code: 'VAULT_ERROR', status: 413 });
+  });
+
+  it.each([
+    ['missing quota', { error: 'quota exceeded', limit: 1, used: 1, requested: 1 }],
+    ['empty quota', { error: 'quota exceeded', quota: '', limit: 1, used: 1, requested: 1 }],
+    ['missing limit', { error: 'quota exceeded', quota: 'rows', used: 1, requested: 1 }],
+    ['missing used', { error: 'quota exceeded', quota: 'rows', limit: 1, requested: 1 }],
+    ['missing requested', { error: 'quota exceeded', quota: 'rows', limit: 1, used: 1 }],
+    ['string numbers', { error: 'quota exceeded', quota: 'rows', limit: '1', used: '1', requested: '1' }],
+    ['non-finite number', { error: 'quota exceeded', quota: 'rows', limit: null, used: 1, requested: 1 }],
+  ])('a body missing part of the shape (%s) -> generic VAULT_ERROR', async (_label, body) => {
+    await expect(push(client(413, body))).rejects.toMatchObject({ code: 'VAULT_ERROR' });
+  });
+
+  it('the quota wording on a status that is neither 413 nor 429 stays VAULT_ERROR', async () => {
+    await expect(push(client(500, FULL))).rejects.toMatchObject({ code: 'VAULT_ERROR', status: 500 });
+  });
+
+  it('the LEGACY SSE 429 body is not a quota rejection', async () => {
+    // Byte-identical legacy body; it fails the `error` check with no
+    // special-casing. (Nothing in this package speaks SSE — see the PR's
+    // documented negative — but the parse must not claim it either.)
+    await expect(push(client(429, { error: 'too many connections for account' })))
+      .rejects.toMatchObject({ code: 'VAULT_ERROR', status: 429 });
+  });
+
+  it('a 401 credential rejection is untouched by quota parsing', async () => {
+    await expect(push(client(401, { error: 'invalid credential' })))
+      .rejects.toMatchObject({ code: 'CREDENTIAL_INVALID', status: 401 });
+  });
+});

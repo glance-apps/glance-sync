@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-08-01
+
+**Should you take this release?** Yes if you run, or might run, a GLANCEvault
+server with a row cap configured (`GLANCEVAULT_QUOTA_*`, server Phase 3.2).
+Also yes for the sync-reliability fix below, which applies to **every**
+deployment including shared mode and unconfigured servers: before this
+release, a failed push also cost you the pull, so a device whose writes were
+failing silently stopped receiving other devices' changes too. Nothing here
+changes behavior against a server with no quota configured, which is and will
+remain the common case.
+
+### Fixed
+
+- **A failed push no longer prevents the pull.** The DB sync cycle threw
+  straight from a push failure to its error handler, so `pullRemoteChanges`
+  and the device-cursor report never ran. A device that could not write — for
+  *any* reason: a transport blip, a 500, a server-side cap — also stopped
+  **reading**, and silently fell behind its peers. The push error is now
+  captured, the pull and cursor run regardless, and the error is reported
+  after. Applies to every transport failure, not just the quota case that
+  exposed it. Behavior on a fully successful cycle is unchanged.
+  - A cycle whose push failed but whose pull succeeded now returns
+    `{ applied, skipped, skippedEntityIds, pushFailed: true, pushErrorCode,
+    quota }` — the pull's own numbers are reported as usual, and `onError`
+    fires with the push error's code and `isHardStop: false`. `lastSynced` is
+    deliberately **not** advanced (the device is not fully in step), and the
+    dirty rows are retained for the next cycle exactly as before.
+- **A quota rejection is no longer mislabelled "update your server".** The key
+  verifier's establishing write is a net-new entity, so a fresh device on an
+  account at the row cap gets a 413 there — and every error on that path was
+  relabelled `VERIFIER_UNSUPPORTED` ("Your GLANCEvault server needs to be
+  updated to support key verification"), sending the user to fix a server
+  that is working correctly. `QUOTA_EXCEEDED` now passes through that
+  classifier, the same way `CREDENTIAL_INVALID` and the client-readiness
+  codes already did.
+
+### Added
+
+- **Over-quota handling for the reachable dimension (server Phase 3.2 /
+  client Phase 3.3).** A 413 or 429 carrying the server's quota body
+  (`{ error: "quota exceeded", quota, limit, used, requested }`) is now typed
+  as `QUOTA_EXCEEDED` and carries the parsed descriptor, so consumers no
+  longer have to substring-match an error message to tell a quota rejection
+  from any other failure.
+  - **Never a halt.** A quota condition is the opposite of a rejected
+    credential: it clears when the operator raises the limit or reclaim runs
+    — with **no client action at all** — so the engine keeps running.
+    `isHardStop` is always `false`, nothing is persisted, and there is no
+    recovery entry point and nothing to clear.
+  - **Bounded, self-resuming suppression** instead of retrying a doomed write
+    every cycle: after a rejection the engine skips the *write* for 30s,
+    doubling on repeat to a 15-minute cap (the file tier's backoff shape),
+    while pulls and cursor reports continue untouched. The next ordinary
+    cycle after the window probes again; a write that gets through clears the
+    state by itself. Raising the server limit is picked up with no restart,
+    no re-enrollment, and no user action.
+  - New state queries: `getQuotaState()` (the descriptor plus `since` /
+    `retryAt`, in memory only) and `isQuotaSuppressed()`.
+  - **Defensive parse.** A body earns the typed classification only with the
+    exact wording, a non-empty `quota` string, and three finite numbers.
+    A missing field, a non-JSON body, a 413 with no quota fields, the legacy
+    SSE `{"error":"too many connections for account"}` 429, or an older
+    server that never sends this shape all degrade to the generic
+    `VAULT_ERROR` handled before — never a throw, never a mis-classification.
+    An **unrecognised** `quota` dimension from a newer server is passed
+    through verbatim and still treated as a quota condition, since the remedy
+    is the same; render an unfamiliar dimension generically.
+
+### Notes
+
+- **Scope: `rows` is the only quota dimension this package can reach.** The
+  server enforces `storage` and `concurrent-uploads` at the blob path, and
+  `intents` at the intents route; this package has no blob path (media is
+  stripped at the adapter boundary) and no intents path (that is
+  `@glance-apps/intents`), and no SSE client. So "text syncs while media
+  fails" is not something this package can exercise. Handling for those
+  dimensions belongs with the media transport work that would call them, and
+  was deliberately not written here.
+- **Known gap, not fixed here:** the DB engine has no backoff of any kind
+  outside the quota window above. On a persistent write failure the same
+  dirty rows are re-pushed on every cycle indefinitely, where the file tier
+  has exponential backoff with an auth-failure escalation. This is a real
+  defect with a live blast radius and it wants its own change rather than a
+  corner of this one.
+
 ## [1.8.0] - 2026-07-31
 
 ### Added

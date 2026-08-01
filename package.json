@@ -1,6 +1,6 @@
 {
   "name": "@glance-apps/sync",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "license": "MIT",
   "type": "module",
   "main": "src/index.js",

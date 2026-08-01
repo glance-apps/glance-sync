@@ -32,7 +32,15 @@ export type SyncErrorCode =
   // credential (401 "invalid credential"). Surfaced with isHardStop === true;
   // the engine persists a halt and stops retrying. Recovery (re-enrollment)
   // is Phase 2.2 — nothing in this version clears the halt.
-  | 'CREDENTIAL_INVALID';
+  | 'CREDENTIAL_INVALID'
+  // DB transport: the server rejected a write because the account is over a
+  // configured quota (413 storage-shaped / 429 volume-shaped, Phase 3.2).
+  // ALWAYS isHardStop === false — a quota condition clears when the operator
+  // raises the limit or reclaim runs, with NO client action, so the engine
+  // never halts on it. The parsed descriptor rides on the engine's
+  // getQuotaState(); the engine suppresses further writes for a bounded,
+  // self-resuming window while the pull keeps running.
+  | 'QUOTA_EXCEEDED';
 
 export type SyncStatus = 'idle' | 'uploading' | 'downloading' | 'success' | 'error';
 
@@ -519,6 +527,43 @@ export interface DbSyncResult {
   applied: number;
   skipped: number;
   skippedEntityIds: string[];
+  /** True when the push threw but the pull still ran (Phase 3.3 partial function). */
+  pushFailed?: boolean;
+  /** True when the push was skipped because an over-quota suppression window is open. */
+  pushSkipped?: boolean;
+  /** The push error's code when pushFailed/pushSkipped — the pull's own result is still reported above. */
+  pushErrorCode?: SyncErrorCode | string;
+  /** The standing over-quota descriptor, when one applies. */
+  quota?: QuotaState | null;
+  /** True when the cycle no-opped because the credential halt is set. */
+  halted?: boolean;
+  /** True when the cycle no-opped because this instance's credential was superseded. */
+  superseded?: boolean;
+}
+
+/**
+ * Over-quota state (Phase 3.3). IN MEMORY ONLY — this describes server-side
+ * state that changes without the client (an operator raises a limit, reclaim
+ * runs, intents expire), so it is never persisted and there is nothing to
+ * clear: it lifts by itself when a write succeeds again.
+ *
+ * `quota` is the server's dimension string, passed through verbatim — the
+ * known values are 'storage' | 'rows' | 'intents' | 'concurrent-uploads', but
+ * a newer server may add dimensions, so treat an unrecognised one generically
+ * rather than assuming it cannot happen. The numbers are bytes for 'storage'
+ * and counts otherwise, and render "X of Y used" directly; they are null only
+ * in the defensive case where a rejection was typed without a full body.
+ */
+export interface QuotaState {
+  quota: string;
+  limit: number | null;
+  used: number | null;
+  requested: number | null;
+  message: string;
+  /** ISO timestamp of the most recent rejection. */
+  since: string;
+  /** ISO timestamp after which the engine probes again, on its own. */
+  retryAt: string;
 }
 
 /** A row quarantined after failing to decrypt under the (verified) account key. */
@@ -564,6 +609,10 @@ export interface DbSyncEngine {
   getCredentialHalt(): { message: string; at: string } | null;
   /** True once this instance proved its bearer was superseded by recovery and went inert (in-memory only). */
   isSuperseded(): boolean;
+  /** The standing over-quota descriptor, or null. In-memory only; never a hard stop; nothing to clear. */
+  getQuotaState(): QuotaState | null;
+  /** True while the bounded over-quota suppression window is open (writes skipped, pulls continue). */
+  isQuotaSuppressed(): boolean;
   /** The resolved stable device identity this engine runs as. */
   deviceId: string;
 

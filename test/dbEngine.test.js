@@ -12,7 +12,7 @@
 // real per-entity crypto runs without touching the salt endpoints.
 
 import 'fake-indexeddb/auto';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 // Minimal in-memory localStorage shim (same pattern as engine.test.js).
 const __store = new Map();
@@ -1178,5 +1178,233 @@ describe('halt-set identity rule', () => {
     expect(recovered.isSuperseded()).toBe(false);
     await recovered.sync();
     expect(okVault.calls.list.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------- Phase 3.3: partial function + over-quota handling ----------
+//
+// Two defects fixed here. (1) A failed push used to throw straight past the
+// pull, so a device whose writes were blocked also stopped RECEIVING other
+// devices' changes — true for ANY push failure, not just quota. (2) A quota
+// rejection must never halt: it clears when the operator acts, with no client
+// action, so the engine backs off in a bounded, self-resuming window instead.
+
+describe('a failed push no longer costs the pull', () => {
+  const quotaError = () => {
+    const e = new Error('batch upsert failed: 413 — rows quota exceeded (100 of 100, requested 1)');
+    e.code = 'QUOTA_EXCEEDED';
+    e.status = 413;
+    e.quota = { quota: 'rows', limit: 100, used: 100, requested: 1 };
+    return e;
+  };
+  const transportError = () => {
+    const e = new Error('batch upsert failed: 503');
+    e.code = 'VAULT_ERROR';
+    e.status = 503;
+    return e;
+  };
+
+  // A vault whose batch always rejects, but whose list still serves a row.
+  const makeRejectingVault = (makeError) => {
+    const base = makeStatefulVault();
+    return {
+      ...base,
+      calls: base.calls,
+      rows: base.rows,
+      async batch(app, args) {
+        // The verifier's establishing write (seeded) never runs here; only
+        // the push reaches batch in these tests.
+        base.calls.batch.push(args.rows);
+        throw makeError();
+      },
+    };
+  };
+
+  const seedRemoteRow = async (vault, entityId, entity, seq) => {
+    vault.rows.set(entityId, {
+      entityId, envelope: await encryptEntity(entity, entityId),
+      createdAt: Date.now(), seq, deleted: false,
+    });
+  };
+
+  it.each([
+    ['a QUOTA_EXCEEDED push failure', quotaError, 'QUOTA_EXCEEDED'],
+    ['a generic transport push failure', transportError, 'VAULT_ERROR'],
+  ])('%s still pulls, applies rows, and reports the cursor', async (_label, makeError, expectedCode) => {
+    const vault = makeRejectingVault(makeError);
+    await seedRemoteRow(vault, 'from-peer', { id: 'from-peer', lastModified: '2026-01-01T00:00:00Z' }, 7);
+
+    const local = new Map([['mine', { id: 'mine', lastModified: '2026-01-01T00:00:00Z' }]]);
+    const { engine, applied } = makeEngine({
+      vault, local, config: { storageKeyPrefix: `pf-${expectedCode}` },
+    });
+    engine.markDirty('mine');
+
+    const result = await engine.sync();
+
+    // The push was attempted and failed...
+    expect(vault.calls.batch.length).toBeGreaterThan(0);
+    expect(result.pushFailed).toBe(true);
+    expect(result.pushErrorCode).toBe(expectedCode);
+    // ...but the pull ran anyway and applied the peer's row.
+    expect(result.applied).toBe(1);
+    expect(applied.map(a => a.id)).toContain('from-peer');
+    // ...and the device cursor still reported.
+    expect(vault.calls.device.length).toBe(1);
+    // The dirty row is retained for the next cycle (unchanged behavior).
+    expect(engine.getDirtySet()).toContain('mine');
+    // Never a halt, in either case.
+    expect(engine.isCredentialHalted()).toBe(false);
+  });
+
+  it('does not claim lastSynced when the push did not land', async () => {
+    const vault = makeRejectingVault(transportError);
+    const local = new Map([['mine', { id: 'mine', lastModified: '2026-01-01T00:00:00Z' }]]);
+    const { engine } = makeEngine({ vault, local, config: { storageKeyPrefix: 'pf-lastsynced' } });
+    engine.markDirty('mine');
+
+    await engine.sync();
+    expect(engine.getLastSynced()).toBeNull();
+  });
+
+  it('a fully successful cycle is unchanged: no push flags, lastSynced set', async () => {
+    const local = new Map([['mine', { id: 'mine', lastModified: '2026-01-01T00:00:00Z' }]]);
+    const { engine } = makeEngine({ local, config: { storageKeyPrefix: 'pf-ok' } });
+    engine.markDirty('mine');
+
+    const result = await engine.sync();
+    expect(result.pushFailed).toBeUndefined();
+    expect(result.pushSkipped).toBeUndefined();
+    expect(engine.getLastSynced()).not.toBeNull();
+    expect(engine.getQuotaState()).toBeNull();
+  });
+});
+
+describe('over-quota: surfaced, suppressed, self-resuming, never halting', () => {
+  const makeQuotaVault = (rejectRef) => {
+    const base = makeStatefulVault();
+    return {
+      ...base, calls: base.calls, rows: base.rows,
+      async batch(app, args) {
+        base.calls.batch.push(args.rows);
+        if (rejectRef.value) {
+          const e = new Error('batch upsert failed: 413 — rows quota exceeded (100 of 100, requested 1)');
+          e.code = 'QUOTA_EXCEEDED';
+          e.quota = { quota: 'rows', limit: 100, used: 100, requested: 1 };
+          throw e;
+        }
+        return { written: args.rows.length, maxSeq: 1 };
+      },
+    };
+  };
+
+  it('surfaces QUOTA_EXCEEDED as a NON-hard-stop with the descriptor, and never halts', async () => {
+    const rejectRef = { value: true };
+    const vault = makeQuotaVault(rejectRef);
+    const errors = [];
+    const local = new Map([['mine', { id: 'mine', lastModified: '2026-01-01T00:00:00Z' }]]);
+    const { engine } = makeEngine({
+      vault, local,
+      config: { storageKeyPrefix: 'q-surface', onError: (m, c, h) => errors.push({ m, c, h }) },
+    });
+    engine.markDirty('mine');
+
+    await engine.sync();
+
+    expect(errors.pop()).toMatchObject({ c: 'QUOTA_EXCEEDED', h: false });
+    expect(engine.isCredentialHalted()).toBe(false);
+    expect(localStorage.getItem('q-surface-db-sync-credential-halt')).toBeNull();
+    expect(engine.getQuotaState()).toMatchObject({
+      quota: 'rows', limit: 100, used: 100, requested: 1,
+      since: expect.any(String), retryAt: expect.any(String),
+    });
+  });
+
+  it('does not hammer: one write attempt, then the window suppresses further pushes while pulls continue', async () => {
+    const rejectRef = { value: true };
+    const vault = makeQuotaVault(rejectRef);
+    const local = new Map([['mine', { id: 'mine', lastModified: '2026-01-01T00:00:00Z' }]]);
+    const { engine } = makeEngine({ vault, local, config: { storageKeyPrefix: 'q-suppress' } });
+    engine.markDirty('mine');
+
+    await engine.sync();
+    const attemptsAfterFirst = vault.calls.batch.length;
+    expect(attemptsAfterFirst).toBe(1);
+    expect(engine.isQuotaSuppressed()).toBe(true);
+
+    // Five more cycles inside the window: ZERO further write attempts...
+    for (let i = 0; i < 5; i += 1) await engine.sync();
+    expect(vault.calls.batch.length).toBe(attemptsAfterFirst);
+    // ...but the pull and cursor kept running every time (partial function).
+    expect(vault.calls.list.length).toBe(6);
+    expect(vault.calls.device.length).toBe(6);
+
+    const suppressed = await engine.sync();
+    expect(suppressed.pushSkipped).toBe(true);
+    expect(suppressed.quota).toMatchObject({ quota: 'rows' });
+  });
+
+  it('resumes on its own when the window expires — no client action, no restart', async () => {
+    const rejectRef = { value: true };
+    const vault = makeQuotaVault(rejectRef);
+    const local = new Map([['mine', { id: 'mine', lastModified: '2026-01-01T00:00:00Z' }]]);
+    const { engine } = makeEngine({ vault, local, config: { storageKeyPrefix: 'q-resume' } });
+    engine.markDirty('mine');
+
+    await engine.sync();
+    expect(engine.isQuotaSuppressed()).toBe(true);
+
+    // The operator raises the limit; the client is told nothing.
+    rejectRef.value = false;
+    // Simulate the window elapsing (the engine probes on its ordinary cycle).
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(Date.now() + 31_000));
+    try {
+      const result = await engine.sync();
+      expect(result.pushFailed).toBeUndefined();
+      expect(result.pushSkipped).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // State cleared by the write that got through — nothing was cleared by hand.
+    expect(engine.getQuotaState()).toBeNull();
+    expect(engine.isQuotaSuppressed()).toBe(false);
+    expect(engine.getDirtySet()).toEqual([]);
+  });
+});
+
+describe('the key verifier reports a quota rejection truthfully', () => {
+  it('a 413 while establishing the keycheck row surfaces QUOTA_EXCEEDED, NOT VERIFIER_UNSUPPORTED', async () => {
+    // Fresh account: the verifier row is absent, so verifyAccountKey tries to
+    // establish it — a net-new entity, which is exactly what a row cap
+    // rejects. Before the pass-through addition this surfaced as
+    // "Your GLANCEvault server needs to be updated", sending the user to fix
+    // a server that is working correctly.
+    const vault = {
+      ...makeStatefulVault({ seedVerifier: false }),
+      async getRow() { return null; },
+      async batch() {
+        const e = new Error('batch upsert failed: 413 — rows quota exceeded (100 of 100, requested 1)');
+        e.code = 'QUOTA_EXCEEDED';
+        e.quota = { quota: 'rows', limit: 100, used: 100, requested: 1 };
+        throw e;
+      },
+    };
+    const errors = [];
+    const { engine } = makeEngine({
+      vault,
+      config: { storageKeyPrefix: 'q-verifier', onError: (m, c, h) => errors.push({ m, c, h }) },
+    });
+
+    await engine.sync();
+
+    const surfaced = errors.pop();
+    expect(surfaced.c).toBe('QUOTA_EXCEEDED');
+    expect(surfaced.c).not.toBe('VERIFIER_UNSUPPORTED');
+    expect(surfaced.m).not.toMatch(/needs to be updated/);
+    expect(surfaced.h).toBe(false);
+    expect(engine.isCredentialHalted()).toBe(false);
+    expect(engine.getQuotaState()).toMatchObject({ quota: 'rows' });
   });
 });
