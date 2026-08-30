@@ -47,6 +47,14 @@ export {
   // discovery and the bootstrap-secret -> per-device-credential exchange.
   fetchVaultHealth,
   enrollVaultDevice,
+  // Module-scope request diagnostics (1.11.0). The brake gates every client
+  // call after a real 429; the budget meter and the write-loop detector are
+  // visibility only. All three are per bundle realm, not per client.
+  isVaultRateLimited,
+  vaultBrakeStatus,
+  getVaultStats,
+  configureVaultDiagnostics,
+  resetVaultDiagnostics,
 } from './vaultClient.js';
 // The packaged connect flow: discover -> branch -> enroll if needed ->
 // persist credential -> build engine. Apps hand it a secret or token and get
