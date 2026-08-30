@@ -60,6 +60,28 @@ const ts = (v) => {
 // A window never becomes terminal: it only ever delays. Whatever the
 // interval, the next ordinary cycle after it expires probes again, with no
 // user action and no restart.
+// ─────────────────────────────────────────────────────────────────────────────
+// The pull-cursor durability contract (Phase 4b).
+//
+// pullRemoteChanges persists a cursor recording what this device has consumed.
+// Whether that is SAFE depends on something only the caller knows: whether
+// applyRemoteEntity made the row durable by the time it returned.
+//
+//   - lastGLANCE and lifeGLANCE write straight into Dexie, so it is durable
+//     immediately and the cursor may advance per page.
+//   - dayGLANCE applies into a per-cycle mirror that is DISCARDED on failure
+//     (commit-only-on-success). For it, a cursor advanced mid-pagination sits
+//     ahead of committed state: those rows are consumed, never committed,
+//     never re-listed by an incremental pull, and unreachable by its glitch
+//     heal — permanent row loss, demonstrated in the 1.10.0 survey.
+//
+// From 1.10.0 to 1.12.0 the per-page assumption was stated only in a source
+// comment, and the config contract documenting applyRemoteEntity said nothing
+// about durability at all. A caller cannot honour a contract it is never
+// shown, so it is now a declared, validated mode.
+const PULL_CURSOR_MODES = ['end-of-pull', 'per-page', 'caller'];
+const DEFAULT_PULL_CURSOR_MODE = 'end-of-pull';
+
 const BACKOFF_BASE_S = 30;
 const MAX_PUSH_BACKOFF_S = 15 * 60; // writes, matching the file tier's upload cap
 const MAX_PULL_BACKOFF_S = 5 * 60;  // reads, matching the file tier's download cap
@@ -144,7 +166,15 @@ export const credentialHaltKey = (storageKeyPrefix) => `${storageKeyPrefix}-db-s
  *
  * Data callbacks (the engine is data-shape agnostic):
  * @param {Function} config.getLocalEntity      - (entityId) => entity | null | Promise
- * @param {Function} config.applyRemoteEntity   - (entityId, entity) => void | Promise
+ * @param {Function} config.applyRemoteEntity   - (entityId, entity) => void | Promise.
+ *   DURABILITY MATTERS HERE, and what you promise decides pullCursorCommit
+ *   below. If this function has made the row durable by the time it resolves
+ *   (a direct store write), the pull cursor may safely advance page by page.
+ *   If it writes somewhere your caller may still DISCARD — a per-cycle mirror
+ *   committed only on success — then a cursor advanced mid-pagination sits
+ *   ahead of your committed state and those rows are lost: consumed, never
+ *   committed, never re-listed by an incremental pull. Declare the mode that
+ *   matches; the default assumes nothing.
  * @param {Function} config.applyRemoteDelete   - (entityId) => void | Promise
  * @param {Function} [config.isInsertOnly]       - (entity, entityId) => boolean
  * @param {Function} [config.getEntityLastModified] - (entity) => string|number (defaults to entity.lastModified)
@@ -154,6 +184,22 @@ export const credentialHaltKey = (storageKeyPrefix) => `${storageKeyPrefix}-db-s
  * @param {Function} [config.onError]      - (message, code, isHardStop) called with code 'KEY_MISMATCH' on a wrong key, 'VERIFIER_UNSUPPORTED' when the server can't host the verifier, or 'CREDENTIAL_INVALID' (isHardStop true) when the server rejects this device's credential — the cycle then halts until Phase 2.2 recovery exists
  * @param {Function} [config.onRowsSkipped] - (count, entityIds) called when a cycle skipped undecryptable rows
  * @param {boolean}  [config.allowUnverified=false] - operator escape hatch: downgrade VERIFIER_UNSUPPORTED to a logged warning and proceed (unsafe; off by default)
+ * @param {'end-of-pull'|'per-page'|'caller'} [config.pullCursorCommit='end-of-pull']
+ *   WHEN the pull cursor is persisted. Pick the one that matches what
+ *   applyRemoteEntity promises above; an unrecognised value is REFUSED at
+ *   construction rather than defaulted.
+ *   - 'end-of-pull' (default): once, after a fully successful pagination loop.
+ *     Safe for every caller, including one that has not thought about it. A
+ *     mid-pagination failure re-pulls from where the run started, which is
+ *     idempotent under entity-grain LWW.
+ *   - 'per-page': after each completed page. Requires a durable apply. Lets a
+ *     large backlog on a flaky connection resume from the last good page
+ *     instead of restarting — the 1.10.0 convergence fix, now opt-in.
+ *   - 'caller': the engine never persists the cursor. pullRemoteChanges
+ *     returns maxSeq and the caller commits it with setHighWaterMark once its
+ *     own state is durable. The only mode under which the cursor can never
+ *     sit ahead of committed state, because the caller decides when.
+ *     dbSyncCycle commits for itself on a fully successful cycle.
  */
 export const createDbSyncEngine = (config) => {
   const {
@@ -177,6 +223,7 @@ export const createDbSyncEngine = (config) => {
     onError,
     onRowsSkipped,
     allowUnverified = false,
+    pullCursorCommit = DEFAULT_PULL_CURSOR_MODE,
   } = config;
 
   if (!storageKeyPrefix) throw new Error('createDbSyncEngine: storageKeyPrefix is required');
@@ -188,6 +235,17 @@ export const createDbSyncEngine = (config) => {
     // and rejects with a cryptic 400 on every row-scoped call (incl. the key
     // verifier's single-row GET).
     throw new Error('createDbSyncEngine: accountId is required');
+  }
+  // REFUSED, NOT DEFAULTED. A typo silently falling back to a default is the
+  // exact failure this contract exists to remove: 'perPage' or 'per_page'
+  // would quietly restore the unsafe behaviour on a caller that was trying to
+  // opt OUT of it, and nothing would say so until rows went missing. Matches
+  // the vault's strict auth-mode parsing.
+  if (!PULL_CURSOR_MODES.includes(pullCursorCommit)) {
+    throw new Error(
+      `createDbSyncEngine: pullCursorCommit must be one of ${PULL_CURSOR_MODES.map((m) => `'${m}'`).join(', ')}` +
+      ` (got ${JSON.stringify(pullCursorCommit)})`
+    );
   }
   if (typeof getLocalEntity    !== 'function') throw new Error('createDbSyncEngine: getLocalEntity is required');
   if (typeof applyRemoteEntity !== 'function') throw new Error('createDbSyncEngine: applyRemoteEntity is required');
@@ -980,23 +1038,34 @@ export const createDbSyncEngine = (config) => {
         if (typeof R.seq === 'number') since = Math.max(since, R.seq);
       }
 
-      // Persist the cursor PER PAGE, not once at the end. Every row in a page
-      // reaches a terminal outcome before we get here — applied, quarantined,
-      // or skipped as engine-reserved — so the cursor may safely advance past
-      // the whole page. Previously a failure on page 3 discarded the progress
-      // of pages 1 and 2, so a large backlog on a flaky connection could
-      // re-download the same pages forever and never converge; that is exactly
-      // the situation backoff is meant to help, so the two changes belong
-      // together.
-      setHighWaterMark(Math.max(getHighWaterMark(), maxSeq));
+      // PER-PAGE COMMIT POINT ('per-page' only). Every row in a page reaches a
+      // terminal outcome before we get here — applied, quarantined, or skipped
+      // as engine-reserved — so a caller whose apply is durable may safely
+      // advance past the whole page. That is what lets a large backlog on a
+      // flaky connection resume from the last good page instead of
+      // re-downloading from the start forever (the 1.10.0 convergence fix).
+      //
+      // It is NOT the default, because it is only correct for a caller that
+      // has told us its apply is durable. See PULL_CURSOR_MODES.
+      if (pullCursorCommit === 'per-page') {
+        setHighWaterMark(Math.max(getHighWaterMark(), maxSeq));
+      }
 
       hasMore = !!more;
     }
 
-    // Pull is the sole writer of the pull cursor. Advance it (monotonically)
-    // from the highest seq we actually listed this run. Retained for the
-    // zero-page case, and harmless after the per-page advance above.
-    setHighWaterMark(Math.max(getHighWaterMark(), maxSeq));
+    // END-OF-PULL COMMIT POINT. Reached only when the whole pagination loop
+    // completed — a page that throws exits above and leaves the cursor where
+    // the run started, which is the 1.6.1 semantic and is safe for every
+    // caller regardless of how it applies rows.
+    //
+    // In 'caller' mode the engine writes nothing at all: the returned maxSeq
+    // is the caller's to commit (via setHighWaterMark) once its own state is
+    // durable. That is the only mode under which the cursor can never sit
+    // ahead of what the caller has committed, because the caller decides when.
+    if (pullCursorCommit !== 'caller') {
+      setHighWaterMark(Math.max(getHighWaterMark(), maxSeq));
+    }
     return { maxSeq, appliedRemote, applied, skipped, skippedEntityIds };
   };
 
@@ -1197,6 +1266,20 @@ export const createDbSyncEngine = (config) => {
           pullErrorCode: pullError ? ((pullError.code) || 'NETWORK_ERROR') : (pullSkipped ? pullBackoff.code : undefined),
           quota: getQuotaState(),
         };
+      }
+
+      // THE CYCLE IS A CALLER TOO ('caller' mode). It commits the cursor here,
+      // at the one point it knows everything landed — the same point it claims
+      // lastSynced. Without this, an app that declared 'caller' and then used
+      // dbSyncCycle would never advance the cursor and would re-pull its whole
+      // backlog forever; the mode would be a footgun aimed at the caller that
+      // read the docs most carefully.
+      //
+      // Committing only on a fully successful cycle is deliberate, and mirrors
+      // what a commit-only-on-success composer does: if the push failed, that
+      // caller discards its applied state, so the cursor must not move either.
+      if (pullCursorCommit === 'caller' && typeof pull.maxSeq === 'number') {
+        setHighWaterMark(Math.max(getHighWaterMark(), pull.maxSeq));
       }
 
       const now = new Date().toISOString();

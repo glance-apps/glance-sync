@@ -238,6 +238,8 @@ TypeScript declarations for all of the above are in `types/index.d.ts`.
 
 This package follows [Semantic Versioning](https://semver.org/). Breaking changes to the public API or the sync envelope schema will result in a major version bump.
 
+A **change to a behavioural default** counts as breaking and gets a major bump too, even when no API signature changes. The test is whether a dependent that changes none of its own code can get different behaviour by taking the release: if it can, the version number has to say so, because the changelog is the thing people skip. 2.0.0 flipped the pull-cursor default from per-page to end-of-pull on exactly this basis.
+
 ## License
 
 MIT

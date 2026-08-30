@@ -635,6 +635,18 @@ export interface DbSyncEngineConfig {
   // and proceed without verification (unsafe — a wrong-key device could push
   // poison rows). Off by default so the safe behavior is the default.
   allowUnverified?: boolean;
+
+  /**
+   * WHEN the pull cursor is persisted. Must match what `applyRemoteEntity`
+   * promises: if it has NOT made the row durable by the time it resolves —
+   * it writes into a per-cycle mirror the caller may discard — then anything
+   * but `'end-of-pull'` or `'caller'` loses rows on a mid-pagination failure.
+   *
+   * An unrecognised value is refused at construction, not defaulted.
+   *
+   * @default 'end-of-pull'
+   */
+  pullCursorCommit?: PullCursorCommit;
 }
 
 /** Result of a DB sync cycle / pull: how many rows applied vs. quarantined. */
@@ -792,6 +804,20 @@ export interface DbSyncEngine {
 
   vault: VaultClient;
 }
+
+/**
+ * When the pull cursor is persisted. Chosen to match what the caller's
+ * `applyRemoteEntity` promises: an unrecognised value is refused at
+ * construction rather than defaulted.
+ *
+ * - `'end-of-pull'` (default) — once, after a fully successful pagination
+ *   loop. Safe for every caller, including one that has not thought about it.
+ * - `'per-page'` — after each completed page. Requires an apply that is
+ *   durable on return. Lets a large backlog resume from the last good page.
+ * - `'caller'` — the engine never persists; `pullRemoteChanges` returns
+ *   `maxSeq` and the caller commits it with `setHighWaterMark`.
+ */
+export type PullCursorCommit = 'end-of-pull' | 'per-page' | 'caller';
 
 export function createDbSyncEngine(config: DbSyncEngineConfig): DbSyncEngine;
 
