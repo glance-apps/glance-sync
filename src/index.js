@@ -40,7 +40,14 @@ export {
 } from './engine.js';
 
 // Phase 3: database transport (selected via transportMode: 'database').
-export { createDbSyncEngine, getOrCreateDeviceId } from './dbEngine.js';
+export {
+  createDbSyncEngine,
+  getOrCreateDeviceId,
+  // Phase 4a: tells a caller's own retry ladder that the engine paused this
+  // call, rather than that the request failed. Branching on it is what keeps
+  // an app's breaker from stacking a second cooldown on the engine's window.
+  isSuppressedError,
+} from './dbEngine.js';
 export {
   createVaultClient,
   // Per-account auth substrate (vault Phase 1.4b): unauthenticated auth-mode

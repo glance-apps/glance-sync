@@ -25,7 +25,7 @@ globalThis.localStorage = {
   get length() { return __store.size; },
 };
 
-const { createDbSyncEngine } = await import('../src/dbEngine.js');
+const { createDbSyncEngine, isSuppressedError, credentialHaltKey } = await import('../src/dbEngine.js');
 const { createSyncEngine } = await import('../src/engine.js');
 const {
   setupDbRootKey,
@@ -407,8 +407,20 @@ describe('push ordering (upserts before deletes)', () => {
 
     // Retry succeeds end-to-end: re-sent upsert is harmless (keyed by entityId),
     // the delete lands with its stamp, and the dirty set clears.
+    //
+    // ADJUSTED FOR PHASE 4a: the failed push above now opens the push window
+    // from inside the primitive, so an immediate retry is refused with
+    // SYNC_SUPPRESSED. Waiting the window out is what a real caller does, and
+    // what the cycle has always done — this test simply had the engine's old
+    // freedom to retry a failed push with no delay at all.
     failDeletes = false;
-    await engine.pushDirtyRows();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(engine.getBackoffState().push.until + 1000));
+    try {
+      await engine.pushDirtyRows();
+    } finally {
+      vi.useRealTimers();
+    }
     expect(order).toEqual(['batch', 'delete:unscheduledTasks:X', 'batch', 'delete:unscheduledTasks:X']);
     expect(server.has('tasks:X')).toBe(true);
     expect(tombstones).toHaveLength(1);
@@ -1804,5 +1816,331 @@ describe('backoff: the pull cursor advances per page', () => {
       vi.useRealTimers();
     }
     expect(vault.calls.list[vault.calls.list.length - 1]).toBe(4);
+  });
+});
+
+// ═══════════════ Phase 4a: enforcement lives in the primitives ═══════════════
+//
+// The two tiers had unequal safety: dbSyncCycle carried backoff, quota
+// suppression and the credential halt; pullRemoteChanges, pushDirtyRows and
+// updateDeviceCursor carried none, so any caller composing its own cycle
+// silently opted out of all three with no signal that it had. These pin the
+// protections at the level every caller reaches, and pin the two things that
+// could go wrong in moving them: a doubled escalation, and a window that
+// feeds itself.
+
+describe('Phase 4a: the primitives enforce their own protections', () => {
+  const mk4 = (code, status) => {
+    const e = new Error(`failed: ${status}`);
+    e.code = code; e.status = status;
+    return e;
+  };
+  const failingVault = ({ pushFails = false, pullFails = false, error = () => mk4('VAULT_ERROR', 503) } = {}) => {
+    const base = makeStatefulVault();
+    const state = { pushFails, pullFails };
+    return {
+      ...base, calls: base.calls, rows: base.rows, state,
+      async batch(app, args) {
+        base.calls.batch.push(args.rows);
+        if (state.pushFails) throw error();
+        return { written: args.rows.length, maxSeq: 1 };
+      },
+      async list(app, args) {
+        base.calls.list.push(args.since);
+        if (state.pullFails) throw error();
+        return { rows: [], hasMore: false };
+      },
+    };
+  };
+  const dirtyEngine = (vault, prefix) => {
+    const local = new Map([['mine', { id: 'mine', lastModified: '2026-01-01T00:00:00Z' }]]);
+    const { engine } = makeEngine({ vault, local, config: { storageKeyPrefix: prefix } });
+    engine.markDirty('mine');
+    return engine;
+  };
+
+  describe('the gate', () => {
+    it('a direct pushDirtyRows while the push window is open is refused BEFORE the wire', async () => {
+      const vault = failingVault({ pushFails: true });
+      const engine = dirtyEngine(vault, 'p4-push-gate');
+
+      // One real failure opens the window from inside the primitive.
+      await expect(engine.pushDirtyRows()).rejects.toMatchObject({ code: 'VAULT_ERROR' });
+      const attempts = vault.calls.batch.length;
+      expect(attempts).toBeGreaterThan(0);
+      expect(engine.getBackoffState().push.until).toBeGreaterThan(Date.now());
+
+      // The composed caller's next attempt never reaches the server.
+      vault.state.pushFails = false; // the server would accept now; the gate must not ask
+      await expect(engine.pushDirtyRows()).rejects.toMatchObject({ code: 'SYNC_SUPPRESSED' });
+      expect(vault.calls.batch.length).toBe(attempts);
+    });
+
+    it('a direct pullRemoteChanges while the pull window is open is refused BEFORE the wire', async () => {
+      const vault = failingVault({ pullFails: true });
+      const engine = dirtyEngine(vault, 'p4-pull-gate');
+
+      await expect(engine.pullRemoteChanges()).rejects.toMatchObject({ code: 'VAULT_ERROR' });
+      const attempts = vault.calls.list.length;
+
+      vault.state.pullFails = false;
+      await expect(engine.pullRemoteChanges()).rejects.toMatchObject({ code: 'SYNC_SUPPRESSED' });
+      expect(vault.calls.list.length).toBe(attempts);
+    });
+
+    it('the window is per-direction: a suppressed push does not gate the pull', async () => {
+      const vault = failingVault({ pushFails: true });
+      const engine = dirtyEngine(vault, 'p4-direction');
+
+      await expect(engine.pushDirtyRows()).rejects.toMatchObject({ code: 'VAULT_ERROR' });
+      await expect(engine.pushDirtyRows()).rejects.toMatchObject({ code: 'SYNC_SUPPRESSED' });
+
+      // The pull is untouched — the composed callers' reason for composing is
+      // that the halves are independent, and that must survive.
+      await expect(engine.pullRemoteChanges()).resolves.toMatchObject({ applied: 0 });
+    });
+
+    it('the window expires on its own: the next attempt after it reaches the wire', async () => {
+      const vault = failingVault({ pushFails: true });
+      const engine = dirtyEngine(vault, 'p4-expiry');
+      await expect(engine.pushDirtyRows()).rejects.toMatchObject({ code: 'VAULT_ERROR' });
+      const attempts = vault.calls.batch.length;
+
+      vault.state.pushFails = false;
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(engine.getBackoffState().push.until + 1000));
+      try {
+        await expect(engine.pushDirtyRows()).resolves.toMatchObject({ written: 1 });
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(vault.calls.batch.length).toBe(attempts + 1);
+      // A success clears the window and its strike count, from the primitive.
+      expect(engine.getBackoffState().push).toMatchObject({ until: 0, strikes: 0, reason: null });
+    });
+  });
+
+  describe('the signal a composed caller has to act on', () => {
+    it('is distinguishable from a real failure cheaply, without string matching', async () => {
+      const vault = failingVault({ pushFails: true });
+      const engine = dirtyEngine(vault, 'p4-signal');
+
+      const real = await engine.pushDirtyRows().catch((e) => e);
+      const gated = await engine.pushDirtyRows().catch((e) => e);
+
+      // Three independent discriminators, none of them a string search of the
+      // message. An app with its own breaker branches on any one of them.
+      expect(isSuppressedError(gated)).toBe(true);
+      expect(gated.code).toBe('SYNC_SUPPRESSED');
+      expect(gated.suppressed).toBe(true);
+
+      expect(isSuppressedError(real)).toBe(false);
+      expect(real.code).toBe('VAULT_ERROR');
+      expect(real.suppressed).toBeUndefined();
+
+      // ...and the helper is total: it never throws on junk.
+      for (const junk of [null, undefined, 'SYNC_SUPPRESSED', 0, {}, new Error('x')]) {
+        expect(isSuppressedError(junk)).toBe(false);
+      }
+    });
+
+    it('carries when to retry, so a caller can ALIGN its own cooldown instead of stacking one', async () => {
+      const vault = failingVault({ pullFails: true, error: () => mk4('VAULT_ERROR', 503) });
+      const engine = dirtyEngine(vault, 'p4-retryat');
+
+      await engine.pullRemoteChanges().catch(() => {});
+      const gated = await engine.pullRemoteChanges().catch((e) => e);
+
+      expect(gated.direction).toBe('pull');
+      expect(gated.reason).toBe('transport');
+      expect(gated.causeCode).toBe('VAULT_ERROR');   // what opened the window
+      expect(gated.retryAt).toBe(engine.getBackoffState().pull.until);
+      expect(gated.retryInMs).toBeGreaterThan(0);
+      expect(gated.retryInMs).toBeLessThanOrEqual(30_000);
+    });
+  });
+
+  describe('the two ways moving enforcement down could have gone wrong', () => {
+    it('escalation is NOT doubled: three failures give 30s, 60s, 120s — not 30, 120, 480', async () => {
+      // If both the primitive and the cycle recorded, strikes would increment
+      // twice per failure and the ladder would climb 2x as fast. This is the
+      // concrete arithmetic behind delegating rather than enforcing in both.
+      const vault = failingVault({ pushFails: true });
+      const engine = dirtyEngine(vault, 'p4-nodouble');
+      const seen = [];
+
+      let now = Date.now();
+      vi.useFakeTimers();
+      try {
+        for (let i = 0; i < 3; i += 1) {
+          vi.setSystemTime(new Date(now));
+          await engine.sync();                       // through the cycle
+          const { push } = engine.getBackoffState();
+          seen.push({ strikes: push.strikes, ms: push.until - now });
+          now = push.until + 1000;
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+
+      expect(seen.map((s) => s.strikes)).toEqual([1, 2, 3]);
+      expect(seen.map((s) => s.ms)).toEqual([30_000, 60_000, 120_000]);
+    });
+
+    it('a suppressed call cannot feed the window that suppressed it', async () => {
+      // SYNC_SUPPRESSED must never record. Otherwise every gated call extends
+      // the window, and a caller polling on a short interval would never see
+      // it close.
+      const vault = failingVault({ pullFails: true });
+      const engine = dirtyEngine(vault, 'p4-selffeed');
+
+      await engine.pullRemoteChanges().catch(() => {});
+      const opened = engine.getBackoffState().pull;
+
+      for (let i = 0; i < 25; i += 1) {
+        await expect(engine.pullRemoteChanges()).rejects.toMatchObject({ code: 'SYNC_SUPPRESSED' });
+      }
+      const after = engine.getBackoffState().pull;
+      expect(after.strikes).toBe(opened.strikes);
+      expect(after.until).toBe(opened.until);
+      expect(vault.calls.list.length).toBe(1);
+    });
+  });
+
+  describe('the credential halt reaches a caller that never runs the cycle', () => {
+    const halting = () => {
+      const base = makeStatefulVault();
+      const state = { reject: true };
+      const err = () => {
+        const e = new Error("batch upsert failed: 401 — the server rejected this device's credential");
+        e.code = 'CREDENTIAL_INVALID'; e.status = 401;
+        return e;
+      };
+      return {
+        ...base, calls: base.calls, rows: base.rows, state,
+        async batch(app, args) { base.calls.batch.push(args.rows); if (state.reject) throw err(); return { written: 1, maxSeq: 1 }; },
+        async list(app, args) { base.calls.list.push(args.since); if (state.reject) throw err(); return { rows: [], hasMore: false }; },
+      };
+    };
+
+    it('a direct push that is rejected SETS the halt, and later direct calls refuse without the wire', async () => {
+      const vault = halting();
+      const engine = dirtyEngine(vault, 'p4-halt');
+
+      // Both halves are needed: a guard over a halt nothing sets never fires.
+      await expect(engine.pushDirtyRows()).rejects.toMatchObject({ code: 'CREDENTIAL_INVALID' });
+      expect(engine.isCredentialHalted()).toBe(true);
+
+      const pushes = vault.calls.batch.length;
+      const lists = vault.calls.list.length;
+      vault.state.reject = false;  // access restored server-side; the halt is terminal anyway
+
+      await expect(engine.pushDirtyRows()).rejects.toMatchObject({ code: 'CREDENTIAL_INVALID' });
+      await expect(engine.pullRemoteChanges()).rejects.toMatchObject({ code: 'CREDENTIAL_INVALID' });
+      expect(vault.calls.batch.length).toBe(pushes);
+      expect(vault.calls.list.length).toBe(lists);
+    });
+
+    it('the halt opens no backoff window (it is terminal, not delayed)', async () => {
+      const vault = halting();
+      const engine = dirtyEngine(vault, 'p4-halt-nowindow');
+      await engine.pushDirtyRows().catch(() => {});
+
+      expect(engine.getBackoffState()).toMatchObject({
+        push: { until: 0, reason: null },
+        pull: { until: 0, reason: null },
+      });
+    });
+
+    it('rows stay dirty under the halt, so nothing is lost if access is restored', async () => {
+      const vault = halting();
+      const engine = dirtyEngine(vault, 'p4-halt-dirty');
+      await engine.pushDirtyRows().catch(() => {});
+      await engine.pushDirtyRows().catch(() => {});
+      expect(engine.getDirtySet()).toContain('mine');
+    });
+  });
+
+  describe('updateDeviceCursor is deliberately the odd one out', () => {
+    it('never throws: it reports a refusal in its return value', async () => {
+      const vault = failingVault();
+      const engine = dirtyEngine(vault, 'p4-cursor-halt');
+      // Halt the device by hand — the point is the cursor's reaction to it.
+      localStorage.setItem(credentialHaltKey('p4-cursor-halt'), JSON.stringify({ message: 'x', at: 'now' }));
+
+      const res = await engine.updateDeviceCursor();
+      expect(res).toEqual({ updated: false, suppressed: true });
+      expect(vault.calls.device.length).toBe(0);
+    });
+
+    it('is NOT suppressed merely because the pull window is open', async () => {
+      // The correction the tests forced: the pull records its own failure, so
+      // the window is already open when the cursor report runs on the very
+      // cycle the pull was attempted. Gating here would silently undo 1.10.0's
+      // decoupling. Whether to report is the caller's composition decision.
+      const vault = failingVault({ pullFails: true });
+      const engine = dirtyEngine(vault, 'p4-cursor-window');
+
+      await engine.pullRemoteChanges().catch(() => {});
+      expect(engine.getBackoffState().pull.until).toBeGreaterThan(Date.now());
+
+      await expect(engine.updateDeviceCursor()).resolves.toMatchObject({ updated: true });
+      expect(vault.calls.device.length).toBe(1);
+    });
+
+    it('never records: a cursor failure cannot open a window', async () => {
+      const base = makeStatefulVault();
+      const vault = {
+        ...base, calls: base.calls, rows: base.rows,
+        async device() { base.calls.device.push({}); throw mk4('VAULT_ERROR', 503); },
+      };
+      const engine = dirtyEngine(vault, 'p4-cursor-norecord');
+
+      await expect(engine.updateDeviceCursor()).resolves.toMatchObject({ updated: false });
+      expect(engine.getBackoffState()).toMatchObject({
+        push: { until: 0, strikes: 0 },
+        pull: { until: 0, strikes: 0 },
+      });
+    });
+  });
+
+  describe('a composed caller inherits all three, without adopting the cycle', () => {
+    it('pull-first ordering still works and is now protected', async () => {
+      // The shape dayGLANCE composes: pull first (structural protection
+      // against its self-nudge seeding loop), then push, then the cursor —
+      // deliberately NOT the package cycle's order. Enforcement must not
+      // require adopting that order.
+      const vault = failingVault({ pullFails: true });
+      const engine = dirtyEngine(vault, 'p4-composed');
+
+      const composedCycle = async () => {
+        const out = { pullSuppressed: false, pushSuppressed: false, error: null };
+        try {
+          await engine.pullRemoteChanges();
+          await engine.pushDirtyRows();
+          await engine.updateDeviceCursor();
+        } catch (err) {
+          if (isSuppressedError(err)) {
+            if (err.direction === 'pull') out.pullSuppressed = true;
+            else out.pushSuppressed = true;
+          } else {
+            out.error = err;
+          }
+        }
+        return out;
+      };
+
+      // Cycle 1: the pull genuinely fails and opens its window.
+      const first = await composedCycle();
+      expect(first.error).toMatchObject({ code: 'VAULT_ERROR' });
+      expect(vault.calls.list.length).toBe(1);
+
+      // Cycle 2 and on: refused by the package, at no cost to the server, and
+      // the caller can tell this apart from a failure without string matching.
+      const second = await composedCycle();
+      expect(second.pullSuppressed).toBe(true);
+      expect(second.error).toBeNull();
+      expect(vault.calls.list.length).toBe(1);
+    });
   });
 });
