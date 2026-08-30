@@ -40,7 +40,13 @@ export type SyncErrorCode =
   // never halts on it. The parsed descriptor rides on the engine's
   // getQuotaState(); the engine suppresses further writes for a bounded,
   // self-resuming window while the pull keeps running.
-  | 'QUOTA_EXCEEDED';
+  | 'QUOTA_EXCEEDED'
+  // DB transport (1.11.0): the module-scope brake is engaged after a real 429,
+  // so this call failed FAST without touching the network. Carries
+  // `status: 429` and `retryInMs`, so any ladder that already treats a real
+  // 429 as transient handles it unchanged. Never a hard stop: the window is
+  // self-expiring and a success both releases it and halves the escalation.
+  | 'RATE_LIMITED';
 
 export type SyncStatus = 'idle' | 'uploading' | 'downloading' | 'success' | 'error';
 
@@ -422,6 +428,23 @@ export interface VaultPulledRow extends Partial<VaultRow> {
   envelope?: string;
 }
 
+/**
+ * One intent event on the wire. `envelope` is OPAQUE to this package — it is
+ * never decoded or inspected; the codec lives in `@glance-apps/intents`.
+ */
+export interface VaultIntentEvent {
+  eventId: string;
+  /** Opaque base64 payload. */
+  envelope: string;
+  /** ISO 8601. */
+  expiresAt: string;
+}
+
+export interface VaultIntentRow extends VaultIntentEvent {
+  seq: number;
+  serverMtime: string;
+}
+
 export interface VaultClient {
   batch(app: string, args: { accountId: string; rows: VaultRow[] }): Promise<{ written: number; maxSeq: number }>;
   list(app: string, args: { accountId: string; since: number }): Promise<{ rows: VaultPulledRow[]; hasMore: boolean }>;
@@ -430,6 +453,10 @@ export interface VaultClient {
   device(app: string, args: { accountId: string; deviceId: string; lastSeenSeq: number }): Promise<{ updated: boolean }>;
   getSalt(accountId: string): Promise<Uint8Array | null>;
   putSalt(accountId: string, salt: Uint8Array): Promise<Uint8Array>;
+  /** Appends intent events. Insert-only: a re-sent eventId is a server no-op. */
+  intentsBatch(accountId: string, events: VaultIntentEvent[]): Promise<{ written: number; maxSeq: number }>;
+  /** Fetches non-expired intent events with seq > since, ascending. One page per call. */
+  intentsList(accountId: string, opts?: { since?: number; limit?: number }): Promise<{ rows: VaultIntentRow[]; hasMore: boolean }>;
 }
 
 export function createVaultClient(config: {
@@ -437,7 +464,85 @@ export function createVaultClient(config: {
   /** Shared device token, or the device's enrolled credential in per-account mode. */
   vaultToken: string;
   fetchImpl?: typeof fetch;
+  /**
+   * Set false to opt this client out of the module-scope brake — it then
+   * neither gates on nor arms it. An escape hatch for tests that need the
+   * wire on every call; production callers should leave it on.
+   * @default true
+   */
+  brake?: boolean;
 }): VaultClient;
+
+// ---------------------------------------------------------------------------
+// Module-scope request diagnostics (1.11.0)
+// ---------------------------------------------------------------------------
+//
+// One brake, one budget meter and one write-loop history per BUNDLE REALM,
+// not per client instance: they model a resource every client in the process
+// shares — the server's per-IP request budget. A separately bundled copy
+// (e.g. an Obsidian plugin) is its own realm, which is correct: separate
+// process, separate traffic.
+
+export interface VaultBrakeStatus {
+  /** Is the brake engaged right now? While engaged, every client call fails fast with RATE_LIMITED. */
+  braked: boolean;
+  /** Epoch ms the current window expires, or null when not braked. */
+  until: number | null;
+  /** Escalation memory. Doubles per 429 burst to a 10-minute ceiling; a success halves it. */
+  memoryMs: number;
+  /** Milliseconds left in the window, 0 when not braked. */
+  retryInMs: number;
+}
+
+export interface VaultWriteLoopSuspect {
+  entityId: string;
+  /** Polarity flips or identical-content rewrites counted inside the window. */
+  transitions: number;
+  /** Whether the loud one-per-window warning has fired for this id. */
+  warned: boolean;
+  history: Array<{ polarity: 'upsert' | 'delete'; at: number; contentHash: string | null }>;
+}
+
+export interface VaultStats {
+  brake: VaultBrakeStatus;
+  requests: {
+    /** Requests that reached the wire in the last rolling minute. */
+    lastMinute: number;
+    softLimitPerMinute: number;
+    /** Attribution by client method name, e.g. { intentsList: 210, batch: 130 }. */
+    byMethod: Record<string, number>;
+    /** Samples dropped by the buffer's hard cap (only ever under-counts a storm). */
+    droppedSamples: number;
+  };
+  writeLoopSuspects: VaultWriteLoopSuspect[];
+}
+
+/** Is the shared brake engaged? For callers that prefer to sit a cycle out pre-flight. */
+export function isVaultRateLimited(): boolean;
+
+/** The brake's full state. */
+export function vaultBrakeStatus(): VaultBrakeStatus;
+
+/** Brake status, per-minute request counts by method, and write-loop suspects in one read. */
+export function getVaultStats(): VaultStats;
+
+/**
+ * Tunes the visibility-only thresholds. The brake's curve is deliberately not
+ * configurable — it protects someone else's server.
+ */
+export function configureVaultDiagnostics(options?: {
+  /** Budget-meter warn threshold. @default 300 */
+  softLimitPerMinute?: number;
+  /** Write-loop K: qualifying transitions before warning. @default 4 */
+  loopTransitions?: number;
+  /** Write-loop M. @default 600000 (10 minutes) */
+  loopWindowMs?: number;
+  /** Console-shaped sink for the diagnostic lines. Defaults to `console`. */
+  logger?: { warn?: (m: string) => void; info?: (m: string) => void; log?: (m: string) => void } | null;
+}): { softLimitPerMinute: number; loopTransitions: number; loopWindowMs: number; logger: unknown };
+
+/** Clears the brake, the meter and the write history, and restores the defaults. For tests. */
+export function resetVaultDiagnostics(): void;
 
 // Per-account auth (vault Phase 1.4b).
 

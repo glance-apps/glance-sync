@@ -158,6 +158,68 @@ Pass `encryptionEnabled: true` in the sync config object stored via `engine.setC
 | `createProviders(config)` | Creates cloud sync provider objects (`nextcloud`, `koofr`, `webdav`). |
 | `normalizeEtag(raw)` | Normalizes a raw ETag header value for If-Match use: strips a weak-validator prefix (`W/"abc"` → `"abc"`) and the content-coding suffixes some servers append inside the quotes (`"abc-gzip"` / `"abc-br"` → `"abc"`). Quotes are preserved; `null`/`undefined` pass through unchanged. |
 
+### GLANCEvault client
+
+| Export | Description |
+|--------|-------------|
+| `createVaultClient(config)` | HTTP client for a GLANCEvault server. `config` is `{ vaultUrl, vaultToken, fetchImpl?, brake? }`. Every method carries the Bearer token, classifies errors uniformly (`CREDENTIAL_INVALID`, `QUOTA_EXCEEDED`, `RATE_LIMITED`, else `VaultError` with `.status`), and passes through the module-scope brake and budget meter. |
+| `fetchVaultHealth(config)` | Unauthenticated `GET /healthz`. Returns `{ status, version, schemaVersion, authMode }`, with `authMode` normalized to `'shared'` on servers that predate the field. |
+| `enrollVaultDevice(config)` | Exchanges the admin-configured bootstrap secret for this device's own credential (`POST /enroll`). The credential is returned once and never again. |
+
+**`VaultClient` methods:**
+
+| Method | Description |
+|--------|-------------|
+| `batch(app, { accountId, rows })` | Upserts rows (`{ entityId, envelope, createdAt }`). Returns `{ written, maxSeq }`. |
+| `list(app, { accountId, since })` | One page of rows with `seq > since`. Returns `{ rows, hasMore }`. |
+| `getRow(app, entityId, accountId)` | Fetches one row; `null` on 404. |
+| `deleteRow(app, entityId, accountId, opts?)` | Soft-deletes a row. `opts.deletedAt` (epoch ms) stamps the tombstone for delete-vs-edit LWW. |
+| `device(app, { accountId, deviceId, lastSeenSeq })` | Updates this device's cursor. |
+| `getSalt(accountId)` / `putSalt(accountId, salt)` | Reads/registers the account root-key salt as a `Uint8Array` (first-write-wins). |
+| `intentsBatch(accountId, events)` | Appends intent events (`{ eventId, envelope, expiresAt }`) via `POST /intents/batch`. **Insert-only** — a re-sent `eventId` is a server no-op, so retrying an ambiguous failure is safe. Returns `{ written, maxSeq }`. |
+| `intentsList(accountId, { since, limit })` | One ascending page of non-expired intent events with `seq > since` via `GET /intents/list`. Returns `{ rows, hasMore }`; the server pages at 500. |
+
+The intents surface is **pure transport**: the `envelope` is opaque here and is
+never decoded or inspected. The codec (and the per-envelope key derivation it
+needs) stays in `@glance-apps/intents` — see `deriveKeyForSalt` above.
+
+### Request diagnostics
+
+One brake, one budget meter and one write-loop history per **bundle realm** —
+not per client instance. They model a resource every client in the process
+shares: the server's per-IP request budget. A separately bundled copy of this
+package (an Obsidian plugin, say) is its own realm, which is correct — it is a
+separate process with its own traffic.
+
+| Export | Description |
+|--------|-------------|
+| `isVaultRateLimited()` | `true` while the brake is engaged. For callers that would rather sit a whole cycle out pre-flight than fire a call and catch the rejection. |
+| `vaultBrakeStatus()` | `{ braked, until, memoryMs, retryInMs }`. |
+| `getVaultStats()` | The brake status, the last rolling minute of requests attributed by method, and the entityIds whose write history looks loop-shaped. |
+| `configureVaultDiagnostics(options?)` | Tunes the visibility-only thresholds (`softLimitPerMinute`, `loopTransitions`, `loopWindowMs`) and the log sink. The brake's curve is deliberately not configurable. |
+| `resetVaultDiagnostics()` | Clears all three and restores the defaults. For tests. |
+
+**The brake.** Any real 429 pauses *every* vault request in the realm: 30s,
+doubling per burst to a 10-minute ceiling, with one arming per burst. While
+paused, calls fail fast — before touching the network — with a `VaultError`
+carrying `status: 429`, `code: 'RATE_LIMITED'` and `retryInMs`, so retry
+ladders that already treat a real 429 as transient need no new code. A 2xx
+releases the pause but only **halves** the escalation memory, so the next 429
+re-arms at the storm's level; a genuine recovery drains to zero in a few quiet
+successes. An over-quota 429 (`QUOTA_EXCEEDED`) is not a limiter hit and does
+not arm it. `createVaultClient({ brake: false })` opts a client out of both the
+gate and the arming — an escape hatch for tests.
+
+**The budget meter and the write-loop detector** are visibility only; neither
+ever throttles. The meter logs one attributable line per minute when a realm
+crosses a soft threshold (default 300/min, half the server's default per-IP
+budget). The detector keeps a bounded per-`entityId` write history across
+`batch` upserts and `deleteRow` and warns once per id per window when one id
+flips polarity (or is rewritten with identical content) four times inside ten
+minutes. It fails open by construction: the rule needs repeated events on the
+*same* id, so a first sync or a large import — many different ids — can never
+trigger it.
+
 ### Auto-backup
 
 | Export | Description |

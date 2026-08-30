@@ -7,6 +7,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-08-30
+
+**Should you take this release?** Yes if you use the GLANCEvault transport, and
+immediately if anything in your bundle writes to it on a timer. This release is
+the client-side answer to a 2026-08-30 incident in which an intent-cleanup loop
+in the dayGLANCE Obsidian plugin deleted rows that were already tombstones. The
+server re-tombstoned on every call — fresh seq, fresh SSE nudge — which put the
+row back above the caller's cursor and fed the loop its own output. It ran for
+hours and saturated the server's per-IP rate budget, and it was **invisible**:
+every delete was fire-and-forget behind a `.catch(() => {})`, so nothing failed
+loudly enough to notice. Two patches landed elsewhere (the plugin no longer
+deletes tombstones; the vault's `softDeleteRow` is now idempotent). This release
+adds the protection and the visibility **by construction**, so no caller has to
+remember them and no loop can be silent. No server changes: the wire contract is
+untouched.
+
+### Added
+
+- **The intents transport.** `intentsBatch(accountId, events)` and
+  `intentsList(accountId, { since, limit })` wrap the server's existing
+  `/intents/*` endpoints, so apps can drop their hand-rolled raw-fetch
+  transports and inherit this client's auth, error classification, brake and
+  meter. `intentsBatch` is insert-only server-side — a re-sent `eventId` is a
+  no-op — so retrying an ambiguous failure is safe by construction.
+  - **Pure transport**: the `envelope` is opaque here and is never decoded or
+    inspected. The codec, and the per-envelope key derivation it needs, stays
+    in `@glance-apps/intents`; this package carries the transport without
+    carrying the crypto.
+- **A device-wide request brake.** Any real 429 now pauses *every* vault
+  request in the bundle realm: 30s, doubling per burst to a 10-minute ceiling,
+  one arming per burst (a concurrent fan-out that all meets the limiter costs
+  one escalation step, not ten). While paused, calls fail fast — **before
+  touching the network** — with a `VaultError` carrying `status: 429`,
+  `code: 'RATE_LIMITED'` and `retryInMs`.
+  - It is at **module scope, not per client instance**, deliberately: the thing
+    it protects is shared by every client in the process (the server's per-IP
+    budget), so the state that models it belongs to the realm. A separately
+    bundled copy — the Obsidian plugin's, say — is its own realm, which is
+    correct: separate process, separate traffic.
+  - **Decay, never amnesty.** A 2xx releases the pause but only *halves* the
+    escalation memory (below the 30s base it drains to zero). This is the fix
+    for the earlier app-side brake, which reset escalation to zero on *any*
+    success: on a saturated shared budget an occasional cheap request slips
+    into a fresh limiter window and returns 200, and each lucky 200 wiped the
+    whole 30s→480s escalation and re-licensed full cadence. Halving keeps the
+    storm's level in memory — the next 429 re-arms at 2× what is left — while a
+    genuine recovery still drains to nothing in a few quiet successes.
+  - Reads: `isVaultRateLimited()` and `vaultBrakeStatus()`, for callers that
+    prefer to sit a whole cycle out pre-flight. Escape hatch:
+    `createVaultClient({ brake: false })` opts a client out of both the gate
+    and the arming.
+- **A budget meter.** Requests are counted per rolling minute and attributed by
+  method name. Crossing a soft threshold (default 300/min — half the server's
+  default per-IP budget, configurable) logs **one** line per window naming the
+  top contributors: `[vault] budget: 412 requests in the last minute (soft
+  limit 300) — top: intentsList 210, batch 130, deleteRow 72`. Visibility only;
+  it never throttles. Its whole argument is that it needs no theory about *why*
+  a loop is running, so the next storm is an attributed event on day one rather
+  than an afternoon of archaeology.
+- **A write-loop detector — the success-side signal.** Failure visibility
+  already existed; what was missing on the day was the signal for everything
+  "succeeding" pathologically. The client now keeps a bounded per-`entityId`
+  history across `batch` upserts and `deleteRow`, and warns loudly (once per id
+  per window) when one id flips polarity, or is rewritten with identical
+  content, four times inside ten minutes. Diagnostic only — never a brake.
+  - **Fails open by construction**: the rule needs repeated events on the
+    *same* id, so a first sync or a large import — many different ids, one
+    event each — can never trigger it, however large.
+  - Both thresholds are tunable via `configureVaultDiagnostics`. Four
+    transitions means five events (upsert/delete/upsert/delete/upsert), which
+    no human edit pattern produces and every delete/resupply loop produces
+    within seconds; ten minutes is long enough to catch a loop running on a
+    60s sync cycle and short enough that a week of ordinary edits never
+    accumulates into it.
+- `getVaultStats()` returns all three in one read: brake status, the last
+  rolling minute of requests by method, and the current write-loop suspects.
+  `configureVaultDiagnostics(options)` tunes the visibility-only thresholds and
+  the log sink; `resetVaultDiagnostics()` clears everything (for tests).
+
+### Changed
+
+- Every `createVaultClient` method now passes through the brake and the meter.
+  The only behaviour change a healthy caller can observe is the new
+  `RATE_LIMITED` rejection while a window is open — and only after the server
+  has already answered a real 429.
+- A **429 arms the brake only when it is a rate-limiter hit**, never when it is
+  an over-quota rejection. The server uses 429 for both and they call for
+  opposite handling: a limiter hit means "stop asking for a while" (exactly
+  what the brake does), while a quota rejection means the account is full,
+  clears only when an operator acts, and already has its own self-resuming
+  window in the DB engine. Gating on it would hide `QUOTA_EXCEEDED` and its
+  descriptor behind `RATE_LIMITED` and leave apps unable to render "X of Y
+  used". The quota shape is recognised as narrowly as before, so anything that
+  is not unmistakably a quota body is treated as a limiter hit.
+
+### Notes
+
+- **Not gated**: `fetchVaultHealth` and `enrollVaultDevice`. Both are
+  pre-credential, user-initiated, one-shot calls — `/healthz` is the
+  unauthenticated probe you reach for *while* diagnosing a stuck client, and
+  refusing it during a braked window would take away the diagnostic just when
+  it is wanted.
+- **For lastGLANCE / lifeGLANCE**: safe to take at leisure (semver-minor).
+  During a braked window, client calls fail fast with `VaultError { status:
+  429, code: 'RATE_LIMITED' }` instead of hitting the wire; any ladder that
+  already treats a real 429 as transient — they all do — handles it unchanged.
+  The meter and the write-loop warnings come along for free.
+- An AES-GCM envelope carries a fresh random IV, so identical plaintext does
+  not produce an identical envelope: for encrypted payloads it is the polarity
+  flip that fires the detector, and the identical-content rule covers plaintext
+  and deterministic payloads.
+
 ## [1.10.0] - 2026-08-01
 
 **Should you take this release?** Yes, for any deployment using the database
