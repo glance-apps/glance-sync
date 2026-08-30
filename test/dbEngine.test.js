@@ -1770,7 +1770,13 @@ describe('backoff: the classes that must NOT be delayed', () => {
   });
 });
 
-describe('backoff: the pull cursor advances per page', () => {
+describe("backoff: the pull cursor advances per page ('per-page' mode)", () => {
+  // MOVED BY PHASE 4b, deliberately and visibly. This suite pinned the 1.10.0
+  // per-page advance as the engine's DEFAULT. Per-page is now an opt-in mode,
+  // because it is only correct for a caller whose applyRemoteEntity is durable
+  // on return, so the engine below declares it. The scenario, the assertions
+  // and the invariant are otherwise untouched: this still pins that a failure
+  // on a later page keeps the progress of the pages already applied.
   it('a failure on a later page keeps the progress of the pages already applied', async () => {
     // Three pages; the third throws. Before the per-page advance, the cursor
     // stayed at 0 and pages 1-2 were re-downloaded forever on a flaky link.
@@ -1799,7 +1805,10 @@ describe('backoff: the pull cursor advances per page', () => {
       async batch() { return { written: 1, maxSeq: 1 }; },
     };
 
-    const { engine, local } = makeEngine({ vault, config: { storageKeyPrefix: 'pagecursor' } });
+    const { engine, local } = makeEngine({
+      vault,
+      config: { storageKeyPrefix: 'pagecursor', pullCursorCommit: 'per-page' },
+    });
     const result = await engine.sync();
 
     expect(result.pullFailed).toBe(true);
@@ -2141,6 +2150,195 @@ describe('Phase 4a: the primitives enforce their own protections', () => {
       expect(second.pullSuppressed).toBe(true);
       expect(second.error).toBeNull();
       expect(vault.calls.list.length).toBe(1);
+    });
+  });
+});
+
+// ══════════ Phase 4b: the pull-cursor durability contract ══════════
+//
+// The package-side twin of dayGLANCE's dbPullPagination.test.js, which exists
+// specifically to fail without its cursor rollback.
+//
+// The bug this closes is data-loss class, not a missing feature. Since 1.10.0
+// the cursor advanced per page on the assumption that an applied row is
+// durable when applyRemoteEntity returns — true for a caller writing straight
+// into a store, false for one applying into a per-cycle mirror it discards on
+// failure. For the second kind, rows below the advanced cursor are consumed,
+// never committed, never re-listed by an incremental pull, and unreachable by
+// a glitch heal. The assumption lived in a source comment; the config contract
+// said nothing. It is now declared, validated, and safe by default.
+
+describe('Phase 4b: the pull-cursor durability contract', () => {
+  // Three pages of two rows each; the third list call throws. The rows of
+  // pages 1 and 2 have been handed to applyRemoteEntity when it blows up —
+  // whether that is safe to record is exactly what the mode declares.
+  const makePagedVault = () => {
+    const base = makeStatefulVault();
+    const state = { failOnListCall: 3, listCalls: 0 };
+    return {
+      ...base, calls: base.calls, rows: base.rows, state,
+      async list(app, args) {
+        base.calls.list.push(args.since);
+        state.listCalls += 1;
+        if (state.listCalls === state.failOnListCall) {
+          throw Object.assign(new Error('list failed: 503'), { code: 'VAULT_ERROR', status: 503 });
+        }
+        const page = state.listCalls === 1
+          ? [await pagedRow('p1a', 1), await pagedRow('p1b', 2)]
+          : [await pagedRow('p2a', 3), await pagedRow('p2b', 4)];
+        return { rows: page, hasMore: true };
+      },
+    };
+  };
+  const pagedRow = async (entityId, seq) => ({
+    entityId,
+    envelope: await encryptEntity({ id: entityId, lastModified: '2026-01-01T00:00:00Z' }, entityId),
+    createdAt: Date.now(), seq, deleted: false,
+  });
+
+  const engineIn = (mode, prefix, vault) => makeEngine({
+    vault,
+    config: { storageKeyPrefix: prefix, ...(mode === undefined ? {} : { pullCursorCommit: mode }) },
+  });
+
+  describe('one scenario, three modes: a failure on page 3', () => {
+    it("'per-page' keeps the progress of the completed pages (1.10.0 convergence)", async () => {
+      const vault = makePagedVault();
+      const { engine, local } = engineIn('per-page', 'p4b-perpage', vault);
+
+      await expect(engine.pullRemoteChanges()).rejects.toMatchObject({ code: 'VAULT_ERROR' });
+
+      expect(local.size).toBe(4);              // four rows were applied
+      expect(engine.getHighWaterMark()).toBe(4); // ...and the cursor kept them
+    });
+
+    it("'end-of-pull' (the default) leaves the cursor where the run started", async () => {
+      const vault = makePagedVault();
+      const { engine, local } = engineIn('end-of-pull', 'p4b-endofpull', vault);
+
+      await expect(engine.pullRemoteChanges()).rejects.toMatchObject({ code: 'VAULT_ERROR' });
+
+      // The rows reached applyRemoteEntity — but whether they SURVIVED is the
+      // caller's business, and this mode does not assume they did. Re-pulling
+      // them is idempotent under entity-grain LWW; losing them is not.
+      expect(local.size).toBe(4);
+      expect(engine.getHighWaterMark()).toBe(0);
+    });
+
+    it("'caller' leaves the cursor alone, because nothing was committed", async () => {
+      const vault = makePagedVault();
+      const { engine } = engineIn('caller', 'p4b-caller', vault);
+
+      await expect(engine.pullRemoteChanges()).rejects.toMatchObject({ code: 'VAULT_ERROR' });
+      expect(engine.getHighWaterMark()).toBe(0);
+    });
+
+    it('an omitted mode behaves as end-of-pull: the SAFE path is what you get by saying nothing', async () => {
+      const vault = makePagedVault();
+      const { engine } = engineIn(undefined, 'p4b-default', vault);
+
+      await expect(engine.pullRemoteChanges()).rejects.toMatchObject({ code: 'VAULT_ERROR' });
+      expect(engine.getHighWaterMark()).toBe(0);
+    });
+  });
+
+  describe('a fully successful pull', () => {
+    const cleanVault = async () => {
+      const base = makeStatefulVault();
+      base.rows.set('r1', await pagedRow('r1', 1));
+      base.rows.set('r2', await pagedRow('r2', 2));
+      return base;
+    };
+
+    it.each(['per-page', 'end-of-pull'])('%s advances the cursor', async (mode) => {
+      const vault = await cleanVault();
+      const { engine } = engineIn(mode, `p4b-ok-${mode}`, vault);
+
+      const res = await engine.pullRemoteChanges();
+      expect(res.maxSeq).toBe(2);
+      expect(engine.getHighWaterMark()).toBe(2);
+    });
+
+    it("'caller' hands back maxSeq and writes nothing until the caller commits", async () => {
+      const vault = await cleanVault();
+      const { engine } = engineIn('caller', 'p4b-ok-caller', vault);
+
+      const res = await engine.pullRemoteChanges();
+      expect(res.maxSeq).toBe(2);
+      expect(engine.getHighWaterMark()).toBe(0);   // the engine wrote nothing
+
+      // No new API is needed: setHighWaterMark is already public, and is what
+      // the caller invokes once its own state is durable.
+      engine.setHighWaterMark(res.maxSeq);
+      expect(engine.getHighWaterMark()).toBe(2);
+
+      // ...and the next pull resumes from there.
+      await engine.pullRemoteChanges();
+      expect(vault.calls.list[vault.calls.list.length - 1]).toBe(2);
+    });
+
+    it("'caller' mode still converges through dbSyncCycle: the cycle commits on a clean cycle", async () => {
+      // Otherwise the mode would be a footgun aimed at the caller who read the
+      // docs most carefully: declare 'caller', keep using dbSyncCycle, and
+      // re-pull the whole backlog forever.
+      const vault = await cleanVault();
+      const { engine } = engineIn('caller', 'p4b-cycle-caller', vault);
+
+      await engine.sync();
+      expect(engine.getHighWaterMark()).toBe(2);
+      expect(engine.getLastSynced()).not.toBeNull();
+    });
+
+    it("'caller' mode does NOT commit through a cycle whose push failed", async () => {
+      // Mirrors what a commit-only-on-success composer does: a failed push
+      // means the applied state is discarded, so the cursor must not move.
+      const base = await cleanVault();
+      const vault = {
+        ...base, calls: base.calls, rows: base.rows,
+        async batch(app, args) {
+          base.calls.batch.push(args.rows);
+          throw Object.assign(new Error('batch upsert failed: 503'), { code: 'VAULT_ERROR', status: 503 });
+        },
+      };
+      const local = new Map([['mine', { id: 'mine', lastModified: '2026-01-01T00:00:00Z' }]]);
+      const { engine } = makeEngine({
+        vault, local,
+        config: { storageKeyPrefix: 'p4b-cycle-pushfail', pullCursorCommit: 'caller' },
+      });
+      engine.markDirty('mine');
+
+      const result = await engine.sync();
+      expect(result.pushFailed).toBe(true);
+      expect(engine.getHighWaterMark()).toBe(0);
+    });
+  });
+
+  describe('the mode is refused, not defaulted, when it is not recognised', () => {
+    // A typo silently falling back to a default is precisely the failure this
+    // phase exists to remove: 'perPage' would quietly restore the unsafe
+    // behaviour on a caller trying to opt OUT of it, and nothing would say so
+    // until rows went missing.
+    it.each([
+      ['perPage'], ['per_page'], ['endOfPull'], ['PER-PAGE'], [''], [null], [42], [{}],
+    ])('createDbSyncEngine refuses %o at construction', async (bad) => {
+      expect(() => makeEngine({ config: { storageKeyPrefix: 'p4b-bad', pullCursorCommit: bad } }))
+        .toThrow(/pullCursorCommit must be one of/);
+    });
+
+    it('the message names every valid mode, so the fix is in the error', async () => {
+      let message = '';
+      try {
+        makeEngine({ config: { storageKeyPrefix: 'p4b-bad2', pullCursorCommit: 'perPage' } });
+      } catch (err) { message = err.message; }
+      expect(message).toContain("'end-of-pull'");
+      expect(message).toContain("'per-page'");
+      expect(message).toContain("'caller'");
+      expect(message).toContain('"perPage"');   // and what was actually passed
+    });
+
+    it('an explicitly undefined mode is the default, not a rejection', async () => {
+      expect(() => makeEngine({ config: { storageKeyPrefix: 'p4b-undef', pullCursorCommit: undefined } }))
+        .not.toThrow();
     });
   });
 });

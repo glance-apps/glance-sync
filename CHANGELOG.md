@@ -7,6 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-08-30
+
+> ### ⚠️ ACTION REQUIRED for lastGLANCE and lifeGLANCE
+>
+> **Add `pullCursorCommit: 'per-page'` to your `createDbSyncEngine` config when
+> you take this release.** Without it you lose 1.10.0's mid-pagination resume
+> and silently regain the convergence bug it fixed: a large backlog on a flaky
+> connection re-downloads from the start on every failure instead of resuming
+> from the last good page.
+>
+> It will not look like a config gap. It will look like a network problem,
+> weeks after the bump, and nobody will connect the two. One line prevents it.
+
+**Should you take this release?** Yes, and read this entry before you do — it is
+the only release so far that changes what an existing caller gets **without that
+caller changing any code**.
+
+Since 1.10.0, `pullRemoteChanges` has persisted the pull cursor **per page**, on
+the assumption that a row is durable the moment `applyRemoteEntity` returns.
+That is true for a caller writing straight into its store. It is false for a
+caller applying into a per-cycle mirror it discards on failure
+(commit-only-on-success): those rows are consumed, the cursor advances past
+them, they are never committed, an incremental pull never re-lists them, and a
+glitch heal cannot reach them because they were never in a snapshot. That is
+permanent row loss, and it was demonstrated as such.
+
+The assumption was stated only in a source comment. The config contract
+documenting `applyRemoteEntity` said nothing about durability at all. **A
+caller cannot honour a contract it is never shown** — so it is now a declared,
+validated mode, and the default is the safe one.
+
+### Changed — BREAKING
+
+- **`pullCursorCommit` now controls when the pull cursor is persisted, and it
+  defaults to `'end-of-pull'`.** Previously the engine always behaved as
+  `'per-page'`, with no way to say otherwise.
+
+  | Mode | When the cursor advances | For |
+  |---|---|---|
+  | `'end-of-pull'` **(new default)** | Once, after a fully successful pagination loop | Any caller that has not thought about it |
+  | `'per-page'` | After each completed page — 1.10.0 behaviour | A caller whose apply is durable on return |
+  | `'caller'` | Never; the engine writes nothing | A commit-only-on-success composer |
+
+  Under `'end-of-pull'`, a mid-pagination failure re-pulls from where the run
+  started. Re-applying already-applied rows is idempotent under entity-grain
+  LWW, so the cost is bandwidth; the cost of the old default, for the wrong
+  caller, was rows.
+
+  In `'caller'` mode `pullRemoteChanges` returns `maxSeq` and the caller
+  commits it with `setHighWaterMark` once its own state is durable. No new API
+  was needed — `setHighWaterMark` was already public. `dbSyncCycle` commits for
+  itself on a fully successful cycle, so declaring `'caller'` and continuing to
+  use the cycle still converges.
+
+- **An unrecognised `pullCursorCommit` is REFUSED at construction**, not
+  defaulted. `'perPage'`, `'per_page'` or `'PER-PAGE'` throw with a message
+  naming every valid mode and the value actually passed. A typo silently
+  falling back to a default is precisely the failure this contract exists to
+  remove: it would quietly restore the unsafe behaviour on a caller that was
+  trying to opt out of it.
+
+### Why this is 2.0.0
+
+No API signature changed, and by the letter of this package's old versioning
+note — "breaking changes to the public API or the sync envelope schema" — this
+would have been a minor. That note was too narrow, and has been widened
+(see the README): **a behavioural default that changes what an existing caller
+gets without that caller changing code is breaking**, because the version
+number is the only signal that cannot be skipped. Under-signalling here costs a
+field bug that presents as a flaky connection; over-signalling costs a digit.
+
+### Why the default was flipped, and what argued against it
+
+The default is what the next composed caller inherits by saying nothing, and
+the next composed caller is an Obsidian plugin. Inheriting the unsafe path by
+saying nothing is exactly what put a data-loss bug in front of dayGLANCE.
+
+The alternative was real and was weighed: keep `'per-page'` as the default and
+require an explicit opt-out from callers needing the safe path. It costs the
+shipping consumers nothing and needs no major bump. It loses on the one point
+that matters — the unsafe path stays the thing you get by default — and the
+tiebreaker was sequencing rather than principle: all three consumers are
+touching engine config for 1.12.0 anyway, so the safe default costs them one
+extra line in a change they are already making. Had those landed far apart, the
+decision would have gone the other way.
+
+### Notes
+
+- **dayGLANCE's cursor rollback stays.** It covers two loss windows and
+  `'end-of-pull'` closes only the first. The second — the pull succeeded but a
+  later step (push, heal, commit) threw, so the mirror was discarded anyway —
+  is invisible to this package. Only `'caller'` mode closes both, and adopting
+  it is dayGLANCE's call on its own schedule.
+- **Per-page convergence does not come back for dayGLANCE under any mode.** It
+  needs per-page *durable* commits, which an all-or-nothing merge-aware commit
+  does not provide.
+- Not closed here: the cycle-only `syncing` re-entrancy guard (see 1.12.0).
+
 ## [1.12.0] - 2026-08-30
 
 **Should you take this release?** Yes if anything in your app calls
