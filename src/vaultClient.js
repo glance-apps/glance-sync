@@ -89,11 +89,13 @@ const BUDGET_SAMPLE_CAP = 20_000;
 const BUDGET_TOP_N = 3;
 
 // --- The write-loop detector ---
-// K=4 qualifying transitions inside M=10 minutes. A "transition" is a
-// polarity FLIP (upsert->delete or delete->upsert) or an identical-content
-// rewrite, counted between consecutive events for one entityId. K=4 means
-// five events — upsert/delete/upsert/delete/upsert — which no human edit
-// pattern produces and every delete/resupply loop produces within seconds.
+// K=4 redundant writes inside M=10 minutes. A write is redundant when it
+// cannot have changed the row's state from what the previous write to the
+// same entityId left it: a polarity flip, a repeat delete, or an
+// identical-content rewrite (see isRedundantWrite for why each counts). K=4
+// means five events — upsert/delete/upsert/delete/upsert, or five deletes of
+// one tombstone — which no human edit pattern produces and every
+// delete/resupply or re-tombstone loop produces within seconds.
 // M=10min is long enough to catch a slow loop running on a 60s sync cycle
 // and short enough that a week of ordinary edits never accumulates into it.
 // Both are configurable via configureVaultDiagnostics for callers whose
@@ -281,11 +283,8 @@ const meterRecord = (label) => {
 const writeHistory = new Map(); // entityId -> { events: [...], warnedAt }
 
 // FNV-1a over a bounded prefix. Cheap enough to run on every row of every
-// batch, and only ever used to spot an IDENTICAL rewrite. Note that an
-// AES-GCM envelope carries a fresh random IV, so identical plaintext does NOT
-// produce an identical envelope: for encrypted payloads the polarity flip is
-// the signal that fires, and the content check catches the plaintext and
-// deterministic-payload cases. Never decoded, only hashed.
+// batch, and only ever used to spot an IDENTICAL rewrite (see
+// isRedundantWrite). Never decoded, only hashed.
 const hashContent = (value) => {
   if (typeof value !== 'string' || value === '') return null;
   const span = value.length > 4096 ? value.slice(0, 4096) : value;
@@ -297,15 +296,44 @@ const hashContent = (value) => {
   return `${value.length}:${(h >>> 0).toString(36)}`;
 };
 
+/**
+ * Is this consecutive pair of writes to one entityId REDUNDANT — a write that
+ * cannot have changed the row's state from what the previous write left it?
+ *
+ * Three shapes qualify, and the third is the founding incident's:
+ *
+ *  1. A POLARITY FLIP (upsert -> delete or delete -> upsert). The
+ *     write-flip / delete-and-resupply loop.
+ *  2. An IDENTICAL-CONTENT REWRITE (upsert -> upsert, same content). Note
+ *     that an AES-GCM envelope carries a fresh random IV, so identical
+ *     plaintext does NOT produce an identical envelope: this rule fires for
+ *     plaintext and deterministic payloads, while shape 1 covers encrypted
+ *     ones.
+ *  3. A REPEAT DELETE (delete -> delete). Re-deleting a row that is already
+ *     a tombstone is redundant by definition — and it is exactly the loop
+ *     this detector was built for: the Obsidian plugin's cleanup called
+ *     deleteRow on rows that were already tombstones, the server re-tombstoned
+ *     each time with a fresh seq, and that pushed the row back above the
+ *     caller's cursor to be deleted again. Same polarity every time, no
+ *     content at all, so neither of the first two rules sees it. A detector
+ *     that misses its own origin story is not a detector.
+ *
+ * A bounded retry of one failed delete does not reach K on its own; a ladder
+ * that retries the same delete K times inside the window is itself worth
+ * knowing about, and is the same shape as the incident.
+ */
+const isRedundantWrite = (prev, cur) => {
+  if (prev.polarity !== cur.polarity) return true;
+  if (prev.polarity === 'delete') return true;
+  return prev.contentHash != null && prev.contentHash === cur.contentHash;
+};
+
 const countTransitions = (events, now) => {
   const cutoff = now - diagnosticsConfig.loopWindowMs;
   const recent = events.filter((e) => e.at >= cutoff);
   let transitions = 0;
   for (let i = 1; i < recent.length; i += 1) {
-    const prev = recent[i - 1];
-    const cur = recent[i];
-    if (prev.polarity !== cur.polarity) transitions += 1;
-    else if (prev.polarity === 'upsert' && prev.contentHash != null && prev.contentHash === cur.contentHash) transitions += 1;
+    if (isRedundantWrite(recent[i - 1], recent[i])) transitions += 1;
   }
   return transitions;
 };
@@ -344,7 +372,7 @@ const noteWrite = (entityId, polarity, envelope) => {
   rec.warnedAt = now;
   diagLog(
     'warn',
-    `[vault] WRITE LOOP? entity ${entityId}: ${transitions} polarity flips or identical rewrites in the last ${Math.round(diagnosticsConfig.loopWindowMs / 60_000)} min — ${renderHistory(rec.events)}`
+    `[vault] WRITE LOOP? entity ${entityId}: ${transitions} redundant writes (polarity flips, repeat deletes or identical rewrites) in the last ${Math.round(diagnosticsConfig.loopWindowMs / 60_000)} min — ${renderHistory(rec.events)}`
   );
 };
 

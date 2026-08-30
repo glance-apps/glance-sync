@@ -70,17 +70,24 @@ untouched.
   already existed; what was missing on the day was the signal for everything
   "succeeding" pathologically. The client now keeps a bounded per-`entityId`
   history across `batch` upserts and `deleteRow`, and warns loudly (once per id
-  per window) when one id flips polarity, or is rewritten with identical
-  content, four times inside ten minutes. Diagnostic only — never a brake.
+  per window) when four **redundant** writes to one id land inside ten minutes.
+  Diagnostic only — never a brake.
+  - A write is redundant when it cannot have changed the row's state from what
+    the previous write to that id left it. Three shapes qualify: a **polarity
+    flip** (the delete-and-resupply loop), a **repeat delete** (re-deleting a
+    row that is already a tombstone — the incident's own shape: same polarity
+    every time, no content at all), and an **identical-content rewrite**.
   - **Fails open by construction**: the rule needs repeated events on the
-    *same* id, so a first sync or a large import — many different ids, one
-    event each — can never trigger it, however large.
-  - Both thresholds are tunable via `configureVaultDiagnostics`. Four
-    transitions means five events (upsert/delete/upsert/delete/upsert), which
-    no human edit pattern produces and every delete/resupply loop produces
-    within seconds; ten minutes is long enough to catch a loop running on a
-    60s sync cycle and short enough that a week of ordinary edits never
-    accumulates into it.
+    *same* id, so a first sync, a large import, or a bulk cleanup deleting many
+    different ids — many ids, one event each — can never trigger it, however
+    large. A bounded retry of one failed delete does not reach the threshold
+    either.
+  - Both thresholds are tunable via `configureVaultDiagnostics`. Four redundant
+    writes means five events (upsert/delete/upsert/delete/upsert, or five
+    deletes of one tombstone), which no human edit pattern produces and every
+    delete/resupply or re-tombstone loop produces within seconds; ten minutes
+    is long enough to catch a loop running on a 60s sync cycle and short enough
+    that a week of ordinary edits never accumulates into it.
 - `getVaultStats()` returns all three in one read: brake status, the last
   rolling minute of requests by method, and the current write-loop suspects.
   `configureVaultDiagnostics(options)` tunes the visibility-only thresholds and

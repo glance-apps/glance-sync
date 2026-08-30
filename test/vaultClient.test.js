@@ -838,7 +838,7 @@ describe('the write-loop detector', () => {
     await upsert('note-1');                // 4 flips
     expect(loopLines()).toHaveLength(1);
     expect(loopLines()[0]).toContain('note-1');
-    expect(loopLines()[0]).toContain('4 polarity flips');
+    expect(loopLines()[0]).toContain('4 redundant writes');
     expect(loopLines()[0]).toContain('upsert -> delete -> upsert -> delete -> upsert');
 
     // At most once per id per window, however long the loop runs.
@@ -859,6 +859,60 @@ describe('the write-loop detector', () => {
     for (let i = 0; i < 5; i += 1) await upsert('note-2', 'the-very-same-envelope');
     expect(loopLines()).toHaveLength(1);
     expect(loopLines()[0]).toContain('note-2');
+  });
+
+  // ── The founding incident's own shape ──
+  //
+  // The 2026-08-30 loop was not a flip and had no content: it was deleteRow
+  // -> deleteRow -> deleteRow on ONE entityId, the plugin re-deleting a row
+  // that was already a tombstone while the server re-seq'd it back above the
+  // caller's cursor. Same polarity every time. A detector that misses its own
+  // origin story is not a detector.
+  it('catches the TOMBSTONE LOOP: repeated deletes of one entityId trip it once, loudly', async () => {
+    await remove('ghost-1');
+    await remove('ghost-1');
+    await remove('ghost-1');
+    expect(loopLines()).toHaveLength(0); // 2 redundant writes: not a loop yet
+
+    await remove('ghost-1');
+    await remove('ghost-1');             // 5 deletes = 4 redundant writes = K
+
+    expect(loopLines()).toHaveLength(1);
+    expect(loopLines()[0]).toContain('ghost-1');
+    expect(loopLines()[0]).toContain('4 redundant writes');
+    expect(loopLines()[0]).toContain('delete -> delete -> delete -> delete -> delete');
+
+    // The loop runs on: still exactly one line for this window.
+    for (let i = 0; i < 20; i += 1) await remove('ghost-1');
+    expect(loopLines()).toHaveLength(1);
+
+    const suspect = getVaultStats().writeLoopSuspects.find((s) => s.entityId === 'ghost-1');
+    expect(suspect).toMatchObject({ warned: true });
+    expect(suspect.history.every((e) => e.polarity === 'delete')).toBe(true);
+  });
+
+  it('a redundant delete is counted even when the server answers 404 (the row really is gone)', async () => {
+    const notFound = createVaultClient({
+      vaultUrl: 'https://vault.example',
+      vaultToken: 'tok',
+      fetchImpl: async () => jsonResponse(404, { error: 'not found' }),
+    });
+    for (let i = 0; i < 5; i += 1) expect(await notFound.deleteRow('app', 'ghost-2', 'a')).toBeNull();
+    expect(loopLines()).toHaveLength(1);
+    expect(loopLines()[0]).toContain('ghost-2');
+  });
+
+  it('FAILS OPEN: a bulk cleanup deleting many DIFFERENT ids never triggers it', async () => {
+    for (let i = 0; i < 500; i += 1) await remove(`cleanup-${i}`);
+    expect(loopLines()).toHaveLength(0);
+    expect(getVaultStats().writeLoopSuspects).toEqual([]);
+  });
+
+  it('FAILS OPEN: a bounded retry of one delete does not reach the threshold', async () => {
+    await remove('flaky-1');
+    await remove('flaky-1');
+    await remove('flaky-1'); // 2 redundant writes, K is 4
+    expect(loopLines()).toHaveLength(0);
   });
 
   it('FAILS OPEN: a big import of many DIFFERENT ids never triggers it', async () => {

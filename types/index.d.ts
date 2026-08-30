@@ -496,7 +496,10 @@ export interface VaultBrakeStatus {
 
 export interface VaultWriteLoopSuspect {
   entityId: string;
-  /** Polarity flips or identical-content rewrites counted inside the window. */
+  /**
+   * Redundant writes counted inside the window: polarity flips, repeat
+   * deletes of an already-deleted row, or identical-content rewrites.
+   */
   transitions: number;
   /** Whether the loud one-per-window warning has fired for this id. */
   warned: boolean;
@@ -533,7 +536,7 @@ export function getVaultStats(): VaultStats;
 export function configureVaultDiagnostics(options?: {
   /** Budget-meter warn threshold. @default 300 */
   softLimitPerMinute?: number;
-  /** Write-loop K: qualifying transitions before warning. @default 4 */
+  /** Write-loop K: redundant writes to one entityId before warning. @default 4 */
   loopTransitions?: number;
   /** Write-loop M. @default 600000 (10 minutes) */
   loopWindowMs?: number;

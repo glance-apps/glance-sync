@@ -214,11 +214,14 @@ gate and the arming — an escape hatch for tests.
 ever throttles. The meter logs one attributable line per minute when a realm
 crosses a soft threshold (default 300/min, half the server's default per-IP
 budget). The detector keeps a bounded per-`entityId` write history across
-`batch` upserts and `deleteRow` and warns once per id per window when one id
-flips polarity (or is rewritten with identical content) four times inside ten
-minutes. It fails open by construction: the rule needs repeated events on the
-*same* id, so a first sync or a large import — many different ids — can never
-trigger it.
+`batch` upserts and `deleteRow` and warns once per id per window when four
+**redundant** writes to one id land inside ten minutes. A write is redundant
+when it cannot have changed the row's state from what the previous write to
+that id left it: a polarity flip, a **repeat delete** (re-deleting a row that
+is already a tombstone — the shape of the incident this was built for), or a
+rewrite with identical content. It fails open by construction: the rule needs
+repeated events on the *same* id, so a first sync, a large import, or a bulk
+cleanup deleting many different ids can never trigger it.
 
 ### Auto-backup
 
