@@ -46,7 +46,14 @@ export type SyncErrorCode =
   // `status: 429` and `retryInMs`, so any ladder that already treats a real
   // 429 as transient handles it unchanged. Never a hard stop: the window is
   // self-expiring and a success both releases it and halves the escalation.
-  | 'RATE_LIMITED';
+  | 'RATE_LIMITED'
+  // DB transport (1.12.0): this engine's OWN gate refused the call, because
+  // the direction's backoff window is open. No request was made. Carries
+  // `suppressed: true`, `direction`, `retryAt` and `retryInMs`. Never a hard
+  // stop and never a failure — a caller with its own retry ladder should
+  // treat it as a scheduled pause and align to `retryAt` rather than
+  // escalating a second cooldown on top of it (see isSuppressedError).
+  | 'SYNC_SUPPRESSED';
 
 export type SyncStatus = 'idle' | 'uploading' | 'downloading' | 'success' | 'error';
 
@@ -715,9 +722,22 @@ export interface DbSyncEngine {
   transportMode: 'database';
   sync(): Promise<DbSyncResult>;
   dbSyncCycle(): Promise<DbSyncResult>;
+  /**
+   * Pushes the dirty set. Enforces the push backoff window and the credential
+   * halt for EVERY caller (1.12.0), not only dbSyncCycle: rejects with
+   * `SYNC_SUPPRESSED` while the window is open and with `CREDENTIAL_INVALID`
+   * while the device is halted, in both cases without touching the network.
+   */
   pushDirtyRows(): Promise<{ written: number; deleted: number; maxSeq: number }>;
+  /** As pushDirtyRows, against the pull window. */
   pullRemoteChanges(): Promise<DbSyncResult & { maxSeq: number; appliedRemote: boolean }>;
-  updateDeviceCursor(): Promise<{ updated: boolean }>;
+  /**
+   * Best-effort cursor report. Never throws and never opens a window. Halted
+   * devices report nothing and get `{ updated: false, suppressed: true }`;
+   * deliberately NOT gated on the pull window, because whether a given cycle
+   * has anything to report is the caller's composition decision.
+   */
+  updateDeviceCursor(): Promise<{ updated: boolean; suppressed?: boolean }>;
   ensureRootKey(): Promise<void>;
 
   markDirty(entityId: string): void;
@@ -774,6 +794,32 @@ export interface DbSyncEngine {
 }
 
 export function createDbSyncEngine(config: DbSyncEngineConfig): DbSyncEngine;
+
+/**
+ * True when an error is the engine's own gate refusing a call (`SYNC_SUPPRESSED`)
+ * rather than anything the server said.
+ *
+ * For callers that keep their own retry ladder or circuit breaker: treating a
+ * suppression as a failure is how two independent brakes compound, each
+ * looking correct in isolation while the device waits far longer than either
+ * intends. Branch on this (or on `err.suppressed`) and align to `err.retryAt`.
+ */
+export function isSuppressedError(err: unknown): boolean;
+
+/** The shape of a `SYNC_SUPPRESSED` rejection. */
+export interface SyncSuppressedError extends Error {
+  code: 'SYNC_SUPPRESSED';
+  suppressed: true;
+  /** Which half was refused. */
+  direction: 'push' | 'pull';
+  /** Why the window is open. */
+  reason: 'quota' | 'auth' | 'transport' | null;
+  /** The typed error that opened the window. */
+  causeCode: string | null;
+  /** Epoch ms the window closes. */
+  retryAt: number;
+  retryInMs: number;
+}
 
 /**
  * Package-owned stable device identifier: generated once (crypto.randomUUID)

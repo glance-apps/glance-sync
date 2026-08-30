@@ -102,6 +102,27 @@ export const getOrCreateDeviceId = (storageKeyPrefix) => {
 
 // Storage keys shared between this engine and the connect/recovery flow in
 // vaultConnect.js. Defined once here so the two modules cannot drift.
+/**
+ * True when an error is this engine's own gate refusing a call (Phase 4a),
+ * rather than anything the server said.
+ *
+ * THE POINT OF THIS EXPORT is that a caller with its own retry ladder or
+ * circuit breaker must be able to tell "the package paused me" from "the
+ * request failed" WITHOUT string matching and without hardcoding a code
+ * literal that could drift. Treating a suppression as a failure is how two
+ * independent brakes compound: the app escalates its own cooldown on a pause
+ * the package already scheduled, and the device waits far longer than either
+ * layer intends while each looks correct in isolation.
+ *
+ * A suppressed error carries `retryAt` (epoch ms), so a caller that keeps its
+ * own schedule can ALIGN to this window rather than add a second one to it.
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+export const isSuppressedError = (err) =>
+  !!err && typeof err === 'object' && err.code === 'SYNC_SUPPRESSED';
+
 export const vaultCredentialKey = (storageKeyPrefix) => `${storageKeyPrefix}-vault-credential`;
 export const credentialHaltKey = (storageKeyPrefix) => `${storageKeyPrefix}-db-sync-credential-halt`;
 
@@ -354,6 +375,13 @@ export const createDbSyncEngine = (config) => {
     const code = err && err.code;
     if (code === 'PASSPHRASE_REQUIRED' || code === 'ACCOUNT_ID_REQUIRED') return null;
     if (code === 'CREDENTIAL_INVALID') return null;
+    // SYNC_SUPPRESSED is this engine's OWN gate refusing a call (Phase 4a). It
+    // is not evidence about the server — no request was made — so letting it
+    // record a failure would let an open window feed itself: every suppressed
+    // call would extend the window that suppressed it, and a caller polling on
+    // a short interval would never see it close. It must never open, extend or
+    // escalate anything.
+    if (code === 'SYNC_SUPPRESSED') return null;
     // QUOTA_EXCEEDED keeps its own reason so its descriptor keeps surfacing —
     // but it is ONE window, not a second one stacked on a transport window.
     if (code === 'QUOTA_EXCEEDED') return 'quota';
@@ -395,6 +423,69 @@ export const createDbSyncEngine = (config) => {
     const reason = backoffReasonFor(err);
     if (reason) openWindow(w, err, reason, maxSeconds);
     return reason;
+  };
+
+  // ── The gate (Phase 4a) ───────────────────────────────────────────────────
+  //
+  // A primitive called while its window is open fails FAST, before any network
+  // call, with a typed SYNC_SUPPRESSED error. The shape deliberately mirrors
+  // the vault client's RATE_LIMITED (1.11.0): a typed `code`, a boolean the
+  // caller can test without string matching, and a `retryAt` so a caller with
+  // its own scheduler can ALIGN to this window rather than stack a second one
+  // on top of it.
+  //
+  // WHY THROW RATHER THAN RETURN A SKIPPED SHAPE. A return would let a
+  // composed caller that ignores the value treat a suppressed cycle as a
+  // successful one — committing a mirror built from a pull that never ran and
+  // resetting its own breaker on a cycle that did nothing. Throwing converts
+  // the worst failure mode from "silently wrong" to "loudly refused". The
+  // argument the other way is real and was weighed: a return needs no catch,
+  // and a caller that forgets to special-case the code turns a deliberate
+  // pause into what looks like an error. That is the trade — see the PR.
+  const suppressedError = (w, direction) => {
+    const retryInMs = Math.max(0, w.until - Date.now());
+    const err = new Error(
+      `${direction} suppressed: backing off after ${w.code || 'a failure'}` +
+      ` — retrying in ~${Math.ceil(retryInMs / 1000)}s`
+    );
+    err.code = 'SYNC_SUPPRESSED';
+    // Redundant on purpose. `code` is the discriminator; `suppressed` is a
+    // second, cheaper one for a caller whose error handling branches on a
+    // boolean, so nobody has to reach for a string comparison.
+    err.suppressed = true;
+    err.direction = direction;          // 'push' | 'pull'
+    err.reason = w.reason;              // 'quota' | 'auth' | 'transport'
+    err.cause = null;
+    err.causeCode = w.code;             // the typed error that opened the window
+    err.retryAt = w.until;              // epoch ms
+    err.retryInMs = retryInMs;
+    return err;
+  };
+
+  // Throws when the direction's window is open. The single gate: every
+  // network-touching primitive calls it, and nothing else does.
+  const guardWindow = (w, direction) => {
+    if (isOpen(w)) throw suppressedError(w, direction);
+  };
+
+  // Throws when the device is under the credential halt. Enforcement of a
+  // halt has two halves, and a composed caller needs both: refuse to run
+  // while halted (here), and SET the halt when a rejection is seen (in each
+  // primitive's catch, via noteCredentialRejection). Only the pair works —
+  // a guard over a halt nothing sets never fires.
+  //
+  // This is a READ of durable state (localStorage), so unlike the windows it
+  // is safe to check in more than one place: the cycle keeps its own halt
+  // check for the reporting and result shape it owes the app, and this guard
+  // covers every other caller. Idempotent reads cannot compound; only
+  // mutating enforcement had to move to exactly one place.
+  const guardHalt = (context) => {
+    const halt = getCredentialHalt();
+    if (!halt) return;
+    const err = new Error(halt.message || `${context} refused: this device's credential was rejected`);
+    err.code = 'CREDENTIAL_INVALID';
+    err.halted = true;
+    throw err;
   };
 
   // Over-quota state, preserved exactly as 3.3 exposed it: non-null from the
@@ -446,19 +537,37 @@ export const createDbSyncEngine = (config) => {
   // when this instance went inert, { halted } when the device halted — so the
   // cycle result matches what isSuperseded()/isCredentialHalted() report,
   // whichever path the rejection arrived by.
-  const applyCredentialRejection = (err) => {
+  // STATE ONLY (Phase 4a). Split out of applyCredentialRejection so a
+  // primitive can set the halt without also firing the cycle's reporting.
+  // The split is what lets a composed caller — one that never calls
+  // dbSyncCycle — still halt on a rejected credential. The identity rule and
+  // the superseded-inertness decision are untouched; this is only about which
+  // half of the work runs.
+  //
+  // IDEMPOTENT, and it has to be: a primitive notes the rejection on its way
+  // out, and the cycle then reports it through applyCredentialRejection,
+  // which notes it again. setCredentialHalt overwrites with the same message
+  // and isBearerSuperseded is a pure read, so the second note changes
+  // nothing.
+  const noteCredentialRejection = (err) => {
     const message = err?.message || String(err);
-    let outcome;
     if (isBearerSuperseded()) {
       // Replaced by recovery and the app kept a stale reference: go inert in
       // memory — surfaced once, then silent — leaving the shared halt key
       // alone so the recovered engine keeps syncing.
       supersededInert = true;
-      outcome = { superseded: true };
-    } else {
-      setCredentialHalt(message);
-      outcome = { halted: true };
+      return { superseded: true };
     }
+    setCredentialHalt(message);
+    return { halted: true };
+  };
+
+  // STATE + REPORTING. The cycle's path, unchanged in behaviour: it owes the
+  // app an onError/onStatusChange and a truthful result flag, and a primitive
+  // called directly owes none of that.
+  const applyCredentialRejection = (err) => {
+    const message = err?.message || String(err);
+    const outcome = noteCredentialRejection(err);
     onError?.(message, 'CREDENTIAL_INVALID', true);
     onStatusChange?.('error');
     return outcome;
@@ -635,7 +744,7 @@ export const createDbSyncEngine = (config) => {
   // verifyAccountKey, which throws KEY_MISMATCH (before any upsert) if the
   // derived key doesn't match the account — so a device can never upload rows
   // under a non-matching key.
-  const pushDirtyRows = async () => {
+  const pushDirtyRowsUnguarded = async () => {
     const dirty = getDirtySet();
     if (dirty.length === 0) return { written: 0, deleted: 0, maxSeq: getPushAck() };
 
@@ -688,6 +797,49 @@ export const createDbSyncEngine = (config) => {
     clearDirty();
     setPushAck(maxSeq);
     return { written: upserts.length, deleted: deletes.length, maxSeq };
+  };
+
+  /**
+   * The push, with its protections attached (Phase 4a).
+   *
+   * Every caller gets the halt, the window and the window bookkeeping —
+   * dbSyncCycle and a hand-composed cycle alike. The cycle no longer checks
+   * or records anything for the push; it reads the result of what happened
+   * here. See the module note on delegation.
+   */
+  const pushDirtyRows = async () => {
+    // The guards sit INSIDE the try on purpose. A suppressed error then takes
+    // the same path out as any other failure and passes through
+    // recordFailure — where the SYNC_SUPPRESSED do-not-delay rule is what
+    // stops an open window from feeding itself. Guarding outside the try
+    // would make that rule unreachable defensive code, and a later change
+    // that produced a suppression deeper in the call could silently start
+    // extending the window that caused it. (The negative control at
+    // scripts/verify-phase-4a.mjs found exactly this: with the guards
+    // outside, removing the rule broke nothing.)
+    try {
+      guardHalt('push');
+      guardWindow(pushBackoff, 'push');
+      const result = await pushDirtyRowsUnguarded();
+      // Any success resets the window and its strike count, exactly as the
+      // file tier does. For a quota window this is also what clears the
+      // over-quota state: the operator acted, and no client action was
+      // needed or taken.
+      clearWindow(pushBackoff);
+      return result;
+    } catch (err) {
+      // A rejected credential is noted (not reported) here, so a caller that
+      // never runs the cycle still halts. recordFailure then classifies it as
+      // do-not-delay and opens nothing, exactly as the cycle's path did.
+      // `err.halted` marks an error raised by guardHalt from the STORED halt,
+      // as opposed to a fresh rejection from the server. Re-noting the former
+      // would keep rewriting the halt's timestamp on every refused call, so
+      // "when the credential was rejected" would drift into "when we last
+      // refused a call".
+      if (err && err.code === 'CREDENTIAL_INVALID' && !err.halted) noteCredentialRejection(err);
+      recordFailure(pushBackoff, err, MAX_PUSH_BACKOFF_S);
+      throw err;
+    }
   };
 
   // Decrypts and applies one row with entity-grain LWW. Mutates the supplied
@@ -788,7 +940,7 @@ export const createDbSyncEngine = (config) => {
   // wrong key has aborted with KEY_MISMATCH before we get here; any decrypt
   // failure now is an INDIVIDUAL bad row. Such a row is counted, quarantined,
   // and its cursor advanced past — it must never throw and wedge the cycle.
-  const pullRemoteChanges = async () => {
+  const pullRemoteChangesUnguarded = async () => {
     await ensureRootKey();
 
     let since = getHighWaterMark();
@@ -848,6 +1000,25 @@ export const createDbSyncEngine = (config) => {
     return { maxSeq, appliedRemote, applied, skipped, skippedEntityIds };
   };
 
+  /**
+   * The pull, with its protections attached (Phase 4a). Same contract as the
+   * guarded push above.
+   */
+  const pullRemoteChanges = async () => {
+    // Guards inside the try — see pushDirtyRows for why.
+    try {
+      guardHalt('pull');
+      guardWindow(pullBackoff, 'pull');
+      const result = await pullRemoteChangesUnguarded();
+      clearWindow(pullBackoff);
+      return result;
+    } catch (err) {
+      if (err && err.code === 'CREDENTIAL_INVALID' && !err.halted) noteCredentialRejection(err);
+      recordFailure(pullBackoff, err, MAX_PULL_BACKOFF_S);
+      throw err;
+    }
+  };
+
   // ── Step 3: update device cursor ──────────────────────────────────────────
   // Best-effort: a failure here only affects tombstone GC timing, never sync
   // correctness, so it is swallowed. lastSeenSeq reports the pull cursor (what
@@ -855,6 +1026,36 @@ export const createDbSyncEngine = (config) => {
   // progress is the conservative value for server-side tombstone GC, since it
   // never lets the server reclaim a tombstone this device has not yet seen.
   const updateDeviceCursor = async () => {
+    // THE THIRD PRIMITIVE IS DELIBERATELY DIFFERENT (Phase 4a): halt-gated,
+    // NOT window-gated, never recording, and never throwing.
+    //
+    // It never throws because it never has. Callers await it mid-cycle inside
+    // their own try blocks (dayGLANCE does, at dbEngine.js:839, before its
+    // commit), so a best-effort call that suddenly threw would abort cycles
+    // that today shrug this off — and in dayGLANCE's case trigger a cursor
+    // rollback. Suppression is reported in the RETURN value instead.
+    //
+    // It never records because a failure here only affects tombstone GC
+    // timing. It is not evidence that sync is failing, so it must not be able
+    // to open or extend a window.
+    //
+    // IT IS NOT GATED ON THE PULL WINDOW, and this is the one place the Phase
+    // 4a design review got it wrong before the tests corrected it. Once the
+    // pull records its own failure, the pull window is ALREADY OPEN by the
+    // time the cycle reaches this call — so a window gate here would suppress
+    // the cursor report on the very cycle the pull was attempted, silently
+    // undoing the 1.10.0 decoupling ("the cursor report runs whenever the
+    // pull was ATTEMPTED, success or failure"). Whether to report on a given
+    // cycle is a COMPOSITION decision about what just happened, which belongs
+    // to the caller; the cycle makes it from its own pullSkipped, and a
+    // composed caller makes its own. Delegation moved enforcement down, not
+    // orchestration.
+    //
+    // What it does enforce is the terminal one: a halted device writes
+    // nothing, from any caller. Rate-limit protection it gets for free from
+    // the vault client's module-scope brake (1.11.0), which fails
+    // vault.device() fast without any window logic here.
+    if (getCredentialHalt()) return { updated: false, suppressed: true };
     try {
       return await vault.device(app, {
         accountId,
@@ -919,45 +1120,43 @@ export const createDbSyncEngine = (config) => {
       // report still happens. The dirty set is untouched by a failed push
       // (pushDirtyRows only clears it on full ack), so backoff changes WHEN
       // rows are retried, never WHETHER they are.
+      // DELEGATED (Phase 4a). The cycle no longer gates and no longer
+      // records: the primitives own both, for every caller. All the cycle
+      // does here is separate "my own gate refused this" from "the server
+      // refused this", because only the second is a failure to report.
+      //
+      // Doing both would DOUBLE the escalation: strikes would increment once
+      // in the primitive and once here, turning the ladder into 30s, 120s,
+      // 480s instead of 30, 60, 120.
       let pushError = null;
       let pushSkipped = false;
-      if (isOpen(pushBackoff)) {
-        pushSkipped = true;
-      } else {
-        try {
-          await pushDirtyRows();
-          // Any success resets the window and its strike count, exactly as the
-          // file tier does. For a quota window this is also what clears the
-          // over-quota state: the operator acted, and no client action was
-          // needed or taken.
-          clearWindow(pushBackoff);
-        } catch (err) {
-          pushError = err;
-          recordFailure(pushBackoff, err, MAX_PUSH_BACKOFF_S);
-        }
+      try {
+        await pushDirtyRows();
+      } catch (err) {
+        if (err && err.code === 'SYNC_SUPPRESSED') pushSkipped = true;
+        else pushError = err;
       }
 
       onStatusChange?.('downloading');
       let pullError = null;
       let pullSkipped = false;
       let pull = { applied: 0, skipped: 0, skippedEntityIds: [] };
-      if (isOpen(pullBackoff)) {
-        pullSkipped = true;
-      } else {
-        try {
-          pull = await pullRemoteChanges();
-          clearWindow(pullBackoff);
-        } catch (err) {
-          pullError = err;
-          recordFailure(pullBackoff, err, MAX_PULL_BACKOFF_S);
-        }
-        // The cursor report runs whenever the pull was ATTEMPTED, success or
-        // failure — that is the 3.3 decoupling applied to the pull. It is
-        // skipped only when the pull itself was skipped, because firing a
-        // write every cycle at a server we are backing off from is the exact
-        // hammering this fix removes.
-        await updateDeviceCursor();
+      try {
+        pull = await pullRemoteChanges();
+      } catch (err) {
+        if (err && err.code === 'SYNC_SUPPRESSED') pullSkipped = true;
+        else pullError = err;
       }
+      // The cursor report runs whenever the pull was ATTEMPTED, success or
+      // failure — the 3.3 decoupling applied to the pull — and is skipped
+      // only when the pull never ran, because firing a write every cycle at a
+      // server we are backing off from is the hammering this removes.
+      //
+      // This is COMPOSITION, not enforcement: the cycle is deciding whether
+      // this cycle has anything to report, which is what a cycle is for. It
+      // reads pullSkipped, which the primitive told it. No window is checked
+      // here and none is written.
+      if (!pullSkipped) await updateDeviceCursor();
 
       // A rejected credential can surface from the push or the pull once the
       // key is verified in-session (ensureRootKey then makes no network call,

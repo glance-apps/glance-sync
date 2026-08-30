@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-08-30
+
+**Should you take this release?** Yes if anything in your app calls
+`pushDirtyRows`, `pullRemoteChanges` or `updateDeviceCursor` directly instead of
+`dbSyncCycle`. Until now the two tiers had unequal safety: the cycle carried
+backoff, over-quota suppression and the credential halt, and the primitives
+beneath it carried none. A caller composing its own cycle silently opted out of
+all three, with no signal that it had. This release moves enforcement down into
+the primitives, so every caller inherits it by construction. **If you only ever
+call `dbSyncCycle`, nothing about this release changes what your app does.**
+
+### Changed
+
+- **The three primitives now enforce their own protections.**
+  `pushDirtyRows` and `pullRemoteChanges` refuse to run while their direction's
+  backoff window is open, rejecting with a typed `SYNC_SUPPRESSED` error
+  *before* any network call, and they open, escalate and clear those windows
+  themselves. Both also refuse while the device is under the credential halt,
+  and both now SET the halt when a rejection reaches them — a guard over a halt
+  that nothing sets never fires, so it took both halves.
+- **`dbSyncCycle` delegates entirely downward.** It no longer checks a window
+  or records a failure; it distinguishes "my own gate refused this" from "the
+  server refused this" and reports as before. Enforcing in both places would
+  have **doubled the escalation** — `strikes` incrementing once in the
+  primitive and once in the cycle turns the ladder into 30s, 120s, 480s instead
+  of 30, 60, 120. The alternative shape (primitives no-op when called from
+  inside the cycle) was rejected: it makes correctness depend on a caller
+  passing a flag, which is the exact defect this release removes, relocated one
+  layer down.
+- **`updateDeviceCursor` is deliberately different**: halt-gated, but *not*
+  window-gated, never recording and never throwing. It reports a refusal as
+  `{ updated: false, suppressed: true }`. It cannot throw because callers await
+  it mid-cycle inside their own try blocks, and it is not window-gated because
+  the pull now records its own failure — so the window is already open by the
+  time the cursor report runs on the very cycle the pull was attempted, and
+  gating there would silently undo 1.10.0's decoupling ("the cursor report runs
+  whenever the pull was ATTEMPTED, success or failure"). Whether a cycle has
+  anything to report is a composition decision that stays with the caller.
+
+### Added
+
+- `SYNC_SUPPRESSED`: the typed rejection from the engine's own gate. It carries
+  `suppressed: true`, `direction` (`'push' | 'pull'`), `reason`, `causeCode`,
+  and `retryAt` / `retryInMs`.
+- `isSuppressedError(err)` — exported so a caller can tell a pause from a
+  failure **without string matching and without hardcoding a code literal**.
+
+### Notes for callers with their own retry ladder or circuit breaker
+
+- **Do not treat `SYNC_SUPPRESSED` as a failure.** This is the one integration
+  hazard in the release. An app that escalates its own cooldown on every thrown
+  error will escalate on a pause this engine already scheduled — two brakes
+  compounding, each correct in isolation, with the device waiting far longer
+  than either layer intends. Branch on `isSuppressedError(err)` (or
+  `err.suppressed`) and align to `err.retryAt` rather than adding a second
+  window on top of it.
+- **This cannot be made structurally impossible from inside the package.** The
+  app owns its breaker and reacts to what it catches; the only way to remove
+  the caller's judgement entirely would be for the package to own the whole
+  retry, which means adopting `dbSyncCycle` — exactly what composed callers
+  compose to avoid. So the signal is made as unmissable as we can: a typed
+  code, a redundant boolean, an exported predicate, and a retry deadline to
+  align to.
+- **Why a throw and not a skipped return value.** A return lets a caller that
+  ignores it treat a suppressed cycle as a successful one — committing state
+  built from a pull that never ran, and resetting its own breaker on a cycle
+  that did nothing. Throwing converts the worst failure mode from "silently
+  wrong" to "loudly refused". The argument the other way is real: a return
+  needs no `catch`, and a caller that forgets to special-case the code turns a
+  deliberate pause into what looks like an error. The `RATE_LIMITED` precedent
+  from 1.11.0 settled it — one shape for "the client refused this", not two.
+- **A direct call that fails now opens a window**, so an immediate retry of a
+  failed primitive is refused rather than re-sent. Retrying after `retryAt` is
+  the supported pattern; this is what the cycle has always done.
+
+### Notes
+
+- **Not closed by this release** (reported, deliberately unfixed): the
+  `syncing` re-entrancy guard is still cycle-only, so a composed caller can
+  overlap primitive calls. See the PR for what that does and why it is a
+  different shape of problem from the two this release addresses.
+- The cursor durability contract is Phase 4b and lands separately.
+
 ## [1.11.0] - 2026-08-30
 
 **Should you take this release?** Yes if you use the GLANCEvault transport, and
