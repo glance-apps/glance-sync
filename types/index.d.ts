@@ -904,3 +904,136 @@ export function recoverVaultSyncEngine(
   enrolled: true;
   deviceId: string;
 }>;
+
+// ---------------------------------------------------------------------------
+// Snapshot-file cycle (2.1.0): iCloud, Direct Access
+// ---------------------------------------------------------------------------
+
+/** How a transport's read is classified (classifySnapshotText). */
+export type SnapshotRead =
+  | { kind: 'absent' }
+  | { kind: 'downloading' }
+  | { kind: 'unparseable' }
+  | { kind: 'error'; error: string }
+  | { kind: 'snapshot'; remote: Record<string, unknown> };
+
+export function classifySnapshotText(text: string | null | undefined): SnapshotRead;
+
+export interface SnapshotFileTransport {
+  /** For log lines. */
+  id?: string;
+  read(): Promise<string | null>;
+  write(text: string): Promise<boolean>;
+  /** The storage key this transport stamps on every real read (the seed guard's "has synced before"). */
+  lastSyncedKey: string;
+  /** Has the user answered the first-run restore prompt. */
+  firstRunDecided(): boolean;
+  writeThrottleMs: number;
+  /** May an undecryptable envelope be overwritten with plaintext (iCloud: yes, a legacy cleanup; a folder: never). */
+  allowsPlaintextReseed: boolean;
+  /** The per-device switch that seeds and upgrades the file as an envelope. */
+  encryptsWrites?(): boolean;
+}
+
+export interface SnapshotFileIo {
+  buildSyncPayload(): { version: number; lastModified?: string; data: Record<string, unknown> };
+  applyEngineData(data: Record<string, unknown>, opts: { allowEmpty: boolean }): void;
+  mergeSyncData(local: Record<string, unknown>, remote: Record<string, unknown>, retentionDays: number): {
+    data: Record<string, unknown>;
+    localChanged: boolean;
+    remoteChanged: boolean;
+    /** Slices every device keeps its own value of; left out of the write question. */
+    deviceLocalKeys?: string[];
+  };
+  syncRetentionDays: number;
+  isEncryptedEnvelope(value: unknown): boolean;
+  decryptData(envelope: unknown): Promise<Record<string, unknown>>;
+  /** Plaintext payload to envelope; required when a transport encrypts or an envelope is read. */
+  encryptData?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+  /** Can encryptData succeed now (a key or the passphrase is in memory). */
+  encryptionReady?(): boolean;
+  /** What the transport actually writes, from the plaintext payload (a strip of slices the file must not carry). */
+  outgoing?(payload: Record<string, unknown>): Record<string, unknown>;
+  storage: Pick<Storage, 'getItem' | 'setItem'>;
+  /** When this device itself last changed its data (ISO); absent: every change is relayed. */
+  lastLocalEditAt?(): string | null;
+  /** Stamped with the time of every apply, for the app's other engines. */
+  localModifiedKey?: string;
+  /** How many items the app's own store holds (the empty-state guard). */
+  localItemCount?(): number;
+  /** Does a payload carry anything worth restoring (default payloadHasData). */
+  hasData?(data: Record<string, unknown>): boolean;
+  /** Stamped as `writtenBy` in the file header; ranks this device's relay. */
+  deviceId?: string | (() => string);
+  now?(): number;
+  log?: Pick<Console, 'warn' | 'error'>;
+}
+
+export interface SnapshotFileState {
+  missingSince: number;
+  lastWriteAt: number;
+  lastWrittenAt?: number;
+  pendingWrite?: { fingerprint: string; at: number } | null;
+}
+
+export type SnapshotFileOutcome =
+  | { kind: 'skipped'; reason: 'missing-grace' | 'empty-state-guard' | 'downloading' | 'unparseable' | 'no-data' | 'key-needed' }
+  | { kind: 'skipped'; reason: 'encrypted-unreadable'; needsKey: boolean }
+  | { kind: 'seeded'; wrote: boolean }
+  | { kind: 'reseeded'; wrote: boolean }
+  | { kind: 'error'; reason: 'unavailable'; error: string }
+  | { kind: 'prompted'; info: { taskCount: number; inboxCount: number; lastModified: string | null; data: Record<string, unknown> } }
+  | { kind: 'merged'; localChanged: boolean; remoteChanged: boolean; applied: boolean; wrote: boolean; deferred: boolean; ownEdits: boolean; keyNeeded: boolean };
+
+/**
+ * One cycle of snapshot-file sync over an injected transport: the seed guard,
+ * the first-run prompt, the content gate, the made-here-or-relayed rule with
+ * relays staggered by writer rank, and the envelope rules (the file decides,
+ * the switch decides the first write). See src/snapshotFileSync.js.
+ */
+export function runSnapshotFileCycle(args: {
+  transport: SnapshotFileTransport;
+  io: SnapshotFileIo;
+  state: SnapshotFileState | null | undefined;
+}): Promise<{ state: Required<SnapshotFileState>; outcome: SnapshotFileOutcome }>;
+
+export const RELAY_CONFIRM_MS: number;
+export const RELAY_STAGGER_MS: number;
+export const MISSING_GRACE_MS: number;
+
+export function evaluateMissingSnapshot(s?: { hasSyncedBefore?: boolean; missingSince?: number; now?: number; graceMs?: number }): { skip: boolean; missingSince: number };
+export function shouldPromptFirstRun(s?: { decided?: boolean; remoteHasData?: boolean; localHasData?: boolean; available?: boolean }): boolean;
+export function payloadHasData(data: unknown): boolean;
+
+/** The relay rule: write once the same fingerprint has been seen for `waitMs`; a different one starts over. */
+export function relayDecision(
+  pending: { fingerprint: string; at: number } | null,
+  fingerprint: string,
+  now: number,
+  waitMs?: number,
+): { write: boolean; pending: { fingerprint: string; at: number } };
+/** RELAY_CONFIRM_MS plus RELAY_STAGGER_MS per writer that sorts before this device among those seen. */
+export function relayWaitMs(storage: Pick<Storage, 'getItem'>, key: string, self: string | null): number;
+export function noteWriter(storage: Pick<Storage, 'getItem' | 'setItem'>, key: string, writer: unknown): boolean;
+export function readWriters(storage: Pick<Storage, 'getItem'>, key: string): string[];
+
+/** A slice-level difference between two snapshot data objects. */
+export interface SliceDiff { key: string; kind: string; summary: string }
+export function canonicalJson(value: unknown): string;
+export function describeSliceDiff(key: string, merged: unknown, other: unknown): SliceDiff | null;
+export function sliceDiffs(a: Record<string, unknown> | null | undefined, b: Record<string, unknown> | null | undefined, opts?: { ignoreDropped?: boolean; ignoreKeys?: Iterable<string> }): SliceDiff[];
+export function writeWorthy(diffs: SliceDiff[]): SliceDiff[];
+export const PER_MERGE_STAMPS: string[];
+export function explainSnapshotMerge(args: {
+  local: Record<string, unknown>;
+  remote: Record<string, unknown>;
+  retentionDays: number;
+  merge: SnapshotFileIo['mergeSyncData'];
+  outgoing?: (data: Record<string, unknown>) => Record<string, unknown>;
+}): {
+  localChanged: boolean; remoteChanged: boolean;
+  fileDiffs: SliceDiff[]; deviceDiffs: SliceDiff[];
+  wouldWrite: boolean; wouldApply: boolean;
+  writeFlagWithoutDiff: boolean; applyFlagWithoutDiff: boolean; flagWithoutDiff: boolean;
+  error: string | null;
+};

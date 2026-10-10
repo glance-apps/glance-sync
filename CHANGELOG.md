@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-10-11
+
+### Added
+
+- **The snapshot-file sync cycle** (`runSnapshotFileCycle`), moved here from
+  dayGLANCE so every GLANCE app's iCloud and Direct Access tiers run one
+  cycle. A snapshot-file transport is a local file something else ferries
+  between devices (an iCloud container, a Nextcloud / Drive / Dropbox /
+  Syncthing folder): no server, no ETag. The cycle reads the whole file,
+  merges it with local state, applies what changed locally, and writes the
+  merged result back, with every data-safety guard the dayGLANCE loop grew
+  on devices: the seed guard (`evaluateMissingSnapshot`), the empty-state
+  guard, the first-run restore prompt (`shouldPromptFirstRun`), the content
+  gate (a write needs a real difference, not just a merge flag), the
+  made-here-or-relayed rule with relays staggered by writer rank
+  (`relayDecision`, `relayWaitMs`, `noteWriter`, `readWriters`), the write
+  throttle, and the envelope rules (the file decides, the switch decides the
+  first write; a wanted envelope with no key ready is held, never written
+  plaintext). Pure over an injected transport and `io`; the app's storage
+  keys and any strip of slices the file must not carry come in through `io`
+  (`localModifiedKey`, `lastLocalEditAt`, `localItemCount`, `hasData`,
+  `outgoing`). The read classification is `classifySnapshotText`.
+- **The slice comparison** the cycle decides writes and applies with
+  (`sliceDiffs`, `describeSliceDiff`, `writeWorthy`, `canonicalJson`,
+  `explainSnapshotMerge`), so an app's diagnostics can run the identical
+  function the cycle runs.
+
+No existing export changes. dayGLANCE's local copies become wrappers over
+these; lastGLANCE's Direct Access tier (its Phase 7b) builds on them.
+
 ## [2.0.0] - 2026-08-30
 
 > ### ⚠️ ACTION REQUIRED for lastGLANCE and lifeGLANCE
