@@ -127,7 +127,8 @@ interface SyncEngine {
   sync(): Promise<void>;
 
   // Trigger upload only (no download). Used after local state changes.
-  upload(): Promise<void>;
+  // Resolves true only when the provider accepted the write.
+  upload(): Promise<boolean>;
 
   // Trigger download+apply only (no upload).
   download(): Promise<void>;

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-10-11
+
+### Fixed
+
+- **A `download()` cycle whose upload fails no longer reports success.**
+  `upload()` reported and then swallowed every failure except 412, so when
+  it ran inside `download()` (seeding an empty remote, or pushing a merge)
+  the cycle carried on, stamped the last-synced key, called
+  `onLastSyncedChange` and reported `success`. The error showed for five
+  seconds before the auto-revert, and from then on "Last synced" kept
+  advancing on every poll while nothing reached the server. Reported against
+  dayGLANCE (krelltunez/dayGLANCE#2037) with a misconfigured WebDAV folder,
+  but any upload failure did it: 403, 409, 5xx, a refused MKCOL, a network
+  drop that left GET working. The cycle now ends without the last-synced
+  stamp or the success status. The upload's own error report is unchanged.
+  Remote changes are still applied locally when only the upload failed, so a
+  device that can read but not write keeps receiving; the download backoff
+  still resets, because the download half worked.
+- **An upload refused by `validateUploadPayload` inside a cycle** is treated
+  the same way: nothing was written, so the cycle is not a success.
+- **A hard-stopped cycle** (`APP_ID_MISMATCH`, `SCHEMA_FORWARD_INCOMPATIBLE`)
+  no longer falls through to the success bookkeeping after reporting its
+  error.
+
+### Changed
+
+- `engine.upload()` resolves to `true` when the provider accepted the write
+  and `false` otherwise (it resolved to `undefined`). Callers that ignore the
+  result are unaffected.
+
 ## [2.1.0] - 2026-10-11
 
 ### Added

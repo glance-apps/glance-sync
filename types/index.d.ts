@@ -362,7 +362,7 @@ export interface SyncEngine {
     prebuiltPayload?: unknown;
     etag?: string | null;
     skipLockCheck?: boolean;
-  }): Promise<void>;
+  }): Promise<boolean>;
   download(): Promise<void>;
   runBackup(frequency: BackupFrequency): Promise<void>;
   test(config: Record<string, unknown>): Promise<{ success: boolean; error?: string }>;
