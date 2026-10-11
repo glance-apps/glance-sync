@@ -70,6 +70,31 @@ export {
 // from a rejected credential: re-enrollment that rotates the dead credential
 // away server-side.
 export { connectVaultSyncEngine, recoverVaultSyncEngine } from './vaultConnect.js';
+// 2.1.0: the snapshot-file cycle (iCloud, Direct Access) and the slice
+// comparison it decides writes and applies with. Pure over an injected
+// transport; see src/snapshotFileSync.js.
+export {
+  runSnapshotFileCycle,
+  classifySnapshotText,
+  evaluateMissingSnapshot,
+  shouldPromptFirstRun,
+  payloadHasData,
+  relayDecision,
+  relayWaitMs,
+  noteWriter,
+  readWriters,
+  RELAY_CONFIRM_MS,
+  RELAY_STAGGER_MS,
+  MISSING_GRACE_MS,
+} from './snapshotFileSync.js';
+export {
+  canonicalJson,
+  describeSliceDiff,
+  sliceDiffs,
+  writeWorthy,
+  explainSnapshotMerge,
+  PER_MERGE_STAMPS,
+} from './snapshotMergeExplain.js';
 export {
   setupDbRootKey,
   initDbRootKey,

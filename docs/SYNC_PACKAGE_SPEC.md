@@ -379,6 +379,51 @@ Generic WebDAV: `{backupFilenamePrefix}{timestamp}.json` at configured root
 
 ---
 
+## Snapshot-File Cycle (2.1.0)
+
+`runSnapshotFileCycle({ transport, io, state })` is the sync cycle for a file
+that something else ferries between devices: an iCloud container, or a folder
+kept in step by Nextcloud, Google Drive, Dropbox or Syncthing (dayGLANCE's
+Direct Access tier, `docs/direct-access-sync.md` in that repository, is the
+design). There is no server and no ETag, so the cycle is read, merge, apply,
+write, and every data-safety rule lives in the cycle:
+
+- **Seed guard.** An absent file is seeded from local data only once
+  `evaluateMissingSnapshot` says the absence is not a transient eviction (a
+  device that has synced before waits `MISSING_GRACE_MS`), and only when the
+  payload is not an empty copy of a populated store (`io.localItemCount`,
+  `io.hasData`).
+- **Read classification.** `classifySnapshotText`: `absent`, `downloading`
+  (a placeholder, retried), `unparseable` (a half-written file, retried),
+  `error` (surfaced, never merged), `snapshot`.
+- **First-run prompt.** A fresh device facing a populated file is asked
+  (`shouldPromptFirstRun`), not restored; the transport records the answer
+  (`firstRunDecided`). The transport's `lastSyncedKey` is stamped before the
+  prompt, since reading the file is what proves the transport works.
+- **Content gate.** A write needs a merge flag AND a real difference between
+  what would be written and the file (`sliceDiffs`, `writeWorthy`, with the
+  merge's `deviceLocalKeys` left out); an apply needs the flag AND a real
+  difference between the merged data and local state.
+- **Made here, or relayed.** A change this device made (`io.lastLocalEditAt`
+  newer than its last write) goes out at once. Anything else is relayed only
+  after the file has sat unchanged, still lacking it, for `RELAY_CONFIRM_MS`,
+  plus `RELAY_STAGGER_MS` per writer that sorts before this device among the
+  writers it has seen in the file header (`writtenBy`, from `io.deviceId`), so
+  a fleet that received one change together relays it from one device.
+- **Envelopes.** The file decides: a file read as an envelope is written back
+  as one whatever the device's switch says; a plaintext or absent file is
+  written as an envelope when `transport.encryptsWrites()` is on. A wanted
+  envelope with no key ready (`io.encryptionReady`) is held, never written
+  plaintext. An envelope the device cannot open is left alone unless the
+  transport `allowsPlaintextReseed` (iCloud's legacy cleanup).
+- **Outgoing transform.** `io.outgoing(payload)` shapes every write from the
+  plaintext payload (dayGLANCE strips HealthKit counts from its iCloud file);
+  it never touches what is applied locally and runs before any envelope.
+
+The `state` carried between cycles holds the eviction clock, the throttle
+stamp, the last successful write and the pending relay look; the hook that
+owns the poll, the mutex and the prompt UI stays in the app.
+
 ## Concurrency and Locking
 
 A single boolean lock (`isSyncing()`) prevents overlapping sync cycles. If `sync()` is called while a cycle is in progress, it returns immediately with `LOCKED`. The debounce delay in the caller (5 seconds in dayGLANCE) further reduces contention.
