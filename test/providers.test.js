@@ -70,6 +70,24 @@ describe('webdavFetch — transport selection', () => {
     expect(res.headers.get('content-type')).toBeNull();
   });
 
+  it('native path: awaits a bridge that returns a Promise (async bridge)', async () => {
+    const nativeFn = vi.fn(async () => ({
+      status: 207, ok: true, body: '{"a":1}', headers: { etag: '"p1"' },
+    }));
+    const fetch = webdavFetch({ ...BASE_ENGINE, nativeHttpRequest: nativeFn });
+    const res = await fetch('PROPFIND', 'https://h/d/', {});
+    expect(res.status).toBe(207);
+    expect(res.ok).toBe(true);
+    expect(res.headers.get('etag')).toBe('"p1"');
+    expect(await res.json()).toEqual({ a: 1 });
+  });
+
+  it('native path: an async bridge resolving to null still throws', async () => {
+    const nativeFn = vi.fn(async () => null);
+    const fetch = webdavFetch({ ...BASE_ENGINE, nativeHttpRequest: nativeFn });
+    await expect(fetch('GET', 'https://h/f', {})).rejects.toThrow('Native HTTP bridge unavailable');
+  });
+
   it('native path: throws when nativeHttpRequest returns null', async () => {
     const nativeFn = vi.fn().mockReturnValue(null);
     const fetch = webdavFetch({ ...BASE_ENGINE, nativeHttpRequest: nativeFn });

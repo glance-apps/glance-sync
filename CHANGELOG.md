@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.2] - 2026-10-11
+
+### Fixed
+
+- **`webdavFetch` awaits `nativeHttpRequest`.** The native path called the
+  bridge without `await`, so it only worked with a synchronous bridge, and a
+  synchronous bridge blocks the WebView's JS thread (input and rendering) for
+  the whole request. On Android that froze dayGLANCE for minutes on cold
+  start while a failing sync server timed out
+  (krelltunez/dayGLANCE#2048). The bridge may now return its result or a
+  Promise of it, as `SYNC_PACKAGE_SPEC.md` already documented; the type
+  says so too. A synchronous bridge keeps working unchanged.
+
 ## [2.1.1] - 2026-10-11
 
 ### Fixed

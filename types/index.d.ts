@@ -92,7 +92,7 @@ export type NativeHttpRequest = (
   url: string,
   headers: Record<string, string>,
   body: string | null,
-) => NativeHttpResponse | null;
+) => NativeHttpResponse | null | Promise<NativeHttpResponse | null>;
 
 export type ElectronProxyFetch = (
   method: string,

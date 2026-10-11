@@ -24,7 +24,8 @@ const toBase64 = (str) => btoa(String.fromCharCode(...new TextEncoder().encode(s
  * before deciding whether to pass a function here).
  *
  * @param {object}        config
- * @param {Function|null} config.nativeHttpRequest  - Android bridge fn, or null
+ * @param {Function|null} config.nativeHttpRequest  - Android bridge fn, or null.
+ *   May return its result or a Promise of it; prefer async (see webdavFetch).
  * @param {Function|null} config.electronProxyFetch - Electron proxy fn, or null
  * @param {string}        [config.proxyUrl='']      - base URL for CORS proxy
  */
@@ -40,7 +41,11 @@ export const webdavFetch = (config) => async (method, targetUrl, authHeaders, bo
     if (body !== undefined && body !== null) {
       headers['Content-Type'] = extraHeaders['Content-Type'] || 'application/octet-stream';
     }
-    const result = config.nativeHttpRequest(method, targetUrl, headers, body ?? '');
+    // Awaited: the bridge may return its result or a Promise of it. A
+    // synchronous bridge blocks the WebView's JS thread (input and rendering)
+    // for the whole request, so hosts should supply an async one
+    // (krelltunez/dayGLANCE#2048); awaiting a plain value is harmless.
+    const result = await config.nativeHttpRequest(method, targetUrl, headers, body ?? '');
     if (!result) throw new Error('Native HTTP bridge unavailable');
     return {
       status: result.status,
