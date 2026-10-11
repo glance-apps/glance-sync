@@ -213,17 +213,20 @@ export const createSyncEngine = (config) => {
    * @param {string} [opts.etag]            - If-Match etag for optimistic concurrency.
    * @param {boolean} [opts.skipLockCheck]  - Bypass the in-progress guard (used
    *   when called from within download()'s merge cycle to avoid self-deadlock).
+   * @returns {Promise<boolean>} true only when the provider accepted the write.
+   *   download() reads it: a cycle whose upload did not land must not record
+   *   "last synced" or report success.
    */
   const upload = async ({ prebuiltPayload, etag = null, skipLockCheck = false } = {}) => {
-    if (hardStopped) return;
+    if (hardStopped) return false;
     const cfg = getConfig();
-    if (!cfg?.enabled) return;
+    if (!cfg?.enabled) return false;
     if (!skipLockCheck && syncing) {
       pendingFollowup = true;
-      return;
+      return false;
     }
     const provider = providers[cfg.provider];
-    if (!provider) return;
+    if (!provider) return false;
 
     if (!skipLockCheck) syncing = true;
     const t0 = Date.now();
@@ -239,7 +242,7 @@ export const createSyncEngine = (config) => {
           // eslint-disable-next-line no-console
           console.error(`[${appId}] cloud sync upload aborted:`, check?.reason || 'validation failed');
           onStatusChange?.('idle');
-          return;
+          return false;
         }
       }
 
@@ -258,6 +261,7 @@ export const createSyncEngine = (config) => {
       onLastSyncedChange?.(now);
       onStatusChange?.('success');
       scheduleAutoRevert('success', SUCCESS_HOLD_MS);
+      return true;
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error(`[${appId}] cloud sync upload error:`, err);
@@ -267,7 +271,7 @@ export const createSyncEngine = (config) => {
         // When download() is the caller, it handles the 412 retry itself. Bubble.
         if (skipLockCheck) throw err;
         onStatusChange?.('idle');
-        return;
+        return false;
       }
 
       if (cls.code === 'AUTH_FAILURE') {
@@ -282,6 +286,7 @@ export const createSyncEngine = (config) => {
       onError?.(formatErrorMessage(cls), cls.code, cls.isHardStop);
       onStatusChange?.('error');
       scheduleAutoRevert('error', ERROR_HOLD_MS);
+      return false;
     } finally {
       if (!skipLockCheck) syncing = false;
     }
@@ -311,16 +316,23 @@ export const createSyncEngine = (config) => {
 
     let conflictShown = false;
     let passphraseRequired = false;
+    // Set when a cycle's upload did not land (it failed, or validation refused
+    // it). upload() has already reported it, so the cycle ends without stamping
+    // "last synced" or reporting success: a device whose writes never reach the
+    // server must not look synced. Remote changes are still applied locally,
+    // as before, so a device that can read but not write keeps receiving.
+    let uploadFailed = false;
 
     // Inner helper: download, merge, apply, upload (if anything changed).
     // Returns true if a reload was triggered (caller should bail).
     // skipIfMatch forces an unconditional upload (no If-Match) — the
     // last-writer-wins fallback used after two consecutive 412s.
     const doCycle = async (overrideEtag, { skipIfMatch = false } = {}) => {
+      uploadFailed = false;
       const downloaded = await provider.download(cfg);
       if (!downloaded) {
         // Empty remote — seed it with local state.
-        await upload({ skipLockCheck: true });
+        if (!(await upload({ skipLockCheck: true }))) uploadFailed = true;
         return false;
       }
       const { payload: remoteRaw, etag } = downloaded;
@@ -364,11 +376,12 @@ export const createSyncEngine = (config) => {
         };
         // Upload first — if this throws (e.g. 412 PRECONDITION_FAILED), the
         // local DB must remain untouched so the retry starts from clean state.
-        await upload({
+        const uploaded = await upload({
           prebuiltPayload: mergedPayload,
           skipLockCheck: true,
           etag: skipIfMatch ? null : (etag || overrideEtag || null),
         });
+        if (!uploaded) uploadFailed = true;
 
         if (localChanged) {
           let mayApply = true;
@@ -398,8 +411,13 @@ export const createSyncEngine = (config) => {
       const reloaded = await doCycle(null);
       if (reloaded || conflictShown) return;
 
+      // A hard stop (foreign or newer envelope) has already reported its
+      // error; it is not a successful cycle either.
+      if (hardStopped) return;
+      // The download half worked, so its backoff resets either way.
       downloadErrorCount = 0;
       downloadBackoffUntil = 0;
+      if (uploadFailed) return;
       const elapsed = Date.now() - t0;
       if (elapsed < MIN_SYNC_DURATION_MS) {
         await new Promise(r => setTimeout(r, MIN_SYNC_DURATION_MS - elapsed));

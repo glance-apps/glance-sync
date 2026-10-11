@@ -483,3 +483,94 @@ describe('createSyncEngine — last-synced persistence', () => {
     expect(localStorage.getItem('test-cloud-sync-last-synced')).toBeTruthy();
   });
 });
+
+// A download() cycle whose upload did not land used to stamp "last synced" and
+// report success anyway: upload() swallowed every non-412 failure, so a device
+// whose writes never reached the server looked synced forever (dayGLANCE #2037).
+describe('createSyncEngine — a cycle whose upload fails is not a success', () => {
+  const remoteEnvelope = {
+    schemaVersion: 1, appId: 'test-app', version: 2,
+    lastModified: '2026-01-02T00:00:00Z',
+    data: { tasks: [{ id: 'r', lastModified: '2026-01-02T00:00:00Z' }] },
+  };
+  const PREVIOUS = '2026-01-01T00:00:00.000Z';
+
+  it('seeding an empty remote: a failed upload leaves last-synced unset and reports the error', async () => {
+    vi.useFakeTimers();
+    const { engine, calls } = makeEngine({
+      provider: makeFakeProvider({ download: null, uploadError: new Error('Upload failed: 409 Conflict') }),
+    });
+    const p = engine.download();
+    await vi.advanceTimersByTimeAsync(3000);
+    await p;
+    expect(localStorage.getItem('test-cloud-sync-last-synced')).toBe(null);
+    expect(calls.lastSynced).toEqual([]);
+    expect(calls.statusChanges.map(c => c.s)).not.toContain('success');
+    expect(calls.statusChanges.map(c => c.s)).toContain('error');
+    expect(calls.errors.length).toBeGreaterThan(0);
+    vi.useRealTimers();
+  });
+
+  it('merge cycle: a failed upload keeps the previous last-synced but still applies remote changes', async () => {
+    vi.useFakeTimers();
+    const { engine, calls } = makeEngine({
+      provider: makeFakeProvider({ download: remoteEnvelope, etag: 'e1', uploadError: new Error('Upload failed: 500 Internal Server Error') }),
+      mergeResult: { data: remoteEnvelope.data, localChanged: true, remoteChanged: true },
+    });
+    localStorage.setItem('test-cloud-sync-last-synced', PREVIOUS);
+    const p = engine.download();
+    await vi.advanceTimersByTimeAsync(3000);
+    await p;
+    expect(localStorage.getItem('test-cloud-sync-last-synced')).toBe(PREVIOUS);
+    expect(calls.lastSynced).toEqual([]);
+    expect(calls.statusChanges.map(c => c.s)).not.toContain('success');
+    // A device that can read but not write keeps receiving.
+    expect(calls.applyPayload).toHaveLength(1);
+    // The download half worked, so only the upload backs off.
+    expect(engine.getDownloadBackoffUntil()).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it('merge cycle: an upload refused by validateUploadPayload is not a success either', async () => {
+    vi.useFakeTimers();
+    const { engine, fakeProvider, calls } = makeEngine({
+      provider: makeFakeProvider({ download: remoteEnvelope, etag: 'e1' }),
+      mergeResult: { data: remoteEnvelope.data, localChanged: false, remoteChanged: true },
+      validateUploadPayload: () => ({ valid: false, reason: 'test refusal' }),
+    });
+    localStorage.setItem('test-cloud-sync-last-synced', PREVIOUS);
+    const p = engine.download();
+    await vi.advanceTimersByTimeAsync(3000);
+    await p;
+    expect(fakeProvider.upload).not.toHaveBeenCalled();
+    expect(localStorage.getItem('test-cloud-sync-last-synced')).toBe(PREVIOUS);
+    expect(calls.statusChanges.map(c => c.s)).not.toContain('success');
+    vi.useRealTimers();
+  });
+
+  it('a hard-stopped cycle does not stamp last-synced or report success', async () => {
+    const { engine, calls } = makeEngine({
+      provider: makeFakeProvider({
+        download: { schemaVersion: 1, appId: 'other-app', version: 2, lastModified: 'x', data: { tasks: [] } },
+      }),
+    });
+    localStorage.setItem('test-cloud-sync-last-synced', PREVIOUS);
+    await engine.download();
+    expect(localStorage.getItem('test-cloud-sync-last-synced')).toBe(PREVIOUS);
+    expect(calls.statusChanges.map(c => c.s)).not.toContain('success');
+  });
+
+  it('control: a cycle whose upload lands still stamps last-synced and reports success', async () => {
+    vi.useFakeTimers();
+    const { engine, calls } = makeEngine({
+      provider: makeFakeProvider({ download: remoteEnvelope, etag: 'e1' }),
+      mergeResult: { data: remoteEnvelope.data, localChanged: false, remoteChanged: true },
+    });
+    localStorage.setItem('test-cloud-sync-last-synced', PREVIOUS);
+    const p = engine.download();
+    await vi.advanceTimersByTimeAsync(5000);
+    await p;
+    expect(localStorage.getItem('test-cloud-sync-last-synced')).not.toBe(PREVIOUS);
+    expect(calls.statusChanges.map(c => c.s)).toContain('success');
+  });
+});
