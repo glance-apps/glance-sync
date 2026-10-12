@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A network failure during key verification is no longer reported as
+  `VERIFIER_UNSUPPORTED`.** `verifyAccountKey` relabelled every error from
+  its verifier fetch, other than a few typed ones, as "Your GLANCEvault
+  server needs to be updated", including requests that never got an answer
+  (the fetch threw, a native bridge returned nothing) and transient answers
+  (status 0, 408, 429, 502-504). An iOS dayGLANCE build whose every request
+  failed told its user to update a server that was fine
+  (krelltunez/dayGLANCE#2068). Those errors now pass through and the cycle
+  reports and backs off them as the transport failures they are.
+  `VERIFIER_UNSUPPORTED` still covers any other HTTP answer, 500 included.
+  `allowUnverified` no longer waves a network failure through.
+
 ## [2.1.2] - 2026-10-11
 
 ### Fixed
