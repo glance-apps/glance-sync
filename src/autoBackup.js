@@ -4,8 +4,45 @@ import { webdavFetch } from './providers.js';
 // btoa() throws InvalidCharacterError for codepoints > 255 (CJK, emoji, etc.).
 const toBase64 = (str) => btoa(String.fromCharCode(...new TextEncoder().encode(str)));
 
+// Backup ids are `auto-<frequency>-<ISO timestamp>` (saveBackup below), so a
+// record's frequency and timestamp can be read from its key alone. Listing and
+// pruning rely on that to work from keys and never load a backup's `data`:
+// with dozens of retained copies of a multi-megabyte payload, reading every
+// record just to decide which few to delete was a memory spike on every
+// backup (krelltunez/dayGLANCE#2144).
+const ID_PATTERN = /^auto-(hourly|daily|weekly)-(\d{4}-\d{2}-\d{2}T[\d:.]+Z)$/;
+
+function parseBackupId(id) {
+  const m = typeof id === 'string' ? id.match(ID_PATTERN) : null;
+  return m ? { id, frequency: m[1], timestamp: m[2] } : null;
+}
+
+// SHA-256 of the payload's JSON, or null where WebCrypto is unavailable (then
+// nothing is deduplicated: a missing fingerprint never matches).
+async function fingerprintOf(data) {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) return null;
+  try {
+    const bytes = new TextEncoder().encode(JSON.stringify(data));
+    const digest = new Uint8Array(await subtle.digest('SHA-256', bytes));
+    return Array.from(digest, b => b.toString(16).padStart(2, '0')).join('');
+  } catch {
+    return null;
+  }
+}
+
+const request = (req) => new Promise((resolve, reject) => {
+  req.onsuccess = () => resolve(req.result);
+  req.onerror = () => reject(req.error);
+});
+
 /**
  * Creates an IndexedDB-backed auto-backup store.
+ *
+ * Version 2 adds the `fingerprints` store: per frequency, the id and content
+ * fingerprint of the last deduped backup saved, so an unchanged payload is not
+ * stored again (saveBackup's opt-in dedupe). Version 1 databases upgrade in
+ * place; their backups are untouched.
  *
  * @param {object} config
  * @param {string} config.autoBackupDBName   - IDB database name (e.g. 'dayglance-auto-backups')
@@ -17,7 +54,7 @@ export function createAutoBackupDB(config) {
     async open() {
       if (this._db) return this._db;
       return new Promise((resolve, reject) => {
-        const req = indexedDB.open(config.autoBackupDBName, 1);
+        const req = indexedDB.open(config.autoBackupDBName, 2);
         req.onupgradeneeded = (e) => {
           const db = e.target.result;
           if (!db.objectStoreNames.contains('backups')) {
@@ -25,23 +62,64 @@ export function createAutoBackupDB(config) {
             store.createIndex('timestamp', 'timestamp', { unique: false });
             store.createIndex('frequency', 'frequency', { unique: false });
           }
+          if (!db.objectStoreNames.contains('fingerprints')) {
+            db.createObjectStore('fingerprints', { keyPath: 'frequency' });
+          }
         };
         req.onsuccess = () => { this._db = req.result; resolve(req.result); };
         req.onerror = () => reject(req.error);
       });
     },
-    async saveBackup(frequency, data) {
+    /**
+     * Save `data` as a backup of `frequency`.
+     *
+     * Opt-in dedupe: with a `fingerprint`, or `dedupe: true`, a payload
+     * identical to the last backup of that frequency that still exists is not
+     * stored again. Backups exist to capture change, not the clock. It is
+     * opt-in because it changes what a caller's retention keeps (the last N
+     * distinct states rather than the last N ticks), and a changed default is
+     * a major version under this package's versioning rules.
+     *
+     * Options:
+     *   fingerprint — the caller's own content fingerprint. Pass one when the
+     *     payload carries fields that change on every build (an export
+     *     timestamp), so they do not defeat the comparison. Implies dedupe.
+     *   dedupe — true compares a SHA-256 of the whole payload when no
+     *     fingerprint is given. Default: true when a fingerprint is passed,
+     *     false otherwise.
+     *
+     * Resolves to the saved record, or, when skipped, to
+     * `{ id, timestamp, frequency, skipped: true }` describing the existing
+     * backup that already holds this content. A save without dedupe clears
+     * the frequency's recorded fingerprint, so a later deduped save compares
+     * against the newest backup, never an older one.
+     */
+    async saveBackup(frequency, data, { fingerprint, dedupe = fingerprint !== undefined } = {}) {
       const db = await this.open();
+      const print = dedupe ? (fingerprint ?? await fingerprintOf(data)) : null;
+      if (print) {
+        const tx = db.transaction(['fingerprints', 'backups'], 'readonly');
+        const last = await request(tx.objectStore('fingerprints').get(frequency));
+        if (last && last.fingerprint === print) {
+          // Only a backup that still exists counts: one the user deleted
+          // holds nothing, and this content must be saved again.
+          const stillThere = await request(tx.objectStore('backups').count(last.id));
+          if (stillThere > 0) return { ...(parseBackupId(last.id) || { id: last.id, frequency }), skipped: true };
+        }
+      }
       const timestamp = new Date().toISOString();
       const id = `auto-${frequency}-${timestamp}`;
       const record = { id, timestamp, frequency, data };
       return new Promise((resolve, reject) => {
-        const tx = db.transaction('backups', 'readwrite');
+        const tx = db.transaction(['backups', 'fingerprints'], 'readwrite');
         tx.objectStore('backups').put(record);
+        if (print) tx.objectStore('fingerprints').put({ frequency, id, fingerprint: print });
+        else tx.objectStore('fingerprints').delete(frequency);
         tx.oncomplete = () => resolve(record);
         tx.onerror = () => reject(tx.error);
       });
     },
+    /** Full records, `data` included. For a list to show, use listBackupMeta. */
     async listBackups(frequency) {
       const db = await this.open();
       return new Promise((resolve, reject) => {
@@ -53,6 +131,25 @@ export function createAutoBackupDB(config) {
         req.onsuccess = () => resolve(req.result.sort((a, b) => b.timestamp.localeCompare(a.timestamp)));
         req.onerror = () => reject(req.error);
       });
+    },
+    /**
+     * `{ id, timestamp, frequency }` for each backup, newest first, read from
+     * the keys: no backup's `data` is loaded. A record whose id does not follow
+     * saveBackup's format (none should) is read individually for its fields.
+     */
+    async listBackupMeta(frequency) {
+      const db = await this.open();
+      const tx = db.transaction('backups', 'readonly');
+      const store = tx.objectStore('backups');
+      const ids = await request(frequency ? store.index('frequency').getAllKeys(frequency) : store.getAllKeys());
+      const meta = [];
+      for (const id of ids) {
+        const parsed = parseBackupId(id);
+        if (parsed) { meta.push(parsed); continue; }
+        const record = await request(store.get(id));
+        if (record) meta.push({ id: record.id, timestamp: record.timestamp, frequency: record.frequency });
+      }
+      return meta.sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
     },
     async getBackup(id) {
       const db = await this.open();
@@ -72,8 +169,14 @@ export function createAutoBackupDB(config) {
         tx.onerror = () => reject(tx.error);
       });
     },
+    /**
+     * Keep the newest `maxCount` backups of `frequency` and delete the rest.
+     * Chooses from metadata only (listBackupMeta), so memory stays flat however
+     * large or numerous the backups are. Resolves to the number deleted, or
+     * undefined when there was nothing to prune.
+     */
     async pruneBackups(frequency, maxCount) {
-      const all = await this.listBackups(frequency);
+      const all = await this.listBackupMeta(frequency);
       if (all.length <= maxCount) return;
       const toDelete = all.slice(maxCount);
       const db = await this.open();

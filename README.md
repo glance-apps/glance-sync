@@ -232,6 +232,21 @@ cleanup deleting many different ids can never trigger it.
 | `AUTO_BACKUP_RETENTION` | Default retention limits: `{ hourly: 24, daily: 30, weekly: 12 }`. |
 | `AUTO_BACKUP_INTERVALS` | Interval seconds: `{ hourly: 3600, daily: 86400, weekly: 604800 }`. |
 
+The store returned by `createAutoBackupDB`:
+
+| Method | Description |
+|--------|-------------|
+| `saveBackup(frequency, data, options?)` | Stores `data` as a backup with id `auto-<frequency>-<ISO timestamp>` and resolves to the record. Dedupe is opt-in: pass `{ fingerprint }` (your own content fingerprint) or `{ dedupe: true }` (a SHA-256 of the payload's JSON) and a payload identical to the last backup of that frequency that still exists is not stored again; the call then resolves to `{ id, timestamp, frequency, skipped: true }` for that existing backup. Use a fingerprint when the payload carries a field that changes on every build, such as an export timestamp, or nothing will ever match. |
+| `listBackupMeta(frequency?)` | `{ id, timestamp, frequency }` for each backup, newest first, read from the keys. Loads no payload; use it to render a restore list. |
+| `listBackups(frequency?)` | Full records, payloads included, newest first. Every payload is loaded into memory, so prefer `listBackupMeta` unless you need the data. |
+| `getBackup(id)` | One full record. |
+| `deleteBackup(id)` | Deletes one backup. |
+| `pruneBackups(frequency, maxCount)` | Keeps the newest `maxCount` backups of `frequency` and deletes the rest. Chooses from keys only, so memory stays flat however many or large the backups are. Resolves to the number deleted, or `undefined` when nothing was over the limit. |
+
+**Storage footprint.** Each local backup is a full copy of the payload in IndexedDB, so at the default retention a store can hold up to 66 copies (24 hourly + 30 daily + 12 weekly). Opting into dedupe keeps one copy per distinct state, and retention then counts changes rather than clock ticks. Remote backups are full files too, one per upload, encrypted ones about a third larger (base64). The package does not deduplicate uploads, since only the caller knows what it last uploaded successfully.
+
+The database is at IndexedDB version 2 (2.2.0 added a small `fingerprints` store for dedupe). A version 1 database upgrades in place and keeps its backups.
+
 TypeScript declarations for all of the above are in `types/index.d.ts`.
 
 ## Versioning
