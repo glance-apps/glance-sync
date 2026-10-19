@@ -116,9 +116,9 @@ describe('createAutoBackupDB — CRUD', () => {
 describe('createAutoBackupDB — pruneBackups', () => {
   it('does nothing when backups are within the limit', async () => {
     const db = makeDB();
-    await db.saveBackup('hourly', {});
+    await db.saveBackup('hourly', { seq: 0 });
     await new Promise(r => setTimeout(r, 5));
-    await db.saveBackup('hourly', {});
+    await db.saveBackup('hourly', { seq: 1 });
     const pruned = await db.pruneBackups('hourly', 5);
     expect(pruned).toBeUndefined(); // returns undefined when nothing to prune
     expect(await db.listBackups('hourly')).toHaveLength(2);
@@ -144,13 +144,141 @@ describe('createAutoBackupDB — pruneBackups', () => {
   it('prunes per-frequency without touching other frequencies', async () => {
     const db = makeDB();
     for (let i = 0; i < 4; i++) {
-      await db.saveBackup('hourly', {});
+      await db.saveBackup('hourly', { seq: i });
       await new Promise(r => setTimeout(r, 5));
     }
     await db.saveBackup('daily', { keep: true });
     await db.pruneBackups('hourly', 2);
     expect(await db.listBackups('hourly')).toHaveLength(2);
     expect(await db.listBackups('daily')).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dedupe and metadata-only listing/pruning (krelltunez/dayGLANCE#2144)
+// ---------------------------------------------------------------------------
+describe('createAutoBackupDB — dedupe', () => {
+  it('does not store the same content twice for a frequency', async () => {
+    const db = makeDB();
+    const first = await db.saveBackup('hourly', { tasks: ['a'] });
+    await new Promise(r => setTimeout(r, 5));
+    const second = await db.saveBackup('hourly', { tasks: ['a'] });
+    expect(second).toEqual({ id: first.id, timestamp: first.timestamp, frequency: 'hourly', skipped: true });
+    expect(await db.listBackups('hourly')).toHaveLength(1);
+  });
+
+  it('saves when the content changed', async () => {
+    const db = makeDB();
+    await db.saveBackup('hourly', { tasks: ['a'] });
+    await new Promise(r => setTimeout(r, 5));
+    const second = await db.saveBackup('hourly', { tasks: ['a', 'b'] });
+    expect(second.skipped).toBeUndefined();
+    expect(await db.listBackups('hourly')).toHaveLength(2);
+  });
+
+  it('compares within a frequency only', async () => {
+    const db = makeDB();
+    await db.saveBackup('hourly', { tasks: ['a'] });
+    const daily = await db.saveBackup('daily', { tasks: ['a'] });
+    expect(daily.skipped).toBeUndefined();
+  });
+
+  it('uses a caller fingerprint, so a volatile field does not defeat it', async () => {
+    const db = makeDB();
+    await db.saveBackup('hourly', { timestamp: 't1', data: { tasks: ['a'] } }, { fingerprint: 'same' });
+    await new Promise(r => setTimeout(r, 5));
+    const second = await db.saveBackup('hourly', { timestamp: 't2', data: { tasks: ['a'] } }, { fingerprint: 'same' });
+    expect(second.skipped).toBe(true);
+  });
+
+  it('saves again when the matching backup was deleted', async () => {
+    const db = makeDB();
+    const first = await db.saveBackup('hourly', { tasks: ['a'] });
+    await db.deleteBackup(first.id);
+    await new Promise(r => setTimeout(r, 5));
+    const second = await db.saveBackup('hourly', { tasks: ['a'] });
+    expect(second.skipped).toBeUndefined();
+    expect(await db.listBackups('hourly')).toHaveLength(1);
+  });
+
+  it('saves again when the matching backup was pruned away', async () => {
+    const db = makeDB();
+    await db.saveBackup('hourly', { seq: 0 });
+    await new Promise(r => setTimeout(r, 5));
+    await db.saveBackup('hourly', { seq: 1 });
+    await db.pruneBackups('hourly', 0);
+    const again = await db.saveBackup('hourly', { seq: 1 });
+    expect(again.skipped).toBeUndefined();
+  });
+
+  it('dedupe: false always saves', async () => {
+    const db = makeDB();
+    await db.saveBackup('hourly', { tasks: ['a'] });
+    await new Promise(r => setTimeout(r, 5));
+    await db.saveBackup('hourly', { tasks: ['a'] }, { dedupe: false });
+    expect(await db.listBackups('hourly')).toHaveLength(2);
+  });
+});
+
+describe('createAutoBackupDB — metadata only', () => {
+  it('listBackupMeta returns id, timestamp and frequency, newest first, without data', async () => {
+    const db = makeDB();
+    const a = await db.saveBackup('hourly', { seq: 0 });
+    await new Promise(r => setTimeout(r, 5));
+    const b = await db.saveBackup('daily', { seq: 1 });
+    const meta = await db.listBackupMeta();
+    expect(meta).toEqual([
+      { id: b.id, timestamp: b.timestamp, frequency: 'daily' },
+      { id: a.id, timestamp: a.timestamp, frequency: 'hourly' },
+    ]);
+    expect(await db.listBackupMeta('hourly')).toEqual([{ id: a.id, timestamp: a.timestamp, frequency: 'hourly' }]);
+  });
+
+  it('pruneBackups never reads a backup record', async () => {
+    const db = makeDB();
+    for (let i = 0; i < 5; i++) {
+      await db.saveBackup('hourly', { seq: i, blob: 'x'.repeat(1000) });
+      await new Promise(r => setTimeout(r, 5));
+    }
+    const idb = await db.open();
+    const proto = Object.getPrototypeOf(idb.transaction('backups').objectStore('backups'));
+    const indexProto = Object.getPrototypeOf(idb.transaction('backups').objectStore('backups').index('frequency'));
+    const spies = [
+      vi.spyOn(proto, 'getAll'), vi.spyOn(proto, 'get'), vi.spyOn(proto, 'openCursor'),
+      vi.spyOn(indexProto, 'getAll'), vi.spyOn(indexProto, 'get'), vi.spyOn(indexProto, 'openCursor'),
+    ];
+    try {
+      expect(await db.pruneBackups('hourly', 2)).toBe(3);
+      for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spies.forEach(spy => spy.mockRestore());
+    }
+    const remaining = await db.listBackups('hourly');
+    expect(remaining.map(r => r.data.seq).sort()).toEqual([3, 4]);
+  });
+
+  it('a version 1 database upgrades in place and keeps its backups', async () => {
+    const idb = new IDBFactory();
+    global.indexedDB = idb;
+    await new Promise((resolve, reject) => {
+      const req = idb.open('legacy-backups', 1);
+      req.onupgradeneeded = (e) => {
+        const store = e.target.result.createObjectStore('backups', { keyPath: 'id' });
+        store.createIndex('timestamp', 'timestamp', { unique: false });
+        store.createIndex('frequency', 'frequency', { unique: false });
+        store.put({ id: 'auto-daily-2026-10-01T00:00:00.000Z', timestamp: '2026-10-01T00:00:00.000Z', frequency: 'daily', data: { old: true } });
+      };
+      req.onsuccess = () => { req.result.close(); resolve(); };
+      req.onerror = () => reject(req.error);
+    });
+    const db = createAutoBackupDB({ autoBackupDBName: 'legacy-backups' });
+    expect(await db.listBackupMeta('daily')).toEqual([
+      { id: 'auto-daily-2026-10-01T00:00:00.000Z', timestamp: '2026-10-01T00:00:00.000Z', frequency: 'daily' },
+    ]);
+    const saved = await db.saveBackup('daily', { old: true });
+    // No fingerprint was recorded for the legacy backup, so it is not a match.
+    expect(saved.skipped).toBeUndefined();
+    expect((await db.getBackup('auto-daily-2026-10-01T00:00:00.000Z')).data).toEqual({ old: true });
   });
 });
 

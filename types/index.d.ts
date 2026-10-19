@@ -221,10 +221,32 @@ export interface BackupRecord<TData = unknown> {
   data: TData;
 }
 
+/** A backup's identity without its payload (listBackupMeta). */
+export interface BackupMeta {
+  id: string;
+  timestamp: string;
+  frequency: BackupFrequency;
+}
+
+/** saveBackup's result when the content matched the last backup of that frequency. */
+export interface SkippedBackup extends BackupMeta {
+  skipped: true;
+}
+
+export interface SaveBackupOptions {
+  /** The caller's content fingerprint; defaults to a SHA-256 of the payload's JSON. */
+  fingerprint?: string;
+  /** false always saves. Default true. */
+  dedupe?: boolean;
+}
+
 export interface AutoBackupDB {
   open(): Promise<IDBDatabase>;
-  saveBackup<TData>(frequency: BackupFrequency, data: TData): Promise<BackupRecord<TData>>;
+  saveBackup<TData>(frequency: BackupFrequency, data: TData, options?: SaveBackupOptions): Promise<BackupRecord<TData> | SkippedBackup>;
+  /** Full records, payloads included. */
   listBackups<TData>(frequency?: BackupFrequency): Promise<BackupRecord<TData>[]>;
+  /** Newest first, read from keys only: no payload is loaded. */
+  listBackupMeta(frequency?: BackupFrequency): Promise<BackupMeta[]>;
   getBackup<TData>(id: string): Promise<BackupRecord<TData> | undefined>;
   deleteBackup(id: string): Promise<void>;
   pruneBackups(frequency: BackupFrequency, maxCount: number): Promise<number | undefined>;

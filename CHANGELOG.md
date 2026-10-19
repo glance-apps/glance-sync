@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Auto-backup prunes from metadata only.** `pruneBackups` used to read
+  every full record of a frequency (`getAll` on the index, payloads
+  included) just to choose which few to delete. With 30 daily copies of a
+  3 MB payload that is ~90 MB of structured clone on the main thread, on
+  every backup. It now chooses from the keys: a backup's id
+  (`auto-<frequency>-<timestamp>`) carries its frequency and timestamp.
+  Retention counts and which backups survive are unchanged
+  (krelltunez/dayGLANCE#2144).
+- **An unchanged payload is not backed up again.** `saveBackup` skips a
+  payload identical to the last backup of that frequency that still exists,
+  and resolves to `{ id, timestamp, frequency, skipped: true }` describing
+  that backup. The comparison is a SHA-256 of the payload's JSON by default.
+  Pass `{ fingerprint }` when the payload carries a field that changes on
+  every build (an export timestamp), or `{ dedupe: false }` to always save.
+  The fingerprints live in a new `fingerprints` object store, so the
+  database moves to version 2. Version 1 databases upgrade in place with
+  their backups untouched.
+
+### Added
+
+- **`listBackupMeta(frequency?)`** returns `{ id, timestamp, frequency }`
+  for each backup, newest first, without loading any payload. Use it for a
+  restore list; `listBackups` still returns full records.
+
 ## [2.1.2] - 2026-10-11
 
 ### Fixed
