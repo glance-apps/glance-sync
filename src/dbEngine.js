@@ -698,8 +698,21 @@ export const createDbSyncEngine = (config) => {
   // so an account at the row cap gets a 413 here, and relabelling it
   // VERIFIER_UNSUPPORTED tells the user to update a server that is working
   // correctly. Pass it through so the cycle reports the truth.
+  // And the server's capability can only be judged from an answer it gave.
+  // A request that never got one (no HTTP status: the fetch threw, a native
+  // bridge returned nothing, the client's own brake) or got a transient one
+  // (status 0 from a native bridge, 408, 429, 502-504) says nothing about the
+  // verifier: it is a network failure, and relabelling it tells the user to
+  // update a server that is fine (krelltunez/dayGLANCE#2068: an iOS build
+  // whose every request failed reported exactly that). Pass it through so
+  // the cycle reports and backs off it as the transport failure it is.
+  const isTransportFailure = (err) => {
+    const status = err ? Number(err.status) : NaN;
+    return !Number.isFinite(status) || [0, 408, 429, 502, 503, 504].includes(status);
+  };
   const isPassThrough = (err) =>
-    isClientNotReady(err) || (err && (err.code === 'CREDENTIAL_INVALID' || err.code === 'QUOTA_EXCEEDED'));
+    isClientNotReady(err) || isTransportFailure(err)
+    || (err && (err.code === 'CREDENTIAL_INVALID' || err.code === 'QUOTA_EXCEEDED'));
 
   const verifierUnsupported = (cause) => {
     if (isPassThrough(cause)) throw cause;
