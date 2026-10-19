@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-10-19
+
 ### Changed
 
 - **Auto-backup prunes from metadata only.** `pruneBackups` used to read
@@ -17,18 +19,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`auto-<frequency>-<timestamp>`) carries its frequency and timestamp.
   Retention counts and which backups survive are unchanged
   (krelltunez/dayGLANCE#2144).
-- **An unchanged payload is not backed up again.** `saveBackup` skips a
-  payload identical to the last backup of that frequency that still exists,
-  and resolves to `{ id, timestamp, frequency, skipped: true }` describing
-  that backup. The comparison is a SHA-256 of the payload's JSON by default.
-  Pass `{ fingerprint }` when the payload carries a field that changes on
-  every build (an export timestamp), or `{ dedupe: false }` to always save.
-  The fingerprints live in a new `fingerprints` object store, so the
-  database moves to version 2. Version 1 databases upgrade in place with
-  their backups untouched.
+- **The auto-backup database moves to IndexedDB version 2**, adding a small
+  `fingerprints` store for the dedupe below. Version 1 databases upgrade in
+  place with their backups untouched.
 
 ### Added
 
+- **Opt-in dedupe in `saveBackup`.** Pass `{ fingerprint }` or
+  `{ dedupe: true }` and a payload identical to the last backup of that
+  frequency that still exists is not stored again; the call resolves to
+  `{ id, timestamp, frequency, skipped: true }` describing that backup.
+  Without a fingerprint the comparison is a SHA-256 of the payload's JSON,
+  so pass a fingerprint when the payload carries a field that changes on
+  every build (an export timestamp). It is opt-in because it changes what
+  retention keeps (the last N distinct states, not the last N ticks), and a
+  changed default would be a major version. A call without options behaves
+  exactly as in 2.1.
 - **`listBackupMeta(frequency?)`** returns `{ id, timestamp, frequency }`
   for each backup, newest first, without loading any payload. Use it for a
   restore list; `listBackups` still returns full records.

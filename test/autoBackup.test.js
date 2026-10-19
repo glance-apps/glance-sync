@@ -160,26 +160,26 @@ describe('createAutoBackupDB — pruneBackups', () => {
 describe('createAutoBackupDB — dedupe', () => {
   it('does not store the same content twice for a frequency', async () => {
     const db = makeDB();
-    const first = await db.saveBackup('hourly', { tasks: ['a'] });
+    const first = await db.saveBackup('hourly', { tasks: ['a'] }, { dedupe: true });
     await new Promise(r => setTimeout(r, 5));
-    const second = await db.saveBackup('hourly', { tasks: ['a'] });
+    const second = await db.saveBackup('hourly', { tasks: ['a'] }, { dedupe: true });
     expect(second).toEqual({ id: first.id, timestamp: first.timestamp, frequency: 'hourly', skipped: true });
     expect(await db.listBackups('hourly')).toHaveLength(1);
   });
 
   it('saves when the content changed', async () => {
     const db = makeDB();
-    await db.saveBackup('hourly', { tasks: ['a'] });
+    await db.saveBackup('hourly', { tasks: ['a'] }, { dedupe: true });
     await new Promise(r => setTimeout(r, 5));
-    const second = await db.saveBackup('hourly', { tasks: ['a', 'b'] });
+    const second = await db.saveBackup('hourly', { tasks: ['a', 'b'] }, { dedupe: true });
     expect(second.skipped).toBeUndefined();
     expect(await db.listBackups('hourly')).toHaveLength(2);
   });
 
   it('compares within a frequency only', async () => {
     const db = makeDB();
-    await db.saveBackup('hourly', { tasks: ['a'] });
-    const daily = await db.saveBackup('daily', { tasks: ['a'] });
+    await db.saveBackup('hourly', { tasks: ['a'] }, { dedupe: true });
+    const daily = await db.saveBackup('daily', { tasks: ['a'] }, { dedupe: true });
     expect(daily.skipped).toBeUndefined();
   });
 
@@ -193,30 +193,51 @@ describe('createAutoBackupDB — dedupe', () => {
 
   it('saves again when the matching backup was deleted', async () => {
     const db = makeDB();
-    const first = await db.saveBackup('hourly', { tasks: ['a'] });
+    const first = await db.saveBackup('hourly', { tasks: ['a'] }, { dedupe: true });
     await db.deleteBackup(first.id);
     await new Promise(r => setTimeout(r, 5));
-    const second = await db.saveBackup('hourly', { tasks: ['a'] });
+    const second = await db.saveBackup('hourly', { tasks: ['a'] }, { dedupe: true });
     expect(second.skipped).toBeUndefined();
     expect(await db.listBackups('hourly')).toHaveLength(1);
   });
 
   it('saves again when the matching backup was pruned away', async () => {
     const db = makeDB();
-    await db.saveBackup('hourly', { seq: 0 });
+    await db.saveBackup('hourly', { seq: 0 }, { dedupe: true });
     await new Promise(r => setTimeout(r, 5));
-    await db.saveBackup('hourly', { seq: 1 });
+    await db.saveBackup('hourly', { seq: 1 }, { dedupe: true });
     await db.pruneBackups('hourly', 0);
-    const again = await db.saveBackup('hourly', { seq: 1 });
+    const again = await db.saveBackup('hourly', { seq: 1 }, { dedupe: true });
     expect(again.skipped).toBeUndefined();
   });
 
-  it('dedupe: false always saves', async () => {
+  it('is opt-in: without options every save is stored, as in 2.1', async () => {
     const db = makeDB();
     await db.saveBackup('hourly', { tasks: ['a'] });
     await new Promise(r => setTimeout(r, 5));
-    await db.saveBackup('hourly', { tasks: ['a'] }, { dedupe: false });
+    const second = await db.saveBackup('hourly', { tasks: ['a'] });
+    expect(second.skipped).toBeUndefined();
     expect(await db.listBackups('hourly')).toHaveLength(2);
+  });
+
+  it('dedupe: false saves even with a fingerprint', async () => {
+    const db = makeDB();
+    await db.saveBackup('hourly', { tasks: ['a'] }, { fingerprint: 'f' });
+    await new Promise(r => setTimeout(r, 5));
+    await db.saveBackup('hourly', { tasks: ['a'] }, { fingerprint: 'f', dedupe: false });
+    expect(await db.listBackups('hourly')).toHaveLength(2);
+  });
+
+  it('a save without dedupe resets the comparison to the newest backup', async () => {
+    const db = makeDB();
+    await db.saveBackup('hourly', { v: 1 }, { dedupe: true });
+    await new Promise(r => setTimeout(r, 5));
+    await db.saveBackup('hourly', { v: 2 });
+    await new Promise(r => setTimeout(r, 5));
+    // Same content as the OLDER backup, not the newest: it must be saved.
+    const third = await db.saveBackup('hourly', { v: 1 }, { dedupe: true });
+    expect(third.skipped).toBeUndefined();
+    expect(await db.listBackups('hourly')).toHaveLength(3);
   });
 });
 
@@ -275,7 +296,7 @@ describe('createAutoBackupDB — metadata only', () => {
     expect(await db.listBackupMeta('daily')).toEqual([
       { id: 'auto-daily-2026-10-01T00:00:00.000Z', timestamp: '2026-10-01T00:00:00.000Z', frequency: 'daily' },
     ]);
-    const saved = await db.saveBackup('daily', { old: true });
+    const saved = await db.saveBackup('daily', { old: true }, { dedupe: true });
     // No fingerprint was recorded for the legacy backup, so it is not a match.
     expect(saved.skipped).toBeUndefined();
     expect((await db.getBackup('auto-daily-2026-10-01T00:00:00.000Z')).data).toEqual({ old: true });

@@ -234,9 +234,9 @@ export interface SkippedBackup extends BackupMeta {
 }
 
 export interface SaveBackupOptions {
-  /** The caller's content fingerprint; defaults to a SHA-256 of the payload's JSON. */
+  /** The caller's content fingerprint. Passing one turns dedupe on. */
   fingerprint?: string;
-  /** false always saves. Default true. */
+  /** Skip a payload identical to the last backup of this frequency. Default: true when a fingerprint is passed, else false; without a fingerprint the comparison is a SHA-256 of the payload's JSON. */
   dedupe?: boolean;
 }
 

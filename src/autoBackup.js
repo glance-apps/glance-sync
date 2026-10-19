@@ -40,8 +40,9 @@ const request = (req) => new Promise((resolve, reject) => {
  * Creates an IndexedDB-backed auto-backup store.
  *
  * Version 2 adds the `fingerprints` store: per frequency, the id and content
- * fingerprint of the last backup saved, so an unchanged payload is not stored
- * again. Version 1 databases upgrade in place; their backups are untouched.
+ * fingerprint of the last deduped backup saved, so an unchanged payload is not
+ * stored again (saveBackup's opt-in dedupe). Version 1 databases upgrade in
+ * place; their backups are untouched.
  *
  * @param {object} config
  * @param {string} config.autoBackupDBName   - IDB database name (e.g. 'dayglance-auto-backups')
@@ -70,22 +71,30 @@ export function createAutoBackupDB(config) {
       });
     },
     /**
-     * Save `data` as a backup of `frequency`, unless it is identical to the
-     * last backup of that frequency that still exists. Backups exist to
-     * capture change, not the clock.
+     * Save `data` as a backup of `frequency`.
+     *
+     * Opt-in dedupe: with a `fingerprint`, or `dedupe: true`, a payload
+     * identical to the last backup of that frequency that still exists is not
+     * stored again. Backups exist to capture change, not the clock. It is
+     * opt-in because it changes what a caller's retention keeps (the last N
+     * distinct states rather than the last N ticks), and a changed default is
+     * a major version under this package's versioning rules.
      *
      * Options:
      *   fingerprint — the caller's own content fingerprint. Pass one when the
      *     payload carries fields that change on every build (an export
-     *     timestamp), so they do not defeat the comparison. Defaults to a
-     *     SHA-256 of the whole payload.
-     *   dedupe — false always saves.
+     *     timestamp), so they do not defeat the comparison. Implies dedupe.
+     *   dedupe — true compares a SHA-256 of the whole payload when no
+     *     fingerprint is given. Default: true when a fingerprint is passed,
+     *     false otherwise.
      *
      * Resolves to the saved record, or, when skipped, to
      * `{ id, timestamp, frequency, skipped: true }` describing the existing
-     * backup that already holds this content.
+     * backup that already holds this content. A save without dedupe clears
+     * the frequency's recorded fingerprint, so a later deduped save compares
+     * against the newest backup, never an older one.
      */
-    async saveBackup(frequency, data, { fingerprint, dedupe = true } = {}) {
+    async saveBackup(frequency, data, { fingerprint, dedupe = fingerprint !== undefined } = {}) {
       const db = await this.open();
       const print = dedupe ? (fingerprint ?? await fingerprintOf(data)) : null;
       if (print) {
