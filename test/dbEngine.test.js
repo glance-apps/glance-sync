@@ -695,6 +695,65 @@ describe('key verifier (Part A)', () => {
     expect(engine.getDirtySet()).toEqual(['a']);  // dirty row preserved
   });
 
+  describe('a verifier fetch that got no answer from the server is a network failure, not VERIFIER_UNSUPPORTED', () => {
+    // krelltunez/dayGLANCE#2068: an iOS build whose every request failed at
+    // the native bridge told the user to update a server that was fine.
+    const failing = (makeErr) => ({
+      calls: { batch: [] },
+      async getRow() { throw makeErr(); },
+      async batch(_app, args) { this.calls.batch.push(args.rows); return { written: args.rows.length, maxSeq: 1 }; },
+      async list() { return { rows: [], hasMore: false }; },
+      async device() { return { updated: true }; },
+    });
+    const withStatus = (status) => () => {
+      const err = new Error(`get row failed: ${status}`);
+      err.code = 'VAULT_ERROR';
+      err.status = status;
+      return err;
+    };
+
+    it.each([
+      ['the fetch threw', () => new TypeError('Failed to fetch')],
+      ['a native bridge answered status 0', withStatus(0)],
+      ['the rate limiter (429)', withStatus(429)],
+      ['a gateway error (503)', withStatus(503)],
+    ])('%s: surfaced as itself, nothing pushed', async (_label, makeErr) => {
+      const vault = failing(makeErr);
+      const local = new Map([['a', { id: 'a', lastModified: '2026-01-01T00:00:00Z' }]]);
+      const errors = [];
+      const { engine } = makeEngine({
+        vault,
+        local,
+        config: { onError: (message, code) => { if (code) errors.push({ message, code }); } },
+      });
+      engine.markDirty('a');
+
+      const thrown = await engine.ensureRootKey().catch((e) => e);
+      expect(thrown).toBeInstanceOf(Error);
+      expect(thrown.code).not.toBe('VERIFIER_UNSUPPORTED');
+
+      await engine.dbSyncCycle();
+      expect(errors.length).toBeGreaterThan(0);
+      expect(errors.some(e => e.code === 'VERIFIER_UNSUPPORTED')).toBe(false);
+      expect(errors.some(e => e.code === 'KEY_MISMATCH')).toBe(false);
+      expect(engine.isKeyVerified()).toBe(false);
+      expect(vault.calls.batch).toHaveLength(0);
+      expect(engine.getDirtySet()).toEqual(['a']);
+    });
+
+    it('allowUnverified does not wave a network failure through', async () => {
+      const vault = failing(() => new TypeError('Failed to fetch'));
+      const { engine } = makeEngine({ vault, config: { allowUnverified: true } });
+      await expect(engine.ensureRootKey()).rejects.toThrow('Failed to fetch');
+      expect(engine.isKeyVerified()).toBe(false);
+    });
+
+    it('a server error answer (500) is still VERIFIER_UNSUPPORTED', async () => {
+      const { engine } = makeEngine({ vault: failing(withStatus(500)) });
+      await expect(engine.ensureRootKey()).rejects.toMatchObject({ code: 'VERIFIER_UNSUPPORTED' });
+    });
+  });
+
   it('a verifier write rejected by the server also surfaces VERIFIER_UNSUPPORTED', async () => {
     // Row absent (getRow -> null) but the establishing write is rejected.
     const vault = {
