@@ -47,6 +47,13 @@ const MAX_UPLOAD_BACKOFF_S   = 15 * 60; // 15 minutes
 const MAX_DOWNLOAD_BACKOFF_S = 5 * 60;  // 5 minutes
 const AUTH_FAILURE_BACKOFF_MS = 60 * 60 * 1000; // 1 hour
 const LOCK_BACKOFF_MS = 30_000; // 30 s for 423 Locked
+// 413: the file is too large for the server (or a proxy in front of it).
+// Retrying the same upload every few minutes cannot succeed; the next attempt
+// waits half an hour, or for the data to change (an edit runs a cycle anyway).
+const TOO_LARGE_BACKOFF_MS = 30 * 60 * 1000;
+// The idle gate re-checks an unchanged remote in full at least this often, as
+// a safety net under the ETag comparison (download()).
+const SETTLED_RECHECK_MS = 10 * 60 * 1000;
 const SUCCESS_HOLD_MS = 3000;
 const ERROR_HOLD_MS = 5000;
 const MIN_SYNC_DURATION_MS = 2000;
@@ -107,6 +114,17 @@ export const createSyncEngine = (config) => {
   let syncing              = false;
   let pendingFollowup      = false;
   let hardStopped          = false;
+  // The idle gate (krelltunez/dayGLANCE#2142). After a cycle that found
+  // nothing to do on either side, the remote's ETag and this device's data as
+  // it stood. A poll whose local data is still that and whose remote still
+  // answers to that ETag has nothing to merge, so it stops after the
+  // conditional GET. Cleared by anything that changes either side, and
+  // re-checked in full every SETTLED_RECHECK_MS regardless.
+  let settled              = null; // { etag, fingerprint, at }
+  // After a 413: until this time, uploads are not attempted (the same data
+  // cannot fit), and the size error is reported again instead. Downloads go on,
+  // so a device that cannot write keeps receiving.
+  let tooLarge             = null; // { until, message }
   let uploadErrorCount     = 0;
   let uploadBackoffUntil   = 0;
   let downloadErrorCount   = 0;
@@ -180,6 +198,9 @@ export const createSyncEngine = (config) => {
       return { code: err.code, isHardStop: true, message: err.message };
     }
     const msg = err?.message || String(err);
+    if (err?.code === 'PAYLOAD_TOO_LARGE' || msg === 'PAYLOAD_TOO_LARGE' || msg.includes('413')) {
+      return { code: 'PAYLOAD_TOO_LARGE', isHardStop: false, message: msg, bytes: err?.bytes ?? null };
+    }
     if (msg === 'PRECONDITION_FAILED')    return { code: 'PRECONDITION_FAILED', isHardStop: false, message: msg };
     if (msg === 'FORBIDDEN')               return { code: 'FORBIDDEN',           isHardStop: true,  message: msg };
     if (msg.includes('401'))               return { code: 'AUTH_FAILURE',        isHardStop: false, message: msg };
@@ -190,6 +211,11 @@ export const createSyncEngine = (config) => {
   // Renders a user-facing error string preserving the exact wording used by
   // dayGLANCE pre-extraction so the UX is unchanged.
   const formatErrorMessage = (cls) => {
+    if (cls.code === 'PAYLOAD_TOO_LARGE') {
+      const size = Number.isFinite(cls.bytes) ? ` (${(cls.bytes / (1024 * 1024)).toFixed(1)} MB)` : '';
+      return `The sync file${size} is too large for this server or the proxy in front of it (413). ` +
+        'Nothing was uploaded; your data is unchanged on this device.';
+    }
     if (cls.code === 'AUTH_FAILURE') {
       return 'Authentication failed (401) — check your username and password in sync settings.';
     }
@@ -227,6 +253,12 @@ export const createSyncEngine = (config) => {
     }
     const provider = providers[cfg.provider];
     if (!provider) return false;
+    if (tooLarge && Date.now() < tooLarge.until) {
+      onError?.(tooLarge.message, 'PAYLOAD_TOO_LARGE', false);
+      onStatusChange?.('error');
+      scheduleAutoRevert('error', ERROR_HOLD_MS);
+      return false;
+    }
 
     if (!skipLockCheck) syncing = true;
     const t0 = Date.now();
@@ -255,6 +287,7 @@ export const createSyncEngine = (config) => {
 
       uploadErrorCount = 0;
       uploadBackoffUntil = 0;
+      tooLarge = null;
       const now = new Date().toISOString();
       localStorage.setItem(KEY_LAST_SYNCED, now);
       localStorage.setItem(KEY_LOCAL_MOD, envelope.lastModified);
@@ -276,6 +309,9 @@ export const createSyncEngine = (config) => {
 
       if (cls.code === 'AUTH_FAILURE') {
         uploadBackoffUntil = Date.now() + AUTH_FAILURE_BACKOFF_MS;
+      } else if (cls.code === 'PAYLOAD_TOO_LARGE') {
+        uploadBackoffUntil = Date.now() + TOO_LARGE_BACKOFF_MS;
+        tooLarge = { until: uploadBackoffUntil, message: formatErrorMessage(cls) };
       } else {
         uploadErrorCount += 1;
         const ms = Math.min(30 * Math.pow(2, uploadErrorCount - 1), MAX_UPLOAD_BACKOFF_S) * 1000;
@@ -329,8 +365,26 @@ export const createSyncEngine = (config) => {
     // last-writer-wins fallback used after two consecutive 412s.
     const doCycle = async (overrideEtag, { skipIfMatch = false } = {}) => {
       uploadFailed = false;
-      const downloaded = await provider.download(cfg);
-      if (!downloaded) {
+      const dataOf = (built) => (built && typeof built === 'object' && 'data' in built ? built.data : built);
+
+      // The idle gate: only armed by a settled cycle, never on the 412 retry
+      // paths, and only while this device's data is still what it was then.
+      let localBuilt = null;
+      let localFingerprint = null;
+      let ifNoneMatch = null;
+      if (settled && !overrideEtag && !skipIfMatch && Date.now() - settled.at < SETTLED_RECHECK_MS) {
+        localBuilt = await buildPayload();
+        localFingerprint = JSON.stringify(dataOf(localBuilt));
+        if (localFingerprint === settled.fingerprint) ifNoneMatch = settled.etag;
+      }
+      const downloaded = await provider.download(cfg, ifNoneMatch ? { ifNoneMatch } : undefined);
+      // 304, or a server that ignores If-None-Match but still reports the same
+      // ETag: the remote is the copy already merged, and so is local.
+      if (ifNoneMatch && (downloaded?.notModified || (downloaded?.etag && downloaded.etag === ifNoneMatch))) {
+        return false;
+      }
+      settled = null;
+      if (!downloaded || downloaded.notModified) {
         // Empty remote — seed it with local state.
         if (!(await upload({ skipLockCheck: true }))) uploadFailed = true;
         return false;
@@ -360,13 +414,16 @@ export const createSyncEngine = (config) => {
         return false;
       }
 
-      const localBuilt = await buildPayload();
-      const localData = (localBuilt && typeof localBuilt === 'object' && 'data' in localBuilt)
-        ? localBuilt.data
-        : localBuilt;
+      if (!localBuilt) localBuilt = await buildPayload();
+      const localData = dataOf(localBuilt);
 
       const mergeResult = mergePayloads(localData, remote.data);
       const { data: mergedData, localChanged, remoteChanged } = mergeResult;
+
+      if (!remoteChanged && !localChanged && etag) {
+        // Nothing to do on either side: the next poll may stop at the ETag.
+        settled = { etag, fingerprint: localFingerprint ?? JSON.stringify(localData), at: Date.now() };
+      }
 
       if (remoteChanged || localChanged) {
         const mergedPayload = {
@@ -428,6 +485,7 @@ export const createSyncEngine = (config) => {
       onStatusChange?.('success');
       scheduleAutoRevert('success', SUCCESS_HOLD_MS);
     } catch (err) {
+      settled = null;
       // eslint-disable-next-line no-console
       console.error(`[${appId}] cloud sync download error:`, err);
       const cls = classifyError(err);
@@ -490,6 +548,8 @@ export const createSyncEngine = (config) => {
 
       if (cls.code === 'AUTH_FAILURE') {
         downloadBackoffUntil = Date.now() + AUTH_FAILURE_BACKOFF_MS;
+      } else if (cls.code === 'PAYLOAD_TOO_LARGE') {
+        downloadBackoffUntil = Date.now() + TOO_LARGE_BACKOFF_MS;
       } else if (cls.code === 'LOCKED') {
         downloadBackoffUntil = Date.now() + LOCK_BACKOFF_MS;
       } else {

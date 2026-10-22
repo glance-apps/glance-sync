@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-10-22
+
+### Added
+
+- **An idle gate on both file-tier cycles** (krelltunez/dayGLANCE#2142).
+  Every poll read, parsed and merged the whole file even when neither side had
+  moved; dayGLANCE measured ~230 ms a snapshot tick at 10k tasks per side.
+  - `runSnapshotFileCycle`: after a merged cycle with nothing to apply and
+    nothing to write, a cycle that reads the same file text with unchanged
+    local data and no pending relay stamps the read and returns
+    `{ kind: 'skipped', reason: 'unchanged' }`. Carried in `state.settled`.
+  - `createSyncEngine` (WebDAV): after a cycle whose merge changed nothing, the
+    next poll with unchanged local data sends `If-None-Match`; a `304`, or the
+    same ETag back, ends the cycle as a successful sync without a parse or a
+    merge.
+  - Both re-check in full at least every 10 minutes (`SETTLED_RECHECK_MS` for
+    the snapshot cycle), and take the ordinary cycle whenever either side
+    moved. What is merged, applied and written is unchanged; only work that
+    could not change anything is skipped.
+- **`PAYLOAD_TOO_LARGE`**: a `413` on upload is its own error code, carrying
+  the refused size, with a message that says so, instead of a
+  `NETWORK_ERROR`. Uploads back off 30 minutes after one: until then
+  `upload()` reports the same error without sending, while downloads go on.
+- Provider `download(config, { ifNoneMatch })`, resolving a `304` to
+  `{ notModified: true, etag }`.
+
+
 ## [2.2.0] - 2026-10-19
 
 ### Changed

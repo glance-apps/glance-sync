@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { runSnapshotFileCycle, classifySnapshotText, RELAY_CONFIRM_MS, RELAY_STAGGER_MS, relayDecision, relayWaitMs, noteWriter, readWriters, MISSING_GRACE_MS, evaluateMissingSnapshot, shouldPromptFirstRun, payloadHasData } from '../src/index.js';
+import { runSnapshotFileCycle, classifySnapshotText, SETTLED_RECHECK_MS, RELAY_CONFIRM_MS, RELAY_STAGGER_MS, relayDecision, relayWaitMs, noteWriter, readWriters, MISSING_GRACE_MS, evaluateMissingSnapshot, shouldPromptFirstRun, payloadHasData } from '../src/index.js';
 
 // The snapshot-file cycle, moved from dayGLANCE with its tests. The app's own
 // storage keys and strip come in through io, so the tests hand in stand-ins.
@@ -854,5 +854,84 @@ describe('shouldPromptFirstRun and payloadHasData', () => {
     expect(payloadHasData({ tasks: [], chores: [{ id: 1 }] })).toBe(true);
     expect(payloadHasData({ tasks: [], settings: { a: 1 }, tombstones: {} })).toBe(false);
     expect(payloadHasData(null)).toBe(false);
+  });
+});
+
+// krelltunez/dayGLANCE#2142: every poll read, parsed and merged the whole file
+// even when neither side had moved (~230 ms a tick at 10k tasks per side).
+describe('the idle gate', () => {
+  const remote = data([task('r')]);
+  const text = envelope(remote);
+  // A merge with nothing to do: local already holds the file's data.
+  const quietIo = (over = {}) => makeIo({
+    buildSyncPayload: () => ({ version: 2, data: remote }),
+    mergeSyncData: vi.fn(() => ({ data: remote, localChanged: false, remoteChanged: false })),
+    lastLocalEditAt: () => null,
+    ...over,
+  });
+
+  it('a poll that reads the settled text with unchanged local data stops before the merge', async () => {
+    const transport = makeTransport({ read: vi.fn(async () => text) });
+    const io = quietIo();
+    const first = await runSnapshotFileCycle({ transport, io, state: fresh });
+    expect(first.outcome).toMatchObject({ kind: 'merged', applied: false, wrote: false });
+    expect(first.state.settled).toMatchObject({ text, at: T0 });
+
+    io.now = () => T0 + 15_000;
+    const second = await runSnapshotFileCycle({ transport, io, state: first.state });
+    // MUTATION: drop the gate and the merge runs a second time.
+    expect(second.outcome).toEqual({ kind: 'skipped', reason: 'unchanged' });
+    expect(io.mergeSyncData).toHaveBeenCalledTimes(1);
+    expect(transport.write).not.toHaveBeenCalled();
+    // The read still counts as one.
+    expect(io.storage.getItem('fake-last-synced')).toBe(new Date(T0 + 15_000).toISOString());
+  });
+
+  it('new file text runs the full cycle', async () => {
+    const read = vi.fn(async () => text);
+    const transport = makeTransport({ read });
+    const io = quietIo();
+    const first = await runSnapshotFileCycle({ transport, io, state: fresh });
+    read.mockImplementation(async () => envelope(remote, '2026-10-03T00:00:00.000Z'));
+    const second = await runSnapshotFileCycle({ transport, io, state: first.state });
+    expect(second.outcome.kind).toBe('merged');
+    expect(io.mergeSyncData).toHaveBeenCalledTimes(2);
+  });
+
+  it('local data that moved runs the full cycle', async () => {
+    const transport = makeTransport({ read: vi.fn(async () => text) });
+    let local = remote;
+    const io = quietIo({ buildSyncPayload: () => ({ version: 2, data: local }) });
+    const first = await runSnapshotFileCycle({ transport, io, state: fresh });
+    local = data([task('r'), task('mine')]);
+    const second = await runSnapshotFileCycle({ transport, io, state: first.state });
+    expect(second.outcome.kind).toBe('merged');
+    expect(io.mergeSyncData).toHaveBeenCalledTimes(2);
+  });
+
+  it('a waiting relay is never skipped', async () => {
+    const transport = makeTransport({ read: vi.fn(async () => text) });
+    const io = quietIo();
+    const first = await runSnapshotFileCycle({ transport, io, state: fresh });
+    const state = { ...first.state, pendingWrite: { fingerprint: 'x', at: T0 } };
+    const second = await runSnapshotFileCycle({ transport, io, state });
+    expect(second.outcome.kind).toBe('merged');
+  });
+
+  it('a cycle that applied or wrote does not settle', async () => {
+    const transport = makeTransport({ read: vi.fn(async () => text) });
+    const io = makeIo(); // the default merge reports a local change and applies it
+    const first = await runSnapshotFileCycle({ transport, io, state: fresh });
+    expect(first.outcome.applied).toBe(true);
+    expect(first.state.settled).toBeNull();
+  });
+
+  it('re-checks in full after SETTLED_RECHECK_MS', async () => {
+    const transport = makeTransport({ read: vi.fn(async () => text) });
+    const io = quietIo();
+    const first = await runSnapshotFileCycle({ transport, io, state: fresh });
+    io.now = () => T0 + SETTLED_RECHECK_MS;
+    const second = await runSnapshotFileCycle({ transport, io, state: first.state });
+    expect(second.outcome.kind).toBe('merged');
   });
 });

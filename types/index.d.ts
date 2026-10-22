@@ -17,6 +17,9 @@ export type SyncErrorCode =
   | 'AUTH_FAILURE'
   | 'LOCKED'
   | 'NETWORK_ERROR'
+  // File tier: the server or a proxy in front of it refused the upload for its
+  // size (413). Not a network problem; retrying the same upload cannot succeed.
+  | 'PAYLOAD_TOO_LARGE'
   // DB transport: derived root key does not match the account's existing data.
   | 'KEY_MISMATCH'
   // DB transport: a single row failed to decrypt (surfaced as a count via
@@ -307,7 +310,8 @@ export interface CloudSyncProvider {
   configFields: Array<{ key: string; label: string; type: string; placeholder?: string }>;
   helpText?: string;
   upload(config: Record<string, unknown>, envelope: SyncEnvelope, etag?: string | null): Promise<boolean>;
-  download(config: Record<string, unknown>): Promise<{ payload: unknown; etag: string | null } | null>;
+  /** With `ifNoneMatch`, a conditional GET: an unchanged file resolves to `{ notModified: true, etag }`. */
+  download(config: Record<string, unknown>, options?: { ifNoneMatch?: string | null }): Promise<{ payload: unknown; etag: string | null } | { notModified: true; etag: string } | null>;
   test(config: Record<string, unknown>): Promise<{ success: boolean; error?: string }>;
 }
 
@@ -996,10 +1000,12 @@ export interface SnapshotFileState {
   lastWriteAt: number;
   lastWrittenAt?: number;
   pendingWrite?: { fingerprint: string; at: number } | null;
+  /** The idle gate: the file text and local data of the last cycle that had nothing to do. */
+  settled?: { text: string; fingerprint: string; at: number } | null;
 }
 
 export type SnapshotFileOutcome =
-  | { kind: 'skipped'; reason: 'missing-grace' | 'empty-state-guard' | 'downloading' | 'unparseable' | 'no-data' | 'key-needed' }
+  | { kind: 'skipped'; reason: 'missing-grace' | 'empty-state-guard' | 'downloading' | 'unparseable' | 'no-data' | 'key-needed' | 'unchanged' }
   | { kind: 'skipped'; reason: 'encrypted-unreadable'; needsKey: boolean }
   | { kind: 'seeded'; wrote: boolean }
   | { kind: 'reseeded'; wrote: boolean }
@@ -1020,6 +1026,8 @@ export function runSnapshotFileCycle(args: {
 }): Promise<{ state: Required<SnapshotFileState>; outcome: SnapshotFileOutcome }>;
 
 export const RELAY_CONFIRM_MS: number;
+/** How long a settled snapshot cycle may stand in for a full one (the idle gate). */
+export const SETTLED_RECHECK_MS: number;
 export const RELAY_STAGGER_MS: number;
 export const MISSING_GRACE_MS: number;
 

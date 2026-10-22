@@ -112,7 +112,7 @@ Pass `encryptionEnabled: true` in the sync config object stored via `engine.setC
 
 | Method | Description |
 |--------|-------------|
-| `sync()` / `download()` | Full cycle: download → validate → merge → apply → upload if changed. |
+| `sync()` / `download()` | Full cycle: download → validate → merge → apply → upload if changed. After a cycle that changed nothing, the next one downloads conditionally (`If-None-Match`) and stops at a `304` when local data is also unchanged; a full re-check runs at least every 10 minutes. A `413` on upload is reported as `PAYLOAD_TOO_LARGE` with the size. |
 | `upload(opts?)` | Upload local state to the remote provider. |
 | `runBackup(frequency)` | Save a snapshot to IDB and upload it to the remote backup folder (`<appFolderName>/backups/`, a sibling of the sync file inside the app folder). |
 | `test(config)` | Test the connection to the configured provider. |

@@ -433,3 +433,32 @@ describe('provider metadata', () => {
     }
   });
 });
+
+
+// krelltunez/dayGLANCE#2142: the conditional GET the engine's idle gate sends,
+// and the 413 code. Driven through the Electron bridge, the seam above.
+describe('providers — conditional download and a 413 upload', () => {
+  const bridge = (respond) => vi.fn(async (method, url, headers, body) => respond({ method, url, headers, body }));
+  const reply = (status, { etag = null, body = '{"version":2,"data":{}}' } = {}) => ({
+    status, ok: status >= 200 && status < 300, statusText: String(status), headers: etag ? { etag } : {}, body,
+  });
+
+  it.each(['nextcloud', 'koofr', 'webdav'])('%s: sends If-None-Match and reads 304 as not modified', async (id) => {
+    const fn = bridge(({ headers }) => (headers['If-None-Match'] === '"e1"' ? reply(304) : reply(200, { etag: '"e2"' })));
+    const provider = createProviders({ ...BASE_ENGINE, electronProxyFetch: fn })[id];
+    expect(await provider.download(USER_CFG, { ifNoneMatch: '"e1"' })).toEqual({ notModified: true, etag: '"e1"' });
+    expect(fn.mock.calls[0][2]['If-None-Match']).toBe('"e1"');
+    // Without one, an ordinary GET with no conditional header.
+    const plain = await provider.download(USER_CFG);
+    expect(plain.etag).toBe('"e2"');
+    expect(fn.mock.calls[1][2]['If-None-Match']).toBeUndefined();
+  });
+
+  it.each(['nextcloud', 'koofr', 'webdav'])('%s: a 413 upload throws PAYLOAD_TOO_LARGE with the size', async (id) => {
+    const fn = bridge(() => reply(413));
+    const provider = createProviders({ ...BASE_ENGINE, electronProxyFetch: fn })[id];
+    const err = await provider.upload(USER_CFG, { version: 2, data: { notes: 'é'.repeat(10) } }).catch((e) => e);
+    expect(err.code).toBe('PAYLOAD_TOO_LARGE');
+    expect(err.bytes).toBe(new TextEncoder().encode(fn.mock.calls.at(-1)[3]).length);
+  });
+});
