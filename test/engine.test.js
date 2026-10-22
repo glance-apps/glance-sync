@@ -688,3 +688,30 @@ describe('createSyncEngine — an upload too large for the server', () => {
     expect(calls.errors[0].code).toBe('PAYLOAD_TOO_LARGE');
   });
 });
+
+describe('createSyncEngine — after a 413, uploads wait and downloads go on', () => {
+  it('does not retry the upload inside the backoff, still applies remote changes, and retries after it', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-22T12:00:00Z'));
+    localStorage.setItem('test-cloud-sync-last-synced', '2026-10-01T00:00:00.000Z');
+    const remoteEnvelope = { schemaVersion: 1, appId: 'test-app', version: 2, lastModified: '2026-01-02T00:00:00Z', data: { tasks: [{ id: 'r' }] } };
+    const tooLarge = Object.assign(new Error('PAYLOAD_TOO_LARGE'), { code: 'PAYLOAD_TOO_LARGE', bytes: 6 * 1024 * 1024 });
+    const provider = makeFakeProvider({ download: remoteEnvelope, etag: 'e1', uploadError: tooLarge });
+    const { engine, calls } = makeEngine({ provider, mergeResult: { data: remoteEnvelope.data, localChanged: true, remoteChanged: true } });
+    const run = async () => { const p = engine.download(); await vi.advanceTimersByTimeAsync(3000); await p; };
+
+    await run();
+    expect(provider.upload).toHaveBeenCalledTimes(1);
+    await run();
+    // MUTATION: drop the tooLarge short-circuit and the oversized upload goes out again.
+    expect(provider.upload).toHaveBeenCalledTimes(1);
+    expect(calls.applyPayload).toHaveLength(2);
+    expect(calls.errors.at(-1)).toMatchObject({ code: 'PAYLOAD_TOO_LARGE' });
+    expect(calls.errors.at(-1).msg).toContain('6.0 MB');
+
+    vi.setSystemTime(new Date('2026-10-22T12:31:00Z'));
+    await run();
+    expect(provider.upload).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+});

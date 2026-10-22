@@ -121,6 +121,10 @@ export const createSyncEngine = (config) => {
   // conditional GET. Cleared by anything that changes either side, and
   // re-checked in full every SETTLED_RECHECK_MS regardless.
   let settled              = null; // { etag, fingerprint, at }
+  // After a 413: until this time, uploads are not attempted (the same data
+  // cannot fit), and the size error is reported again instead. Downloads go on,
+  // so a device that cannot write keeps receiving.
+  let tooLarge             = null; // { until, message }
   let uploadErrorCount     = 0;
   let uploadBackoffUntil   = 0;
   let downloadErrorCount   = 0;
@@ -249,6 +253,12 @@ export const createSyncEngine = (config) => {
     }
     const provider = providers[cfg.provider];
     if (!provider) return false;
+    if (tooLarge && Date.now() < tooLarge.until) {
+      onError?.(tooLarge.message, 'PAYLOAD_TOO_LARGE', false);
+      onStatusChange?.('error');
+      scheduleAutoRevert('error', ERROR_HOLD_MS);
+      return false;
+    }
 
     if (!skipLockCheck) syncing = true;
     const t0 = Date.now();
@@ -277,6 +287,7 @@ export const createSyncEngine = (config) => {
 
       uploadErrorCount = 0;
       uploadBackoffUntil = 0;
+      tooLarge = null;
       const now = new Date().toISOString();
       localStorage.setItem(KEY_LAST_SYNCED, now);
       localStorage.setItem(KEY_LOCAL_MOD, envelope.lastModified);
@@ -300,6 +311,7 @@ export const createSyncEngine = (config) => {
         uploadBackoffUntil = Date.now() + AUTH_FAILURE_BACKOFF_MS;
       } else if (cls.code === 'PAYLOAD_TOO_LARGE') {
         uploadBackoffUntil = Date.now() + TOO_LARGE_BACKOFF_MS;
+        tooLarge = { until: uploadBackoffUntil, message: formatErrorMessage(cls) };
       } else {
         uploadErrorCount += 1;
         const ms = Math.min(30 * Math.pow(2, uploadErrorCount - 1), MAX_UPLOAD_BACKOFF_S) * 1000;

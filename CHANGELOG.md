@@ -28,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     could not change anything is skipped.
 - **`PAYLOAD_TOO_LARGE`**: a `413` on upload is its own error code, carrying
   the refused size, with a message that says so, instead of a
-  `NETWORK_ERROR`. Uploads back off 30 minutes after one.
+  `NETWORK_ERROR`. Uploads back off 30 minutes after one: until then
+  `upload()` reports the same error without sending, while downloads go on.
 - Provider `download(config, { ifNoneMatch })`, resolving a `304` to
   `{ notModified: true, etag }`.
 
