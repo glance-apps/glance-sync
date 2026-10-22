@@ -84,6 +84,7 @@ export {
   noteWriter,
   readWriters,
   RELAY_CONFIRM_MS,
+  SETTLED_RECHECK_MS,
   RELAY_STAGGER_MS,
   MISSING_GRACE_MS,
 } from './snapshotFileSync.js';

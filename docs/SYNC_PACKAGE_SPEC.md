@@ -321,12 +321,16 @@ Each provider exposes: `upload(config, envelope)`, `download(config)`, `test(con
 
 ETag is read on download and sent as `If-Match` on upload for optimistic concurrency. `412 Precondition Failed` triggers `PRECONDITION_FAILED` error and a retry after re-download.
 
+`download(config, { ifNoneMatch })` sends `If-None-Match`; a `304 Not Modified` resolves to `{ notModified: true, etag }`. A `413` on upload throws `PAYLOAD_TOO_LARGE` with the refused size in bytes (`err.bytes`).
+
+**Idle gate (2.3.0).** After a cycle whose merge changed nothing on either side, the engine keeps the remote's ETag and this device's data as it stood. The next poll, if the local data is still exactly that, downloads conditionally: a `304`, or a `200` carrying the same ETag (a server that ignores `If-None-Match`), ends the cycle without parsing or merging, and counts as a successful sync. Anything that moves either side, any error, the 412 retry paths, and a full re-check at least every 10 minutes, take the ordinary cycle. A server that sends no ETag gets no gate.
+
 ### Vercel CORS Proxy (`api/webdav-proxy.js`)
 
 - Fully portable — zero app-specific code
 - Validates destination URL (blocks RFC 1918 private IPs to prevent SSRF)
 - Forwards `Authorization` / `X-WebDAV-Auth` headers to upstream
-- Forwards `ETag` / `If-Match` headers
+- Forwards `ETag` / `If-Match` / `If-None-Match` headers, and passes a `304` through (the idle gate)
 - Disables Vercel body parser (`export const config = { api: { bodyParser: false } }`)
 - **Each app deploys its own proxy instance.** Do not share a proxy across apps.
 
@@ -344,6 +348,7 @@ ETag is read on download and sent as `If-Match` on upload for optimistic concurr
 | `AUTH_FAILURE` | `false` | Server returned 401. Credentials likely wrong. |
 | `LOCKED` | `false` | Another sync is in progress. |
 | `NETWORK_ERROR` | `false` | Fetch failed entirely (offline, DNS, timeout). |
+| `PAYLOAD_TOO_LARGE` | `false` | The server or a proxy refused the upload for its size (413). The message gives the size; uploads back off 30 minutes, since a retry of the same data cannot succeed. |
 
 **Hard-stop errors**: The engine sets status to `'error'` and stops all auto-retry. The UI must **not** auto-clear hard-stop error messages on a timer. They must persist until the user acknowledges them or reconfigures sync.
 
@@ -387,7 +392,8 @@ that something else ferries between devices: an iCloud container, or a folder
 kept in step by Nextcloud, Google Drive, Dropbox or Syncthing (dayGLANCE's
 Direct Access tier, `docs/direct-access-sync.md` in that repository, is the
 design). There is no server and no ETag, so the cycle is read, merge, apply,
-write, and every data-safety rule lives in the cycle:
+write (unless the idle gate below finds nothing moved), and every data-safety
+rule lives in the cycle:
 
 - **Seed guard.** An absent file is seeded from local data only once
   `evaluateMissingSnapshot` says the absence is not a transient eviction (a
@@ -421,9 +427,17 @@ write, and every data-safety rule lives in the cycle:
   plaintext payload (dayGLANCE strips HealthKit counts from its iCloud file);
   it never touches what is applied locally and runs before any envelope.
 
+- **Idle gate (2.3.0).** A merged cycle that had nothing to apply and
+  nothing to write records the file's text and the local data
+  (`state.settled`). A later cycle that reads the same text, while the local
+  data is unchanged and no relay is pending, stamps the read and returns
+  `skipped` / `unchanged` before parsing, decrypting or merging. Anything
+  else, and a full cycle at least every `SETTLED_RECHECK_MS`, clears it.
+
 The `state` carried between cycles holds the eviction clock, the throttle
-stamp, the last successful write and the pending relay look; the hook that
-owns the poll, the mutex and the prompt UI stays in the app.
+stamp, the last successful write, the pending relay look and the settled
+copy; the hook that owns the poll, the mutex and the prompt UI stays in the
+app.
 
 ## Concurrency and Locking
 

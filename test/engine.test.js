@@ -574,3 +574,117 @@ describe('createSyncEngine — a cycle whose upload fails is not a success', () 
     expect(calls.statusChanges.map(c => c.s)).toContain('success');
   });
 });
+
+// ---------- The idle gate and the size error (krelltunez/dayGLANCE#2142) ----------
+describe('createSyncEngine — the idle gate', () => {
+  const remoteEnvelope = {
+    schemaVersion: 1, appId: 'test-app', version: 2,
+    lastModified: '2026-01-02T00:00:00Z',
+    data: { tasks: [{ id: 'a', lastModified: '2026-01-01T00:00:00Z' }] },
+  };
+  const quiet = { data: remoteEnvelope.data, localChanged: false, remoteChanged: false };
+
+  // A provider that honours If-None-Match the way a WebDAV server does.
+  const conditionalProvider = ({ etag = 'e1', honours = true } = {}) => {
+    const p = makeFakeProvider({ download: remoteEnvelope, etag });
+    p.download = vi.fn(async (_cfg, opts) => {
+      if (honours && opts?.ifNoneMatch === etag) return { notModified: true, etag };
+      return { payload: remoteEnvelope, etag };
+    });
+    return p;
+  };
+  const run = async (engine) => {
+    const p = engine.download();
+    await vi.advanceTimersByTimeAsync(3000);
+    await p;
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-22T12:00:00Z'));
+    localStorage.setItem('test-cloud-sync-last-synced', '2026-10-01T00:00:00.000Z');
+  });
+
+  it('after a cycle with nothing to do, the next poll stops at a 304 and still counts as synced', async () => {
+    const provider = conditionalProvider();
+    const { engine, calls } = makeEngine({ provider, mergeResult: quiet });
+    await run(engine);
+    expect(calls.mergePayloads).toHaveLength(1);
+    expect(provider.download.mock.calls[0][1]).toBeUndefined();
+
+    await run(engine);
+    expect(provider.download.mock.calls[1][1]).toEqual({ ifNoneMatch: 'e1' });
+    // MUTATION: drop the gate's early return and the merge runs again.
+    expect(calls.mergePayloads).toHaveLength(1);
+    expect(provider.upload).not.toHaveBeenCalled();
+    expect(calls.statusChanges.filter(c => c.s === 'success')).toHaveLength(2);
+    expect(calls.lastSynced).toHaveLength(2);
+  });
+
+  it('a server that ignores If-None-Match but reports the same ETag is also unchanged', async () => {
+    const provider = conditionalProvider({ honours: false });
+    const { engine, calls } = makeEngine({ provider, mergeResult: quiet });
+    await run(engine);
+    await run(engine);
+    expect(calls.mergePayloads).toHaveLength(1);
+  });
+
+  it('local data that moved runs a full cycle, without If-None-Match', async () => {
+    const provider = conditionalProvider();
+    let n = 0;
+    const { engine, calls, config } = makeEngine({ provider, mergeResult: quiet });
+    config.buildPayload.mockImplementation(async () => ({ data: { tasks: [{ id: 'a', edit: n++ }] } }));
+    await run(engine);
+    await run(engine);
+    expect(provider.download.mock.calls[1][1]).toBeUndefined();
+    expect(calls.mergePayloads).toHaveLength(2);
+  });
+
+  it('a cycle that changed something does not settle', async () => {
+    const provider = conditionalProvider();
+    const { engine, calls } = makeEngine({ provider, mergeResult: { data: remoteEnvelope.data, localChanged: true, remoteChanged: false } });
+    await run(engine);
+    await run(engine);
+    expect(provider.download.mock.calls[1][1]).toBeUndefined();
+    expect(calls.mergePayloads).toHaveLength(2);
+  });
+
+  it('re-checks in full after ten minutes', async () => {
+    const provider = conditionalProvider();
+    const { engine, calls } = makeEngine({ provider, mergeResult: quiet });
+    await run(engine);
+    vi.setSystemTime(new Date('2026-10-22T12:11:00Z'));
+    await run(engine);
+    expect(provider.download.mock.calls[1][1]).toBeUndefined();
+    expect(calls.mergePayloads).toHaveLength(2);
+  });
+
+  it('no ETag, no gate', async () => {
+    const provider = conditionalProvider({ etag: null });
+    const { engine, calls } = makeEngine({ provider, mergeResult: quiet });
+    await run(engine);
+    await run(engine);
+    expect(calls.mergePayloads).toHaveLength(2);
+  });
+});
+
+describe('createSyncEngine — an upload too large for the server', () => {
+  it('reports PAYLOAD_TOO_LARGE with the size, not a network error, and backs off', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-22T12:00:00Z'));
+    const tooLarge = Object.assign(new Error('PAYLOAD_TOO_LARGE'), { code: 'PAYLOAD_TOO_LARGE', bytes: 5 * 1024 * 1024 });
+    const { engine, calls } = makeEngine({ provider: makeFakeProvider({ uploadError: tooLarge }) });
+    await engine.upload();
+    expect(calls.errors).toHaveLength(1);
+    expect(calls.errors[0]).toMatchObject({ code: 'PAYLOAD_TOO_LARGE', hard: false });
+    expect(calls.errors[0].msg).toContain('5.0 MB');
+    expect(engine.getUploadBackoffUntil()).toBe(Date.parse('2026-10-22T12:30:00Z'));
+    vi.useRealTimers();
+  });
+
+  it('a plain 413 message from a proxy is classified the same way', async () => {
+    const { engine, calls } = makeEngine({ provider: makeFakeProvider({ uploadError: new Error('Upload failed: 413 Payload Too Large') }) });
+    await engine.upload();
+    expect(calls.errors[0].code).toBe('PAYLOAD_TOO_LARGE');
+  });
+});

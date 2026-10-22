@@ -124,6 +124,13 @@ export function payloadHasData(data) {
 export const RELAY_CONFIRM_MS = 90 * 1000;
 
 /**
+ * How long a settled cycle may stand in for a full one (the idle gate in
+ * runSnapshotFileCycle). The gate already requires the same file text and the
+ * same local data; this bounds how long a mistake in that judgement could last.
+ */
+export const SETTLED_RECHECK_MS = 10 * 60 * 1000;
+
+/**
  * The relay rule, shared with the event-set cycle (intents/folderIntents.js):
  * a change this device did not make goes out only once the same difference
  * (`fingerprint`, against the file version it was seen on) has been seen
@@ -234,11 +241,14 @@ export function classifySnapshotText(str) {
  * @param {string|(() => string)} [args.io.deviceId]          stamped as `writtenBy` in the file header; ranks this device's relay (relayWaitMs)
  * @param {() => number} [args.io.now]
  * @param {Console}  [args.io.log]
- * @param {{missingSince: number, lastWriteAt: number, lastWrittenAt?: number, pendingWrite?: {fingerprint: string, at: number}|null}} args.state  carried between cycles
- * @returns {Promise<{state: {missingSince: number, lastWriteAt: number, lastWrittenAt: number, pendingWrite: object|null}, outcome: object}>}
+ * @param {{missingSince: number, lastWriteAt: number, lastWrittenAt?: number, pendingWrite?: {fingerprint: string, at: number}|null, settled?: object|null}} args.state  carried between cycles
+ * @returns {Promise<{state: {missingSince: number, lastWriteAt: number, lastWrittenAt: number, pendingWrite: object|null, settled: object|null}, outcome: object}>}
  *   outcome.kind is one of:
  *     'skipped'   (reason: 'missing-grace' | 'empty-state-guard' | 'downloading' |
- *                  'unparseable' | 'no-data' | 'encrypted-unreadable' | 'key-needed')
+ *                  'unparseable' | 'no-data' | 'encrypted-unreadable' | 'key-needed' |
+ *                  'unchanged')
+ *                 unchanged: the idle gate; the file and local data are as a
+ *                 settled cycle left them
  *                 encrypted-unreadable carries needsKey: true when no key and no
  *                 passphrase are in memory (the prompt collects one), false when
  *                 the key in memory is the wrong one
@@ -270,6 +280,10 @@ export async function runSnapshotFileCycle({ transport, io, state }) {
     // an edit made here has to be newer than to count as not yet written.
     lastWrittenAt: state?.lastWrittenAt ?? 0,
     pendingWrite: state?.pendingWrite ?? null,
+    // The idle gate (krelltunez/dayGLANCE#2142): after a merged cycle that had
+    // nothing to apply and nothing to write, the file's text and this device's
+    // data as they stood. See SETTLED_RECHECK_MS.
+    settled: state?.settled ?? null,
   };
   const lastLocalEdit = (() => {
     try {
@@ -303,7 +317,26 @@ export async function runSnapshotFileCycle({ transport, io, state }) {
   // plaintext, before any envelope, and never touches what is applied locally.
   const strip = typeof io.outgoing === 'function' ? (payload) => io.outgoing(payload) ?? payload : (payload) => payload;
 
-  const read = classifySnapshotText(await transport.read());
+  const text = await transport.read();
+
+  // The idle gate. A poll that reads the very text a settled cycle read, while
+  // this device's data is still what it was then and no relay is waiting, has
+  // nothing to merge: stop before parsing, decrypting and comparing the file.
+  // The read still counts as a read (lastSyncedKey). Re-checked in full every
+  // SETTLED_RECHECK_MS, as a safety net.
+  let gateLocal = null;
+  if (next.settled && typeof text === 'string' && text === next.settled.text && !next.pendingWrite
+      && now() - next.settled.at < SETTLED_RECHECK_MS) {
+    gateLocal = io.buildSyncPayload();
+    if (JSON.stringify(gateLocal.data) === next.settled.fingerprint) {
+      io.storage.setItem(transport.lastSyncedKey, new Date(now()).toISOString());
+      next.missingSince = 0;
+      return { state: next, outcome: { kind: 'skipped', reason: 'unchanged' } };
+    }
+  }
+  next.settled = null;
+
+  const read = classifySnapshotText(text);
 
   // The file decides; the switch decides the first write.
   const envelopeRead = read.kind === 'snapshot' && !!io.isEncryptedEnvelope(read.remote);
@@ -383,7 +416,7 @@ export async function runSnapshotFileCycle({ transport, io, state }) {
 
   // First launch on a device with no data of its own, facing a populated
   // remote copy. Ask instead of restoring silently (shouldPromptFirstRun).
-  const localData = io.buildSyncPayload().data;
+  const localData = (gateLocal ?? io.buildSyncPayload()).data;
   const hasData = io.hasData ?? payloadHasData;
   if (shouldPromptFirstRun({
     decided: transport.firstRunDecided(),
@@ -472,6 +505,12 @@ export async function runSnapshotFileCycle({ transport, io, state }) {
     }
   } else {
     next.pendingWrite = null;
+  }
+  // Nothing applied and nothing wanted on the file: the next poll may stop at
+  // the read if neither side moves. (A cycle that applied or wrote changed one
+  // side, and the next full cycle settles it.)
+  if (!applyNeeded && !writeNeeded && typeof text === 'string') {
+    next.settled = { text, fingerprint: JSON.stringify(localData), at: now() };
   }
   return {
     state: next,

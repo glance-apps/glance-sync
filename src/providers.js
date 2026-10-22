@@ -138,6 +138,21 @@ async function parseDownloadResponse(res, engineConfig) {
   return { payload, etag };
 }
 
+// A server (or a proxy in front of it) that refuses the upload for its size
+// answers 413. That is not a network problem and retrying will not help, so it
+// gets its own code and carries the size that was refused (engine.js
+// classifyError, formatErrorMessage).
+function payloadTooLarge(body) {
+  const err = new Error('PAYLOAD_TOO_LARGE');
+  err.code = 'PAYLOAD_TOO_LARGE';
+  err.bytes = typeof body === 'string' ? new TextEncoder().encode(body).length : null;
+  return err;
+}
+
+// Conditional GET: with the ETag of a copy this device has already merged, an
+// unchanged file comes back as 304 with no body (engine.js, the idle gate).
+const conditional = (etag) => (etag ? { 'If-None-Match': etag } : undefined);
+
 async function mkcolWithParents(dirUrl, authHeaders, wf) {
   const res = await wf('MKCOL', dirUrl, authHeaders);
   if (res.status === 409 || res.status === 404 || res.status === 405) {
@@ -210,13 +225,15 @@ export function createProviders(engineConfig) {
         }
         if (res.status === 403) throw new Error('FORBIDDEN');
         if (res.status === 412) throw new Error('PRECONDITION_FAILED');
+        if (res.status === 413) throw payloadTooLarge(body);
         if (!res.ok) throw new Error(`Upload failed: ${res.status} ${res.statusText}`);
         return true;
       },
-      async download(config) {
+      async download(config, { ifNoneMatch = null } = {}) {
         const fileUrl = this.getFileUrl(config);
         const authHeaders = this.getAuthHeaders(config);
-        const res = await wf('GET', fileUrl, authHeaders);
+        const res = await wf('GET', fileUrl, authHeaders, undefined, conditional(ifNoneMatch));
+        if (res.status === 304) return { notModified: true, etag: ifNoneMatch };
         if (res.status === 404) return null;
         if (res.status === 403) throw new Error('FORBIDDEN');
         if (!res.ok) throw new Error(`Download failed: ${res.status} ${res.statusText}`);
@@ -262,13 +279,15 @@ export function createProviders(engineConfig) {
         }
         if (res.status === 403) throw new Error('FORBIDDEN');
         if (res.status === 412) throw new Error('PRECONDITION_FAILED');
+        if (res.status === 413) throw payloadTooLarge(body);
         if (!res.ok) throw new Error(`Upload failed: ${res.status} ${res.statusText}`);
         return true;
       },
-      async download(config) {
+      async download(config, { ifNoneMatch = null } = {}) {
         const fileUrl = this.getFileUrl();
         const authHeaders = this.getAuthHeaders(config);
-        const res = await wf('GET', fileUrl, authHeaders);
+        const res = await wf('GET', fileUrl, authHeaders, undefined, conditional(ifNoneMatch));
+        if (res.status === 304) return { notModified: true, etag: ifNoneMatch };
         if (res.status === 404) return null;
         if (res.status === 403) throw new Error('FORBIDDEN');
         if (!res.ok) throw new Error(`Download failed: ${res.status} ${res.statusText}`);
@@ -326,13 +345,15 @@ export function createProviders(engineConfig) {
         }
         if (res.status === 403) throw new Error('FORBIDDEN');
         if (res.status === 412) throw new Error('PRECONDITION_FAILED');
+        if (res.status === 413) throw payloadTooLarge(body);
         if (!res.ok) throw new Error(`Upload failed: ${res.status} ${res.statusText}`);
         return true;
       },
-      async download(config) {
+      async download(config, { ifNoneMatch = null } = {}) {
         const fileUrl = this.getFileUrl(config);
         const authHeaders = this.getAuthHeaders(config);
-        const res = await wf('GET', fileUrl, authHeaders);
+        const res = await wf('GET', fileUrl, authHeaders, undefined, conditional(ifNoneMatch));
+        if (res.status === 304) return { notModified: true, etag: ifNoneMatch };
         if (res.status === 404) return null;
         if (res.status === 403) throw new Error('FORBIDDEN');
         if (!res.ok) throw new Error(`Download failed: ${res.status} ${res.statusText}`);
