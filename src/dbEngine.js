@@ -15,7 +15,9 @@
 // Local sync state (dbSyncHighWaterMark, dbSyncDirtySet) is persisted via the
 // same localStorage that the file engine uses for its sync metadata, keyed by
 // storageKeyPrefix. See the Phase 3 summary for why localStorage is used here in
-// place of the spec's IndexedDB suggestion.
+// place of the spec's IndexedDB suggestion. Since 2.4.0 the store is injectable
+// (config.storage, see SyncStorage below) so the engine can run where there is
+// no localStorage, e.g. a Node host; the default is still localStorage.
 
 import { createVaultClient } from './vaultClient.js';
 import { getSyncPassphrase } from './crypto.js';
@@ -98,6 +100,68 @@ const randomUUID = () => {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 };
 
+// ── Sync bookkeeping storage (2.4.0) ─────────────────────────────────────────
+//
+// Every key this engine and the connect/recovery flow keep (device id, config,
+// pull cursor, push ack, dirty set, last-synced, quarantine, credential halt,
+// vault credential) goes through ONE store: `{ getItem, setItem, removeItem }`.
+//
+// THE CONTRACT: the store is SYNCHRONOUS and DURABLE ON RETURN. The engine
+// relies on ordering, not on awaiting: the dirty set is written in the app's
+// own write path and read back before the push that clears it, the cursor is
+// written before the next request resumes from it, and the vault credential is
+// written and read back BEFORE enrollment is treated as complete (enrollment
+// is non-idempotent). A store whose setItem returns before the value would
+// survive a crash, or whose getItem cannot answer without awaiting, breaks
+// those guarantees silently. localStorage meets the contract; under Node a
+// Map flushed with fs.writeFileSync (or any synchronous embedded store) does.
+// An injected store that answers with a Promise is refused at the call.
+//
+// The default is globalThis.localStorage, looked up at EACH CALL rather than
+// captured at construction, which is exactly what the bare `localStorage`
+// references this replaced did: same keys, same values, same order of writes,
+// and a localStorage replaced or patched after the engine is built is still
+// the one written to.
+const defaultSyncStorage = Object.freeze({
+  getItem: (key) => globalThis.localStorage.getItem(key),
+  setItem: (key, value) => globalThis.localStorage.setItem(key, value),
+  removeItem: (key) => globalThis.localStorage.removeItem(key),
+});
+
+/**
+ * @typedef {{ getItem(key: string): string|null, setItem(key: string, value: string): void, removeItem(key: string): void }} SyncStorage
+ */
+
+const isThenable = (v) => v != null && typeof v.then === 'function';
+
+/**
+ * Resolves the bookkeeping store: the default (globalThis.localStorage, looked
+ * up per call) when `storage` is null/undefined, otherwise the injected store,
+ * checked for shape and guarded against asynchronous answers.
+ *
+ * @param {SyncStorage|null|undefined} storage
+ * @param {string} context - caller name for the error message
+ */
+export const resolveSyncStorage = (storage, context) => {
+  if (storage == null) return defaultSyncStorage;
+  if (typeof storage.getItem !== 'function'
+    || typeof storage.setItem !== 'function'
+    || typeof storage.removeItem !== 'function') {
+    throw new Error(`${context}: storage must implement getItem, setItem and removeItem`);
+  }
+  const syncOnly = (op, v) => {
+    if (isThenable(v)) {
+      throw new Error(`${context}: storage.${op} returned a Promise; the sync storage must be synchronous and durable on return`);
+    }
+    return v;
+  };
+  return {
+    getItem: (key) => syncOnly('getItem', storage.getItem(key)),
+    setItem: (key, value) => { syncOnly('setItem', storage.setItem(key, value)); },
+    removeItem: (key) => { syncOnly('removeItem', storage.removeItem(key)); },
+  };
+};
+
 /**
  * The package-owned stable device identifier (vault Phase 1.4b). Generated
  * once per storageKeyPrefix and persisted under `{prefix}-device-id`; used
@@ -110,14 +174,20 @@ const randomUUID = () => {
  * launch of this version — which also means their device cursor starts
  * updating for the first time (updateDeviceCursor previously no-oped
  * silently without a deviceId).
+ *
+ * @param {string} storageKeyPrefix
+ * @param {SyncStorage} [storage] - the bookkeeping store (see
+ *   resolveSyncStorage); defaults to globalThis.localStorage. Pass the same
+ *   store the engine is given, or the id is minted twice.
  */
-export const getOrCreateDeviceId = (storageKeyPrefix) => {
+export const getOrCreateDeviceId = (storageKeyPrefix, storage) => {
   if (!storageKeyPrefix) throw new Error('getOrCreateDeviceId: storageKeyPrefix is required');
+  const store = resolveSyncStorage(storage, 'getOrCreateDeviceId');
   const key = `${storageKeyPrefix}-device-id`;
-  let id = localStorage.getItem(key);
+  let id = store.getItem(key);
   if (!id) {
     id = randomUUID();
-    localStorage.setItem(key, id);
+    store.setItem(key, id);
   }
   return id;
 };
@@ -163,6 +233,12 @@ export const credentialHaltKey = (storageKeyPrefix) => `${storageKeyPrefix}-db-s
  * @param {Function|null} [config.nativeGetSyncKey]
  * @param {Function|null} [config.nativeStoreSyncKey]
  * @param {Function} [config.fetchImpl]     - injectable fetch (tests / native shells)
+ * @param {SyncStorage} [config.storage]
+ *   - where the sync bookkeeping lives (device id, config, cursors, dirty set,
+ *   quarantine, credential halt, vault credential). Defaults to
+ *   globalThis.localStorage. MUST be synchronous and durable on return: the
+ *   dirty set and cursors are written before the request that depends on
+ *   them, and nothing awaits a write. See resolveSyncStorage.
  *
  * Data callbacks (the engine is data-shape agnostic):
  * @param {Function} config.getLocalEntity      - (entityId) => entity | null | Promise
@@ -251,10 +327,12 @@ export const createDbSyncEngine = (config) => {
   if (typeof applyRemoteEntity !== 'function') throw new Error('createDbSyncEngine: applyRemoteEntity is required');
   if (typeof applyRemoteDelete !== 'function') throw new Error('createDbSyncEngine: applyRemoteDelete is required');
 
+  const store = resolveSyncStorage(config.storage, 'createDbSyncEngine');
+
   const app = vaultApp || appId;
   // Package-owned device identity: an explicit config.deviceId wins, else the
   // persisted per-prefix id (generated on first use).
-  const resolvedDeviceId = deviceId || getOrCreateDeviceId(storageKeyPrefix);
+  const resolvedDeviceId = deviceId || getOrCreateDeviceId(storageKeyPrefix, config.storage);
   const lastModifiedOf = typeof getEntityLastModified === 'function'
     ? getEntityLastModified
     : (entity) => entity && entity.lastModified;
@@ -267,7 +345,7 @@ export const createDbSyncEngine = (config) => {
   // otherwise build the default HTTP client from the vault credentials.
   const vault = config.vaultClient || createVaultClient({ vaultUrl, vaultToken, fetchImpl });
 
-  // localStorage keys owned by this engine.
+  // Storage keys owned by this engine (in `store`; localStorage by default).
   const KEY_CONFIG = `${storageKeyPrefix}-db-sync-config`;
   // KEY_HWM is the PULL cursor: the highest seq this device has actually
   // consumed (listed + applied). It is the `since` we resume pulling from, so
@@ -327,42 +405,42 @@ export const createDbSyncEngine = (config) => {
 
   // ── Local state accessors ─────────────────────────────────────────────────
   const getConfig = () => {
-    const saved = localStorage.getItem(KEY_CONFIG);
+    const saved = store.getItem(KEY_CONFIG);
     return saved ? JSON.parse(saved) : null;
   };
   const setConfig = (cfg) => {
-    if (cfg) localStorage.setItem(KEY_CONFIG, JSON.stringify(cfg));
-    else     localStorage.removeItem(KEY_CONFIG);
+    if (cfg) store.setItem(KEY_CONFIG, JSON.stringify(cfg));
+    else     store.removeItem(KEY_CONFIG);
   };
-  const getLastSynced = () => localStorage.getItem(KEY_LAST_SYNCED) || null;
+  const getLastSynced = () => store.getItem(KEY_LAST_SYNCED) || null;
 
   // PULL cursor. Advanced only by pullRemoteChanges from rows actually applied.
   // An existing stored value from before the pull/push split is read as
   // pull-progress, which is the conservative interpretation (it never lets us
   // resume ahead of what we have consumed).
   const getHighWaterMark = () => {
-    const raw = localStorage.getItem(KEY_HWM);
+    const raw = store.getItem(KEY_HWM);
     const n = raw == null ? 0 : Number(raw);
     return Number.isFinite(n) ? n : 0;
   };
   const setHighWaterMark = (seq) => {
-    localStorage.setItem(KEY_HWM, String(seq));
+    store.setItem(KEY_HWM, String(seq));
   };
 
   // PUSH high-water mark. Tracked separately so a push can never advance the
   // pull cursor (KEY_HWM) and skip lower-seq remote rows.
   const getPushAck = () => {
-    const raw = localStorage.getItem(KEY_PUSH_ACK);
+    const raw = store.getItem(KEY_PUSH_ACK);
     const n = raw == null ? 0 : Number(raw);
     return Number.isFinite(n) ? n : 0;
   };
   const setPushAck = (seq) => {
-    localStorage.setItem(KEY_PUSH_ACK, String(seq));
+    store.setItem(KEY_PUSH_ACK, String(seq));
   };
 
   // Dirty set persisted as a JSON array; deduped via Set on read/write.
   const getDirtySet = () => {
-    const raw = localStorage.getItem(KEY_DIRTY);
+    const raw = store.getItem(KEY_DIRTY);
     if (!raw) return [];
     try {
       const arr = JSON.parse(raw);
@@ -372,13 +450,13 @@ export const createDbSyncEngine = (config) => {
     }
   };
   const writeDirtySet = (ids) => {
-    localStorage.setItem(KEY_DIRTY, JSON.stringify([...new Set(ids)]));
+    store.setItem(KEY_DIRTY, JSON.stringify([...new Set(ids)]));
   };
-  const clearDirty = () => localStorage.removeItem(KEY_DIRTY);
+  const clearDirty = () => store.removeItem(KEY_DIRTY);
 
   // Quarantine set persisted as a JSON array of { entityId, seq }.
   const getQuarantine = () => {
-    const raw = localStorage.getItem(KEY_QUARANTINE);
+    const raw = store.getItem(KEY_QUARANTINE);
     if (!raw) return [];
     try {
       const arr = JSON.parse(raw);
@@ -388,8 +466,8 @@ export const createDbSyncEngine = (config) => {
     }
   };
   const writeQuarantine = (list) => {
-    if (list.length === 0) localStorage.removeItem(KEY_QUARANTINE);
-    else localStorage.setItem(KEY_QUARANTINE, JSON.stringify(list));
+    if (list.length === 0) store.removeItem(KEY_QUARANTINE);
+    else store.setItem(KEY_QUARANTINE, JSON.stringify(list));
   };
   const addToQuarantine = (entityId, seq) => {
     const list = getQuarantine();
@@ -405,7 +483,7 @@ export const createDbSyncEngine = (config) => {
   // Credential-rejected stop state. Read/written only here; deliberately no
   // clear function on the engine (recovery is Phase 2.2).
   const getCredentialHalt = () => {
-    const raw = localStorage.getItem(KEY_CRED_HALT);
+    const raw = store.getItem(KEY_CRED_HALT);
     if (!raw) return null;
     try {
       return JSON.parse(raw);
@@ -414,7 +492,7 @@ export const createDbSyncEngine = (config) => {
     }
   };
   const setCredentialHalt = (message) => {
-    localStorage.setItem(KEY_CRED_HALT, JSON.stringify({ message, at: new Date().toISOString() }));
+    store.setItem(KEY_CRED_HALT, JSON.stringify({ message, at: new Date().toISOString() }));
   };
 
   // ── The backoff ladder: classify, open, clear ─────────────────────────────
@@ -532,7 +610,7 @@ export const createDbSyncEngine = (config) => {
   // primitive's catch, via noteCredentialRejection). Only the pair works —
   // a guard over a halt nothing sets never fires.
   //
-  // This is a READ of durable state (localStorage), so unlike the windows it
+  // This is a READ of durable state (the sync storage), so unlike the windows it
   // is safe to check in more than one place: the cycle keeps its own halt
   // check for the reporting and result shape it owes the app, and this guard
   // covers every other caller. Idempotent reads cannot compound; only
@@ -646,7 +724,7 @@ export const createDbSyncEngine = (config) => {
   // prevent. Do not simplify this condition.
   const isBearerSuperseded = () => {
     if (typeof vaultToken !== 'string' || vaultToken === '') return false;
-    const raw = localStorage.getItem(KEY_CREDENTIAL);
+    const raw = store.getItem(KEY_CREDENTIAL);
     if (!raw) return false;
     try {
       const rec = JSON.parse(raw);
@@ -1296,7 +1374,7 @@ export const createDbSyncEngine = (config) => {
       }
 
       const now = new Date().toISOString();
-      localStorage.setItem(KEY_LAST_SYNCED, now);
+      store.setItem(KEY_LAST_SYNCED, now);
       onStatusChange?.('success');
 
       return { applied: pull.applied, skipped: pull.skipped, skippedEntityIds: pull.skippedEntityIds };
