@@ -41,6 +41,7 @@ import {
   getOrCreateDeviceId,
   vaultCredentialKey,
   credentialHaltKey,
+  resolveSyncStorage,
 } from './dbEngine.js';
 
 const typedError = (message, code) => {
@@ -56,18 +57,18 @@ const typedError = (message, code) => {
 // next successful enrollment with the same (accountId, deviceId) supersedes
 // it, so even that is no longer a live orphan. Broken storage must still not
 // orphan one per attempt.)
-const ensureCredentialSlotWritable = (key, context) => {
+const ensureCredentialSlotWritable = (store, key, context) => {
   // The slot's prior contents are RESTORED, not discarded: during recovery
   // the slot holds the stale record, and a failed enrollment after the canary
   // must leave that record exactly as it was (a failed recovery leaves the
   // device halted with its state intact, never ambiguous).
-  const prior = localStorage.getItem(key);
+  const prior = store.getItem(key);
   const canary = JSON.stringify({ canary: true });
   try {
-    localStorage.setItem(key, canary);
-    if (localStorage.getItem(key) !== canary) throw new Error('read-back mismatch');
-    if (prior === null) localStorage.removeItem(key);
-    else localStorage.setItem(key, prior);
+    store.setItem(key, canary);
+    if (store.getItem(key) !== canary) throw new Error('read-back mismatch');
+    if (prior === null) store.removeItem(key);
+    else store.setItem(key, prior);
   } catch {
     throw typedError(
       `${context}: device storage cannot persist a credential; refusing to enroll.`,
@@ -80,10 +81,10 @@ const ensureCredentialSlotWritable = (key, context) => {
 // complete. Overwrites whatever was in the slot — the credential slot holds
 // exactly one record, so a stale credential never survives alongside a new
 // one. Only the credential and its metadata are written — never the secret.
-const persistCredentialRecord = (key, record, context) => {
+const persistCredentialRecord = (store, key, record, context) => {
   try {
-    localStorage.setItem(key, JSON.stringify(record));
-    const readBack = JSON.parse(localStorage.getItem(key));
+    store.setItem(key, JSON.stringify(record));
+    const readBack = JSON.parse(store.getItem(key));
     if (!readBack || readBack.credential !== record.credential) throw new Error('read-back mismatch');
   } catch {
     throw typedError(
@@ -114,6 +115,9 @@ const requireString = (value, name, code) => {
  * @param {string} [config.vaultToken] - the shared device token. Required
  *   when the server runs shared mode; ignored against a per-account server
  *   (the shared token authenticates nothing there).
+ * @param {import('./dbEngine.js').SyncStorage} [config.storage] - where the
+ *   device id and the credential record are kept; passed on to the engine
+ *   unchanged. Defaults to globalThis.localStorage. See createDbSyncEngine.
  *
  * Typed failures:
  *  - VAULT_TOKEN_REQUIRED: server is shared-mode and no vaultToken was given.
@@ -143,14 +147,19 @@ export async function connectVaultSyncEngine(config = {}) {
 
   // Same normalization the vault client applies to every request URL, so the
   // stored credential's server binding survives a trailing-slash difference.
+  // The same store the engine will be built with (engineConfig.storage rides
+  // through to createDbSyncEngine untouched): the credential this flow
+  // persists must be the one the engine's superseded-bearer check reads.
+  const store = resolveSyncStorage(engineConfig.storage, 'connectVaultSyncEngine');
+
   const base = vaultUrl.replace(/\/+$/, '');
-  const deviceId = engineConfig.deviceId || getOrCreateDeviceId(storageKeyPrefix);
+  const deviceId = engineConfig.deviceId || getOrCreateDeviceId(storageKeyPrefix, engineConfig.storage);
   const KEY_CREDENTIAL = vaultCredentialKey(storageKeyPrefix);
 
   // A stored credential is only usable for the exact (server, account) it was
   // minted for: the server binds it to an account and 403s any other claim.
   const readStoredCredential = () => {
-    const raw = localStorage.getItem(KEY_CREDENTIAL);
+    const raw = store.getItem(KEY_CREDENTIAL);
     if (!raw) return null;
     try {
       const rec = JSON.parse(raw);
@@ -193,7 +202,7 @@ export async function connectVaultSyncEngine(config = {}) {
         );
       }
 
-      ensureCredentialSlotWritable(KEY_CREDENTIAL, 'connectVaultSyncEngine');
+      ensureCredentialSlotWritable(store, KEY_CREDENTIAL, 'connectVaultSyncEngine');
 
       const enrollment = await enrollVaultDevice({
         vaultUrl: base,
@@ -203,7 +212,7 @@ export async function connectVaultSyncEngine(config = {}) {
         fetchImpl,
       });
 
-      persistCredentialRecord(KEY_CREDENTIAL, {
+      persistCredentialRecord(store, KEY_CREDENTIAL, {
         credentialId: enrollment.credentialId,
         credential: enrollment.credential,
         accountId,
@@ -307,6 +316,7 @@ export async function recoverVaultSyncEngine(config = {}) {
     );
   }
 
+  const store = resolveSyncStorage(engineConfig.storage, 'recoverVaultSyncEngine');
   const base = vaultUrl.replace(/\/+$/, '');
   const KEY_CREDENTIAL = vaultCredentialKey(storageKeyPrefix);
   const KEY_HALT = credentialHaltKey(storageKeyPrefix);
@@ -314,7 +324,7 @@ export async function recoverVaultSyncEngine(config = {}) {
   // 1. Halt gate. Recovery is the exit from the halt and nothing else; a
   // device that isn't halted has nothing to recover from, and refusing here
   // is what makes "no routine code path can re-enroll" structural.
-  if (localStorage.getItem(KEY_HALT) === null) {
+  if (store.getItem(KEY_HALT) === null) {
     throw typedError(
       'recoverVaultSyncEngine: this device is not credential-halted; recovery only runs from the halted state.',
       'NOT_HALTED'
@@ -324,7 +334,7 @@ export async function recoverVaultSyncEngine(config = {}) {
   // 2. Device identity, from the stale record when one is readable.
   let staleRecord = null;
   try {
-    const raw = localStorage.getItem(KEY_CREDENTIAL);
+    const raw = store.getItem(KEY_CREDENTIAL);
     staleRecord = raw ? JSON.parse(raw) : null;
   } catch {
     staleRecord = null;
@@ -339,7 +349,7 @@ export async function recoverVaultSyncEngine(config = {}) {
       'DEVICE_ID_CONFLICT'
     );
   }
-  const deviceId = recordDeviceId || engineConfig.deviceId || getOrCreateDeviceId(storageKeyPrefix);
+  const deviceId = recordDeviceId || engineConfig.deviceId || getOrCreateDeviceId(storageKeyPrefix, engineConfig.storage);
 
   // 3. Mode guard. Unlike connect, recovery NEVER falls back on discovery
   // failure — it exists only to enroll, and enrolling blind could hit a
@@ -363,7 +373,7 @@ export async function recoverVaultSyncEngine(config = {}) {
 
   // 4-6. Canary, enroll (the rotation: same byte-exact accountId + deviceId
   // revokes every still-active predecessor server-side), persist + verify.
-  ensureCredentialSlotWritable(KEY_CREDENTIAL, 'recoverVaultSyncEngine');
+  ensureCredentialSlotWritable(store, KEY_CREDENTIAL, 'recoverVaultSyncEngine');
 
   const enrollment = await enrollVaultDevice({
     vaultUrl: base,
@@ -373,7 +383,7 @@ export async function recoverVaultSyncEngine(config = {}) {
     fetchImpl,
   });
 
-  persistCredentialRecord(KEY_CREDENTIAL, {
+  persistCredentialRecord(store, KEY_CREDENTIAL, {
     credentialId: enrollment.credentialId,
     credential: enrollment.credential,
     accountId,
@@ -383,7 +393,7 @@ export async function recoverVaultSyncEngine(config = {}) {
   }, 'recoverVaultSyncEngine');
 
   // 7. Clear the halt — the last state change, after verified persistence.
-  localStorage.removeItem(KEY_HALT);
+  store.removeItem(KEY_HALT);
 
   // 8. Fresh engine on the new credential.
   const engine = createDbSyncEngine({ ...engineConfig, deviceId, vaultToken: enrollment.credential });

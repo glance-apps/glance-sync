@@ -223,6 +223,79 @@ rewrite with identical content. It fails open by construction: the rule needs
 repeated events on the *same* id, so a first sync, a large import, or a bulk
 cleanup deleting many different ids can never trigger it.
 
+### Running the vault engine under Node
+
+The vault path (`createDbSyncEngine`, `connectVaultSyncEngine`,
+`recoverVaultSyncEngine`, the vault client and the per-entity crypto) needs
+only `fetch`, Web Crypto and `atob`/`btoa`, all globals on Node 20+. The two
+browser dependencies are both injectable (2.4.0):
+
+**1. Sync bookkeeping: pass `storage`.** The engine keeps its device id,
+config, pull cursor, push ack, dirty set, last-synced time, quarantine,
+credential halt and vault credential under `storageKeyPrefix` in a
+`{ getItem, setItem, removeItem }` store (`SyncStorage` in the types). It
+defaults to `globalThis.localStorage`; pass `storage` to the engine (or to the
+connect and recover calls, which hand it on) and the same keys land there
+instead. The store must be **synchronous and durable on return**: nothing awaits
+a write, because the dirty set and the cursors are written before the request
+that depends on them and the credential is read back before an enrollment
+counts. A store that answers with a Promise is refused. If you call
+`getOrCreateDeviceId` yourself, pass it the same store as the second argument.
+
+```js
+import fs from 'node:fs';
+
+const file = '/path/to/sync-state.json';
+const map = new Map(Object.entries(fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {}));
+const flush = () => {
+  fs.writeFileSync(`${file}.tmp`, JSON.stringify(Object.fromEntries(map)), { mode: 0o600 });
+  fs.renameSync(`${file}.tmp`, file); // atomic replace: a crash leaves the old or the new file
+};
+const storage = {
+  getItem: (k) => (map.has(k) ? map.get(k) : null),
+  setItem: (k, v) => { map.set(k, String(v)); flush(); },
+  removeItem: (k) => { map.delete(k); flush(); },
+};
+```
+
+**2. The root key: supply `nativeGetSyncKey` and `nativeStoreSyncKey`.** The
+derived key lives in IndexedDB unless these hooks are given; with
+`nativeGetSyncKey` present, setup, restore and clear go through the hooks and
+never touch IndexedDB. Supply both: the choice keys on `nativeGetSyncKey`.
+`nativeStoreSyncKey(value)` receives an opaque base64 string, or `null` on
+clear; it is called without being awaited, so make it synchronous or let it
+handle its own errors. The value is the account's raw root key, as sensitive
+as the passphrase: keep it in the OS keychain or a `0600` file. Or keep nothing:
+return `null` from `nativeGetSyncKey`, make `nativeStoreSyncKey` a no-op, and
+call `setSyncPassphrase(passphrase)` at start; the first cycle fetches the salt
+and re-derives the key (one PBKDF2, 310 000 iterations) per process.
+
+```js
+import { connectVaultSyncEngine, setSyncPassphrase } from '@glance-apps/sync';
+
+setSyncPassphrase(passphrase); // needed whenever no stored key is handed back
+const { engine } = await connectVaultSyncEngine({
+  storageKeyPrefix: 'myhost',
+  appId: 'myapp',
+  accountId,
+  vaultUrl,
+  enrollmentSecret,                  // first run against a per-account server
+  cryptoDBName: 'unused-with-hooks',
+  storage,
+  nativeGetSyncKey: async () => readKeyRecord(),          // string | null
+  nativeStoreSyncKey: (v) => writeKeyRecordSync(v),       // v === null on clear
+  getLocalEntity, applyRemoteEntity, applyRemoteDelete,
+});
+```
+
+`fetchImpl` is optional: the global `fetch` is used when it is omitted. Pass
+one to route through a proxy or a custom agent.
+
+**One account per process.** The root key and the session passphrase are
+module state, as are the vault client's brake and diagnostics, so a process (a
+module realm) holds one account at a time. Two accounts need two processes or
+two isolated realms.
+
 ### Auto-backup
 
 | Export | Description |

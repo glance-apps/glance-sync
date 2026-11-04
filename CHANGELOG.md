@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-11-04
+
+### Added
+
+- **Injectable sync storage for the vault engine** (krelltunez/dayGLANCE#2280),
+  so the vault path can run where there is no `localStorage`, such as a Node
+  process acting as one more device.
+  - `createDbSyncEngine({ storage })`: a synchronous
+    `{ getItem, setItem, removeItem }` store (`SyncStorage` in the types) for
+    every key the engine kept in `localStorage`: the device id,
+    `-db-sync-config`, `-db-sync-hwm`, `-db-sync-push-ack`, `-db-sync-dirty`,
+    `-db-sync-last-synced`, `-db-sync-quarantine`,
+    `-db-sync-credential-halt` and `-vault-credential`. Same keys, same
+    values. The store must be durable on return, because the dirty set and
+    cursors are written before the request that depends on them; an injected
+    store whose methods return a Promise is refused, and one missing a method
+    is refused at construction.
+  - `connectVaultSyncEngine` and `recoverVaultSyncEngine` read and write the
+    device id, the credential record and the halt through `config.storage`
+    and hand it on to the engine they build.
+  - `getOrCreateDeviceId(storageKeyPrefix, storage?)`: optional trailing
+    store.
+  - README: "Running the vault engine under Node" (inject `storage`, supply
+    the root key through `nativeGetSyncKey` / `nativeStoreSyncKey` or
+    re-derive it from the passphrase at start, one account per process).
+
+### Notes
+
+- Without `storage`, every read and write goes to `globalThis.localStorage`,
+  looked up at each call as the bare `localStorage` references were: same
+  keys, same values, same order of writes, for the dayGLANCE app, the
+  Obsidian plugin and the native shells.
+- The root key: with `nativeGetSyncKey` supplied, `setupDbRootKey`,
+  `initDbRootKey` and `clearDbRootKey` already used only the hooks and never
+  touched IndexedDB. Now covered by a test that runs the engine with both
+  globals trapped.
+
 ## [2.3.0] - 2026-10-22
 
 ### Added

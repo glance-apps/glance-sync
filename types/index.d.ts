@@ -622,9 +622,37 @@ export function enrollVaultDevice(config: {
   fetchImpl?: typeof fetch;
 }): Promise<VaultEnrollment>;
 
+/**
+ * Where the vault engine keeps its sync bookkeeping (2.4.0): the device id,
+ * `-db-sync-config`, `-db-sync-hwm`, `-db-sync-push-ack`, `-db-sync-dirty`,
+ * `-db-sync-last-synced`, `-db-sync-quarantine`, `-db-sync-credential-halt`
+ * and `-vault-credential`, each under `storageKeyPrefix`. `localStorage`
+ * satisfies it, and is the default.
+ *
+ * THE CONTRACT: synchronous and durable on return. Nothing awaits a write:
+ * the dirty set and the cursors are written before the request that depends
+ * on them, and the vault credential is written and read back before an
+ * enrollment counts as complete. A store that only persists later (a
+ * debounced flush, an async database) loses those guarantees silently. Under
+ * Node, a Map flushed with `fs.writeFileSync` on every `setItem` /
+ * `removeItem` meets it. An injected store whose methods return a Promise is
+ * refused when called.
+ */
+export interface SyncStorage {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
 export interface DbSyncEngineConfig {
   // Identity / local state
   storageKeyPrefix: string;
+  /**
+   * The bookkeeping store; see {@link SyncStorage}. Defaults to
+   * `globalThis.localStorage`, looked up at each call. Pass the same store
+   * to `getOrCreateDeviceId` if you call it yourself.
+   */
+  storage?: SyncStorage;
   appId: string;
   vaultApp?: string;
   cryptoDBName: string;
@@ -877,8 +905,9 @@ export interface SyncSuppressedError extends Error {
  * Package-owned stable device identifier: generated once (crypto.randomUUID)
  * and persisted under `{prefix}-device-id`. Used for both the device cursor
  * and per-account enrollment. An explicit config.deviceId overrides it.
+ * `storage` defaults to `globalThis.localStorage`; pass the engine's store.
  */
-export function getOrCreateDeviceId(storageKeyPrefix: string): string;
+export function getOrCreateDeviceId(storageKeyPrefix: string, storage?: SyncStorage): string;
 
 /**
  * The packaged vault connect flow: discovers the server's auth mode, resolves
